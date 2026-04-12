@@ -1,0 +1,88 @@
+run:
+  profile: deep
+  output_dir: artifacts/runs
+  max_depth: 4
+  concurrency:
+    fetch: 20
+    parse: 8
+  timeouts:
+    request_sec: 20
+    headless_nav_sec: 30
+  retries:
+    fetch: 2
+  user_agent: "jsintel/1.0"
+
+scope:
+  allow_domains:
+    - "example.com"
+    - "*.example.com"
+  deny_domains:
+    - "analytics.example"
+  allow_paths_prefix:
+    - "/"
+  deny_paths_regex:
+    - ".*\\.map$"   # 필요하면 sourcemap은 별도 단계에서만
+  third_party_policy: "collect_and_tag" # drop / collect_and_tag / collect_only_initiators
+
+collection:
+  static_html: true
+  headless: true
+  headless_scenarios:
+    - type: "route_walk"
+      max_routes: 15
+    - type: "click_common"
+      selectors:
+        - "a"
+        - "button"
+      max_clicks: 20
+
+acquisition:
+  max_js_size_mb: 10
+  accept_types:
+    - "application/javascript"
+    - "text/javascript"
+    - "application/x-javascript"
+  follow_redirects: true
+
+sourcemap:
+  enabled: true
+  fetch_maps: true
+  max_map_size_mb: 20
+
+normalize:
+  beautify: true
+  deobfuscate_lite: true
+  preserve_evidence: true
+
+parse:
+  engine: "node_babel"   # node_babel / python_esprima / fallback
+  tolerant: true
+
+rules:
+  ruleset: "rulesets/pack_default"
+  enable_categories:
+    - endpoints
+    - secrets
+    - domains
+    - feature_flags
+    - debug
+  min_confidence: "low"  # low/medium/high
+
+correlation:
+  enabled: true
+  edges:
+    - same_file
+    - config
+    - import_graph
+    - runtime_initiator
+  clustering:
+    enabled: true
+
+risk:
+  enabled: true
+  scoring_model: "impact_likelihood_confidence"
+  thresholds:
+    P0: 85
+    P1: 70
+    P2: 50
+    P3: 20

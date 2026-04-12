@@ -1,0 +1,41 @@
+# Standard remote web-scan profile.
+# Goal: typical production website diagnosis with headless initial render,
+# but without route-walking or click exploration.
+
+scope:
+  include_subdomains: true
+  third_party_policy: tag_only
+
+crawler:
+  max_depth: 2
+  max_pages: 30
+  max_js_files: 300
+  rate_limit: 1.25
+  max_concurrent: 4
+  request_timeout: 25.0
+  page_timeout: 30.0
+  max_redirects: 8
+  follow_redirects: true
+  use_headless: true
+  headless_wait_time: 1.5
+  explore_routes: false
+  max_route_exploration: 0
+  max_retries: 2
+  retry_delay: 1.0
+
+parser:
+  tolerant: true
+  partial_on_error: true
+  beautify: true
+  resolve_sourcemaps: true
+
+rules:
+  min_confidence: low
+  mask_secrets: true
+
+output:
+  format: html
+  output_dir: artifacts/standard
+  include_raw_content: false
+
+resume: true

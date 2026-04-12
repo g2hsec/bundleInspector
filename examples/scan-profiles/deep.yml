@@ -1,0 +1,40 @@
+# Deep remote web-scan profile.
+# Goal: deeper SPA diagnosis with headless route exploration enabled.
+
+scope:
+  include_subdomains: true
+  third_party_policy: analyze
+
+crawler:
+  max_depth: 3
+  max_pages: 80
+  max_js_files: 800
+  rate_limit: 0.75
+  max_concurrent: 8
+  request_timeout: 30.0
+  page_timeout: 45.0
+  max_redirects: 10
+  follow_redirects: true
+  use_headless: true
+  headless_wait_time: 2.5
+  explore_routes: true
+  max_route_exploration: 15
+  max_retries: 3
+  retry_delay: 1.0
+
+parser:
+  tolerant: true
+  partial_on_error: true
+  beautify: true
+  resolve_sourcemaps: true
+
+rules:
+  min_confidence: low
+  mask_secrets: true
+
+output:
+  format: html
+  output_dir: artifacts/deep
+  include_raw_content: false
+
+resume: true

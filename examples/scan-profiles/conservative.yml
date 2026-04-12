@@ -1,0 +1,40 @@
+# Conservative remote web-scan profile.
+# Goal: minimize traffic and avoid interactive browser behavior.
+
+scope:
+  include_subdomains: true
+  third_party_policy: skip
+
+crawler:
+  max_depth: 1
+  max_pages: 10
+  max_js_files: 120
+  rate_limit: 2.5
+  max_concurrent: 2
+  request_timeout: 20.0
+  page_timeout: 20.0
+  max_redirects: 5
+  follow_redirects: true
+  use_headless: false
+  headless_wait_time: 1.0
+  explore_routes: false
+  max_route_exploration: 0
+  max_retries: 1
+  retry_delay: 1.0
+
+parser:
+  tolerant: true
+  partial_on_error: true
+  beautify: true
+  resolve_sourcemaps: true
+
+rules:
+  min_confidence: medium
+  mask_secrets: true
+
+output:
+  format: html
+  output_dir: artifacts/conservative
+  include_raw_content: false
+
+resume: true

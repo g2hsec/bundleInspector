@@ -1,0 +1,16 @@
+ruleset:
+  id: "pack_default"
+  version: "1.0.0"
+  description: "Default JS intel extraction rules"
+  author: "jsintel"
+  requires:
+    ast: true
+    sourcemap: optional
+
+defaults:
+  evidence_snippet_context_lines: 2
+  masking:
+    enabled: true
+    patterns:
+      - kind: "token_like"
+        mask: "keep_prefix_4_suffix_4"

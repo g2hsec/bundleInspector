@@ -1,0 +1,16 @@
+category: feature_flags
+rules:
+  - id: FF_FLAG_KEY_LITERAL
+    title: "Feature flag key literal detected"
+    severity: low
+    confidence: medium
+    matcher:
+      type: regex
+      pattern: "(?i)\\b(featureFlag|flag|toggle|experiment)\\b[^\\n]{0,80}['\"]([a-z0-9_\\-\\.]{3,40})['\"]"
+      capture_group: 2
+      capture_as: flag_key
+    extract:
+      fields:
+        flag_key: { from_capture: flag_key }
+    evidence:
+      snippet_from: normalized

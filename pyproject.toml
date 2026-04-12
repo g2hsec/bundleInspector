@@ -1,0 +1,117 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "bundleInspector"
+version = "0.1.0"
+description = "JavaScript Security Analysis Tool - Extract hidden APIs, domains, secrets from JS files"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [
+    { name = "BundleInspector Team" }
+]
+keywords = [
+    "security",
+    "javascript",
+    "static-analysis",
+    "api-discovery",
+    "secret-detection",
+    "bug-bounty",
+]
+classifiers = [
+    "Development Status :: 3 - Alpha",
+    "Intended Audience :: Developers",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Security",
+    "Topic :: Software Development :: Testing",
+]
+dependencies = [
+    "httpx>=0.24.0",
+    "playwright>=1.40.0",
+    "beautifulsoup4>=4.12.0",
+    "lxml>=4.9.0",
+    "esprima>=4.0.0",
+    "jsbeautifier>=1.14.0",
+    "pydantic>=2.0.0",
+    "click>=8.1.0",
+    "rich>=13.0.0",
+    "structlog>=23.0.0",
+    "jinja2>=3.1.0",
+    "aiofiles>=23.0.0",
+    "regex>=2023.0.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-asyncio>=0.21.0",
+    "pytest-cov>=4.0.0",
+    "ruff>=0.1.0",
+    "mypy>=1.0.0",
+    "pre-commit>=3.0.0",
+]
+
+[project.scripts]
+bundleInspector = "bundleInspector.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/g2hsec/bundleInspector"
+Documentation = "https://github.com/g2hsec/bundleInspector#readme"
+Repository = "https://github.com/g2hsec/bundleInspector"
+Issues = "https://github.com/g2hsec/bundleInspector/issues"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/bundleInspector"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+select = [
+    "E",    # pycodestyle errors
+    "W",    # pycodestyle warnings
+    "F",    # pyflakes
+    "I",    # isort
+    "B",    # flake8-bugbear
+    "C4",   # flake8-comprehensions
+    "UP",   # pyupgrade
+]
+ignore = [
+    "E501",  # line too long (handled by formatter)
+    "B008",  # function calls in argument defaults
+]
+
+[tool.ruff.isort]
+known-first-party = ["bundleInspector"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_ignores = true
+disallow_untyped_defs = true
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+addopts = "-v --tb=short"
+
+[tool.coverage.run]
+source = ["src/bundleInspector"]
+branch = true
+
+[tool.coverage.report]
+exclude_lines = [
+    "pragma: no cover",
+    "def __repr__",
+    "raise NotImplementedError",
+    "if TYPE_CHECKING:",
+]
+

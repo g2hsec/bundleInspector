@@ -1,0 +1,2 @@
+"""BundleInspector test suite."""
+

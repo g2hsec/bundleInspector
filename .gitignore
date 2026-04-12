@@ -1,0 +1,15 @@
+# Local editor / agent settings
+.claude/settings.local.json
+
+# Local runtime cache and generated artifacts
+.bundleInspector/
+.pytest_cache/
+.tmp_test_artifacts/
+tests/.tmp_sandbox/
+api_map.json
+api_map.txt
+
+# Python cache artifacts
+**/__pycache__/
+*.py[cod]
+

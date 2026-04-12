@@ -1,0 +1,41 @@
+# Ultra-safe remote web-scan profile.
+# Goal: lowest practical traffic for unknown programs, strict environments,
+# or first contact with production systems.
+
+scope:
+  include_subdomains: false
+  third_party_policy: skip
+
+crawler:
+  max_depth: 0
+  max_pages: 1
+  max_js_files: 40
+  rate_limit: 5.0
+  max_concurrent: 1
+  request_timeout: 15.0
+  page_timeout: 15.0
+  max_redirects: 3
+  follow_redirects: true
+  use_headless: false
+  headless_wait_time: 0.5
+  explore_routes: false
+  max_route_exploration: 0
+  max_retries: 0
+  retry_delay: 1.0
+
+parser:
+  tolerant: true
+  partial_on_error: true
+  beautify: true
+  resolve_sourcemaps: true
+
+rules:
+  min_confidence: medium
+  mask_secrets: true
+
+output:
+  format: html
+  output_dir: artifacts/ultra-safe
+  include_raw_content: false
+
+resume: true

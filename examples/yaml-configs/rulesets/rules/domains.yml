@@ -1,0 +1,31 @@
+category: domains
+rules:
+  - id: DOM_INTERNAL_HOSTNAME
+    title: "Internal-looking hostname found"
+    severity: medium
+    confidence: medium
+    matcher:
+      type: regex
+      pattern: "(?i)\\b([a-z0-9\\-]+\\.)*(corp|internal|intra|local|lan)\\.[a-z]{2,}\\b"
+      capture_as: domain
+    extract:
+      fields:
+        indicator_type: { static: "domain" }
+        value: { from_capture: domain }
+    evidence:
+      snippet_from: normalized
+
+  - id: DOM_PRIVATE_IP
+    title: "Private IP literal found"
+    severity: medium
+    confidence: high
+    matcher:
+      type: regex
+      pattern: "\\b(10\\.(?:\\d{1,3}\\.){2}\\d{1,3}|192\\.168\\.(?:\\d{1,3}\\.)\\d{1,3}|172\\.(?:1[6-9]|2\\d|3[0-1])\\.(?:\\d{1,3}\\.)\\d{1,3})\\b"
+      capture_as: ip
+    extract:
+      fields:
+        indicator_type: { static: "ip" }
+        value: { from_capture: ip }
+    evidence:
+      snippet_from: raw

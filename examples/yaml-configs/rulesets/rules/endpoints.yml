@@ -1,0 +1,28 @@
+category: endpoints
+rules:
+  - id: EP_FETCH_LITERAL
+    title: "Detect literal fetch endpoints"
+    severity: medium
+    confidence: high
+    matcher:
+      type: ast_pattern
+      language: javascript
+      pattern:
+        kind: CallExpression
+        callee_any_of:
+          - "fetch"
+        args:
+          - type: LiteralString
+            capture_as: endpoint
+    extract:
+      fields:
+        endpoint:
+          from_capture: endpoint
+        method:
+          static: "GET|UNKNOWN"
+    normalize:
+      endpoint:
+        strip_query: true
+    evidence:
+      snippet_from: normalized
+      include_ast_path: true

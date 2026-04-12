@@ -1,0 +1,15 @@
+category: debug
+rules:
+  - id: DBG_DEBUG_PATHS
+    title: "Debug/health/metrics path string detected"
+    severity: medium
+    confidence: medium
+    matcher:
+      type: regex
+      pattern: "(?i)\\b(/debug|/health|/metrics|/internal|/admin|/actuator)\\b"
+      capture_as: path
+    extract:
+      fields:
+        debug_path: { from_capture: path }
+    evidence:
+      snippet_from: normalized
