@@ -272,12 +272,13 @@ class SecretDetector(BaseRule):
 
     # Generic assignment-context patterns (scanned against source content, not string literals)
     GENERIC_PATTERNS = [
-        (r"['\"]?(?:api[_-]?key|apikey)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "api_key", Severity.HIGH),
-        (r"['\"]?(?:secret[_-]?key)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "secret_key", Severity.HIGH),
-        (r"['\"]?(?:access[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "access_token", Severity.HIGH),
-        (r"['\"]?(?:auth[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "auth_token", Severity.HIGH),
-        (r"['\"]?(?:secret|token|password|passwd|pwd)['\"]?\s*[:=]\s*['\"]([^'\"]{8,})['\"]", "generic_secret", Severity.MEDIUM),
-        (r"['\"]?(?:auth|authorization)['\"]?\s*[:=]\s*['\"](?:Bearer |Basic )?([a-zA-Z0-9_.-]{20,})['\"]", "auth_header", Severity.HIGH),
+        (r"['\"]?(?:api[_-]?key|apikey)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "api_key", Severity.HIGH, Confidence.HIGH),
+        (r"['\"]?(?:secret[_-]?key)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "secret_key", Severity.HIGH, Confidence.HIGH),
+        (r"['\"]?(?:session(?:[_-]?(?:id|token|key))?|sess(?:ion|id)?|jsessionid|phpsessid|connect\.sid|nextauth\.session-token|next-auth\.session-token|session_cookie|cookie_token)['\"]?\s*[:=]\s*['\"]([^'\"]{16,})['\"]", "session_token", Severity.MEDIUM, Confidence.MEDIUM),
+        (r"['\"]?(?:access[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "access_token", Severity.HIGH, Confidence.HIGH),
+        (r"['\"]?(?:auth[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "auth_token", Severity.HIGH, Confidence.HIGH),
+        (r"['\"]?(?:secret|token|password|passwd|pwd)['\"]?\s*[:=]\s*['\"]([^'\"]{8,})['\"]", "generic_secret", Severity.MEDIUM, Confidence.HIGH),
+        (r"['\"]?(?:auth|authorization)['\"]?\s*[:=]\s*['\"](?:Bearer |Basic )?([a-zA-Z0-9_.-]{20,})['\"]", "auth_header", Severity.MEDIUM, Confidence.MEDIUM),
     ]
 
     # Exclude patterns (placeholder, test values)
@@ -301,6 +302,13 @@ class SecretDetector(BaseRule):
         r"^replace[-_]",  # replace-with-key
     ]
 
+    SESSION_CONTEXT_PATTERN = re.compile(
+        r"(?:session(?:[_-]?(?:id|token|key))?|sess(?:ion|id)?|jsessionid|phpsessid|"
+        r"connect\.sid|nextauth\.session-token|next-auth\.session-token|"
+        r"session_cookie|cookie_token|cookie)",
+        re.IGNORECASE,
+    )
+
     def __init__(self, entropy_threshold: float = 3.5):
         self.entropy_threshold = entropy_threshold
 
@@ -310,7 +318,9 @@ class SecretDetector(BaseRule):
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Match secrets in IR."""
-        seen_values = set()
+        seen_literal_values = set()
+        emitted_values = set()
+        entropy_candidates = []
 
         for literal in ir.string_literals:
             value = literal.value
@@ -320,9 +330,9 @@ class SecretDetector(BaseRule):
                 continue
 
             # Skip duplicates
-            if value in seen_values:
+            if value in seen_literal_values:
                 continue
-            seen_values.add(value)
+            seen_literal_values.add(value)
 
             # Skip excluded patterns
             if self._is_excluded(value):
@@ -336,63 +346,51 @@ class SecretDetector(BaseRule):
                     if len(match.groups()) > 0:
                         matched_value = match.group(1)
 
+                    effective_secret_type = secret_type
+                    effective_severity = severity
+                    effective_confidence = Confidence.HIGH
+                    context_override = self._session_context_override(
+                        secret_type=secret_type,
+                        literal_line=literal.line,
+                        source_content=context.source_content or "",
+                    )
+                    if context_override:
+                        effective_secret_type = context_override["value_type"]
+                        effective_severity = context_override["severity"]
+                        effective_confidence = context_override["confidence"]
+
                     # Prevent duplicate from GENERIC_PATTERNS scan
-                    seen_values.add(matched_value)
+                    emitted_values.add(matched_value)
 
                     yield RuleResult(
                         rule_id=self.id,
                         category=self.category,
-                        severity=severity,
-                        confidence=Confidence.HIGH,
-                        title=f"Hardcoded {secret_type.replace('_', ' ').title()}",
-                        description=f"Found hardcoded {secret_type} in source code",
+                        severity=effective_severity,
+                        confidence=effective_confidence,
+                        title=f"Hardcoded {effective_secret_type.replace('_', ' ').title()}",
+                        description=f"Found hardcoded {effective_secret_type} in source code",
                         extracted_value=matched_value,
-                        value_type=secret_type,
+                        value_type=effective_secret_type,
                         line=literal.line,
                         column=literal.column,
                         ast_node_type="Literal",
-                        tags=["secret", secret_type],
+                        tags=["secret", effective_secret_type],
+                        metadata={
+                            "matched_text": match.group(0),
+                            "match_uses_capture_group": len(match.groups()) > 0 and matched_value != match.group(0),
+                            "matched_pattern_type": secret_type,
+                            "contextual_type_override": (
+                                effective_secret_type if effective_secret_type != secret_type else None
+                            ),
+                        },
                     )
                     break
             else:
-                # Check entropy for unrecognized but suspicious strings
-                if self._looks_like_secret(value) and self._is_high_quality_random(value):
-                    entropy = self._calculate_entropy(value)
-                    normalized = self._calculate_normalized_entropy(value)
-                    bigram = self._calculate_bigram_entropy(value)
-                    diversity = self._calculate_char_class_diversity(value)
-
-                    # Determine confidence based on multiple factors
-                    confidence = Confidence.LOW
-                    if normalized > 0.85 and diversity >= 3:
-                        confidence = Confidence.MEDIUM
-                    if normalized > 0.9 and bigram > 3.0 and diversity >= 3:
-                        confidence = Confidence.HIGH
-
-                    yield RuleResult(
-                        rule_id=self.id,
-                        category=self.category,
-                        severity=Severity.MEDIUM,
-                        confidence=confidence,
-                        title="Potential Hardcoded Secret",
-                        description=f"High-entropy string found (entropy: {entropy:.2f}, normalized: {normalized:.2f})",
-                        extracted_value=value,
-                        value_type="potential_secret",
-                        line=literal.line,
-                        column=literal.column,
-                        ast_node_type="Literal",
-                        tags=["secret", "entropy"],
-                        metadata={
-                            "entropy": entropy,
-                            "normalized_entropy": normalized,
-                            "bigram_entropy": bigram,
-                            "char_class_diversity": diversity,
-                        },
-                    )
+                entropy_candidates.append((value, literal))
 
         # Scan source content for generic assignment-context patterns
         if context.source_content:
-            for pattern, secret_type, severity in self.GENERIC_PATTERNS:
+            for pattern, secret_type, severity, confidence in self.GENERIC_PATTERNS:
                 for match in re.finditer(pattern, context.source_content, re.IGNORECASE):
                     matched_value = match.group(0)
                     if len(match.groups()) > 0:
@@ -401,26 +399,72 @@ class SecretDetector(BaseRule):
                     if self._is_excluded(matched_value):
                         continue
 
-                    if matched_value in seen_values:
+                    if matched_value in emitted_values:
                         continue
-                    seen_values.add(matched_value)
+                    emitted_values.add(matched_value)
 
                     line = context.source_content[:match.start()].count("\n") + 1
+                    line_start = context.source_content.rfind("\n", 0, match.start()) + 1
+                    column = match.start() - line_start
 
                     yield RuleResult(
                         rule_id=self.id,
                         category=self.category,
                         severity=severity,
-                        confidence=Confidence.HIGH,
+                        confidence=confidence,
                         title=f"Hardcoded {secret_type.replace('_', ' ').title()}",
                         description=f"Found hardcoded {secret_type} in source code",
                         extracted_value=matched_value,
                         value_type=secret_type,
                         line=line,
-                        column=0,
+                        column=column,
                         ast_node_type="Expression",
                         tags=["secret", secret_type],
+                        metadata={
+                            "matched_text": match.group(0),
+                            "match_uses_capture_group": len(match.groups()) > 0 and matched_value != match.group(0),
+                            "match_column": column,
+                        },
                     )
+
+        for value, literal in entropy_candidates:
+            if value in emitted_values:
+                continue
+            if not self._looks_like_secret(value) or not self._is_high_quality_random(value):
+                continue
+
+            entropy = self._calculate_entropy(value)
+            normalized = self._calculate_normalized_entropy(value)
+            bigram = self._calculate_bigram_entropy(value)
+            diversity = self._calculate_char_class_diversity(value)
+
+            confidence = Confidence.LOW
+            if normalized > 0.85 and diversity >= 3:
+                confidence = Confidence.MEDIUM
+            if normalized > 0.9 and bigram > 3.0 and diversity >= 3:
+                confidence = Confidence.HIGH
+
+            yield RuleResult(
+                rule_id=self.id,
+                category=self.category,
+                severity=Severity.MEDIUM,
+                confidence=confidence,
+                title="Potential Hardcoded Secret",
+                description=f"High-entropy string found (entropy: {entropy:.2f}, normalized: {normalized:.2f})",
+                extracted_value=value,
+                value_type="potential_secret",
+                line=literal.line,
+                column=literal.column,
+                ast_node_type="Literal",
+                tags=["secret", "entropy"],
+                metadata={
+                    "entropy": entropy,
+                    "normalized_entropy": normalized,
+                    "bigram_entropy": bigram,
+                    "char_class_diversity": diversity,
+                },
+            )
+            emitted_values.add(value)
 
     def _is_excluded(self, value: str) -> bool:
         """Check if value matches exclusion patterns."""
@@ -444,6 +488,41 @@ class SecretDetector(BaseRule):
                 return True
 
         return False
+
+    def _session_context_override(
+        self,
+        *,
+        secret_type: str,
+        literal_line: int,
+        source_content: str,
+    ) -> dict[str, object] | None:
+        """Downgrade session-like literals found in explicit session/cookie assignment context."""
+        if secret_type not in {"jwt_token", "access_token"}:
+            return None
+        if literal_line <= 0 or not source_content:
+            return None
+
+        line_text = self._source_line(source_content, literal_line)
+        if not line_text:
+            return None
+        if not self.SESSION_CONTEXT_PATTERN.search(line_text):
+            return None
+
+        return {
+            "value_type": "session_token",
+            "severity": Severity.MEDIUM,
+            "confidence": Confidence.MEDIUM,
+        }
+
+    def _source_line(self, source_content: str, line_number: int) -> str:
+        """Return a single source line using 1-based line numbers."""
+        if line_number <= 0:
+            return ""
+        lines = source_content.splitlines()
+        index = line_number - 1
+        if index >= len(lines):
+            return ""
+        return lines[index]
 
     def _looks_like_secret(self, value: str) -> bool:
         """

@@ -220,6 +220,7 @@ It supports both static and runtime-assisted collection, then normalizes, parses
 
 - Shows a branded startup banner by default for `scan` and `analyze`
 - Shows a stage-aware progress bar so long-running scans are easier to follow
+- Prints concise one-line finding summaries in the terminal at the end of a run
 - `--verbose` prints stage-level detail without flooding the terminal
 - `--debug` enables internal logging and deeper execution detail
 - `--no-banner` suppresses the startup art when you want cleaner CI or terminal output
@@ -236,6 +237,16 @@ It supports both static and runtime-assisted collection, then normalizes, parses
 ```bash
 git clone https://github.com/g2hsec/bundleInspector.git
 cd bundleInspector
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .
+```
+
+Windows PowerShell:
+
+```powershell
+py -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -e .
 ```
 

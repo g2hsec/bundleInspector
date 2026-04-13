@@ -13,7 +13,15 @@ from rich.console import Console
 import bundleInspector.cli as cli_module
 from bundleInspector.config import Config, LogLevel
 from bundleInspector.core.progress import PipelineStage, StageProgress
-from bundleInspector.storage.models import Report
+from bundleInspector.storage.models import (
+    Category,
+    Confidence,
+    Evidence,
+    Finding,
+    Report,
+    RiskTier,
+    Severity,
+)
 
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
@@ -232,3 +240,33 @@ def test_run_scan_emits_normalize_asset_detail_and_heartbeat(monkeypatch):
     assert "example.com/static/app.js" in rendered
     assert "sourcemap check" in rendered
     assert "elapsed" in rendered
+
+
+def test_format_cli_finding_line_includes_matched_text_when_value_differs():
+    finding = Finding(
+        rule_id="secret-detector",
+        category=Category.SECRET,
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
+        risk_tier=RiskTier.P2,
+        title="Hardcoded Session Token",
+        evidence=Evidence(
+            file_url="https://example.com/static/app.js",
+            file_hash="hash-secret",
+            line=12,
+            column=4,
+            snippet='const session = "abc123";',
+        ),
+        extracted_value="abc123",
+        masked_value="abc***",
+        value_type="session_token",
+        metadata={"matched_text": 'session_token = "abc123"'},
+    )
+
+    rendered = cli_module._format_cli_finding_line(finding)
+
+    assert "[P2] [MEDIUM] [SECRET]" in rendered
+    assert "Hardcoded Session Token" in rendered
+    assert "abc***" in rendered
+    assert "app.js:12" in rendered
+    assert '(match: session_token = "abc123")' in rendered

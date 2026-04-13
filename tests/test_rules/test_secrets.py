@@ -272,3 +272,45 @@ class TestSecretDetector:
 
         assert not any(f.category.value == "secret" for f in findings)
 
+    def test_detect_session_token_with_moderate_severity_and_confidence(self, detector, context):
+        """Session-like assignments should be detected without escalating to high severity."""
+        source = '''
+        const session_token = "abcdefghijklmnopqrstuvwxyz123456";
+        '''
+        findings = self._analyze(source, detector, context)
+
+        session_finding = next((f for f in findings if f.value_type == "session_token"), None)
+        assert session_finding is not None
+        assert session_finding.severity == Severity.MEDIUM
+        assert session_finding.confidence == Confidence.MEDIUM
+        assert session_finding.extracted_value == "abcdefghijklmnopqrstuvwxyz123456"
+
+    def test_detect_auth_header_preserves_matched_text_metadata(self, detector, context):
+        """Captured auth values should retain the original matched text for reporting."""
+        source = '''
+        const authorization = "Bearer abcdefghijklmnopqrstuvwxyz123456";
+        '''
+        findings = self._analyze(source, detector, context)
+
+        auth_finding = next((f for f in findings if f.value_type == "auth_header"), None)
+        assert auth_finding is not None
+        assert auth_finding.severity == Severity.MEDIUM
+        assert auth_finding.confidence == Confidence.MEDIUM
+        assert auth_finding.metadata["matched_text"] == 'authorization = "Bearer abcdefghijklmnopqrstuvwxyz123456"'
+        assert auth_finding.metadata["match_uses_capture_group"] is True
+
+    def test_detect_session_jwt_downgrades_to_session_context(self, detector, context):
+        """JWTs stored in explicit session context should not be escalated as generic high-risk auth tokens."""
+        source = '''
+        const sessionToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
+        '''
+        findings = self._analyze(source, detector, context)
+
+        session_finding = next((f for f in findings if f.extracted_value.startswith("eyJ")), None)
+        assert session_finding is not None
+        assert session_finding.value_type == "session_token"
+        assert session_finding.severity == Severity.MEDIUM
+        assert session_finding.confidence == Confidence.MEDIUM
+        assert session_finding.metadata["matched_pattern_type"] == "jwt_token"
+        assert session_finding.metadata["contextual_type_override"] == "session_token"
+

@@ -237,6 +237,11 @@ HTML_TEMPLATE = """
                 <div class="evidence">
                     <strong>Value:</strong> {{ finding.masked_value or finding.extracted_value[:100] }}{% if not finding.masked_value and finding.extracted_value|length > 100 %}...{% endif %}
                 </div>
+                {% if finding.metadata.get('matched_text') and finding.metadata.get('matched_text') != finding.extracted_value %}
+                <div class="evidence">
+                    <strong>Matched Text:</strong> {{ finding.metadata.get('matched_text')[:160] }}{% if finding.metadata.get('matched_text')|length > 160 %}...{% endif %}
+                </div>
+                {% endif %}
                 <div class="location">
                     <strong>Location:</strong> {{ finding.evidence.file_url }}:{{ finding.evidence.line }}
                 </div>
