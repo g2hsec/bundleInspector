@@ -293,6 +293,34 @@ def test_html_reporter_shows_original_source_location_and_snippet():
     assert 'const endpoint = &#34;/api/users&#34;;' in html
 
 
+def test_html_reporter_shows_distinct_matched_text_when_value_is_captured():
+    """HTML reports should show the original matched text when it differs from the extracted value."""
+    finding = Finding(
+        rule_id="secret-detector",
+        category=Category.SECRET,
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
+        title="Hardcoded Session Token",
+        evidence=Evidence(
+            file_url="https://example.com/static/app.js",
+            file_hash="hash-secret",
+            line=12,
+            column=4,
+            snippet='const authorization = "Bearer abcdefghijklmnopqrstuvwxyz123456";',
+        ),
+        extracted_value="abcdefghijklmnopqrstuvwxyz123456",
+        metadata={
+            "matched_text": 'authorization = "Bearer abcdefghijklmnopqrstuvwxyz123456"',
+        },
+    )
+    report = Report(findings=[finding])
+
+    html = HTMLReporter().generate(report)
+
+    assert "<strong>Matched Text:</strong>" in html
+    assert "authorization = &#34;Bearer abcdefghijklmnopqrstuvwxyz123456&#34;" in html
+
+
 def test_wordlist_reporter_params_only_uses_endpoint_snippets():
     """Parameter wordlists should not harvest names from non-endpoint findings."""
     report = Report(

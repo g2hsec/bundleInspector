@@ -509,7 +509,7 @@ async def _run_scan(
             completed, total = counts
             count_detail = f"{completed}/{total}" if total else f"{completed} items"
             if runtime_detail and runtime_detail != "starting":
-                return f"{count_detail} · {runtime_detail}"
+                return f"{count_detail} | {runtime_detail}"
             return count_detail
 
         def on_stage_start(stage: PipelineStage):
@@ -845,24 +845,49 @@ def _print_summary(report):
 
         console.print(sev_table)
 
-    # Top findings
     if report.findings:
         console.print()
-        console.print("[bold]Top Findings:[/bold]")
-
-        # Sort by risk score
         sorted_findings = sorted(
             report.findings,
             key=lambda f: f.risk_score or 0,
             reverse=True,
-        )[:5]
+        )
 
-        for finding in sorted_findings:
-            tier = finding.risk_tier.value if finding.risk_tier else "?"
-            sev = finding.severity.value.upper() if finding.severity else "?"
-            console.print(
-                f"  [{tier}] [{sev}] {finding.title[:60]}"
-            )
+        console.print("[bold]Findings:[/bold]")
+        max_display = None if len(sorted_findings) <= 20 else 20
+
+        for idx, finding in enumerate(sorted_findings):
+            if max_display is not None and idx >= max_display:
+                remaining = len(sorted_findings) - max_display
+                console.print(f"  ... and {remaining} more findings")
+                break
+            console.print(f"  {_format_cli_finding_line(finding)}")
+
+
+def _format_cli_finding_line(finding) -> str:
+    """Render a concise one-line finding summary for terminal output."""
+    tier = finding.risk_tier.value if finding.risk_tier else "?"
+    sev = finding.severity.value.upper() if finding.severity else "?"
+    cat = finding.category.value.upper() if finding.category else "?"
+    location = finding.evidence.file_url.rsplit("/", 1)[-1] if finding.evidence and finding.evidence.file_url else "?"
+    line = finding.evidence.line if finding.evidence else 0
+    value = finding.masked_value or finding.extracted_value or ""
+    if len(value) > 48:
+        value = value[:45] + "..."
+    summary = f"[{tier}] [{sev}] [{cat}] {finding.title}"
+    if value:
+        summary += f" :: {value}"
+    summary += f" @ {location}:{line}"
+
+    matched_text = ""
+    if isinstance(finding.metadata, dict):
+        matched_text = str(finding.metadata.get("matched_text") or "")
+    if matched_text and matched_text != finding.extracted_value:
+        compact = matched_text.strip().replace("\n", " ")
+        if len(compact) > 36:
+            compact = compact[:33] + "..."
+        summary += f" (match: {compact})"
+    return summary
 
 
 @main.command()

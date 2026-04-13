@@ -217,6 +217,7 @@ BundleInspector는 JavaScript 자산을 분석해 다음을 찾습니다.
 
 - `scan`과 `analyze`는 기본적으로 브랜드 배너를 표시합니다.
 - 긴 실행 동안 현재 stage를 보여주는 진행 표시를 제공합니다.
+- 실행이 끝나면 주요 finding을 터미널에 한 줄씩 간략하게 요약해 보여줍니다.
 - `--verbose`는 터미널을 과하게 어지럽히지 않는 수준에서 stage 시작과 완료를 보여줍니다.
 - `--debug`는 내부 로그와 더 자세한 실행 과정을 보여줍니다.
 - `--no-banner`는 CI나 깔끔한 터미널 출력을 원할 때 시작 배너를 숨깁니다.
@@ -233,6 +234,16 @@ BundleInspector는 JavaScript 자산을 분석해 다음을 찾습니다.
 ```bash
 git clone https://github.com/g2hsec/bundleInspector.git
 cd bundleInspector
+python3 -m venv venv
+source venv/bin/activate
+pip install -e .
+```
+
+Windows PowerShell:
+
+```powershell
+py -m venv venv
+.\venv\Scripts\Activate.ps1
 pip install -e .
 ```
 

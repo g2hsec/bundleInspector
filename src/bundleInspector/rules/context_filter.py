@@ -142,7 +142,7 @@ class ContextFilter:
             Filtered list of findings
         """
         filtered = []
-        seen_values: dict[str, Finding] = {}
+        seen_values: dict[tuple[str, str], Finding] = {}
 
         # Check if this is a test/mock file
         is_test_file = self._is_test_file(file_url)
@@ -163,7 +163,7 @@ class ContextFilter:
                 continue
 
             # Deduplicate: keep only highest-severity match per value
-            value_key = finding.extracted_value
+            value_key = (finding.extracted_value, finding.rule_id)
             if value_key in seen_values:
                 existing = seen_values[value_key]
                 # Keep the more severe finding (higher order = more severe)
