@@ -829,23 +829,39 @@ class Orchestrator:
                 # Beautify
                 original_hash = asset.content_hash or self.dedup.compute_hash(asset.content)
                 content = asset.content.decode("utf-8", errors="replace")
-                beautify_detail = self._format_normalize_detail(
-                    index,
-                    total_assets,
-                    asset.url,
-                    "beautify",
-                )
-                self.progress.set_detail(beautify_detail)
-                result = await self._await_with_stage_heartbeat(
-                    asyncio.to_thread(self.beautifier.beautify, content),
-                    stage=PipelineStage.NORMALIZE,
-                    detail=beautify_detail,
-                    heartbeat_event="normalize_heartbeat",
-                    log_fields={
-                        "url": asset.url[:160],
-                        "operation": "beautify",
-                    },
-                )
+                if self._should_skip_beautify(asset.content):
+                    skip_detail = self._format_normalize_detail(
+                        index,
+                        total_assets,
+                        asset.url,
+                        "beautify skipped (size limit)",
+                    )
+                    self.progress.set_detail(skip_detail)
+                    logger.info(
+                        "beautify_skipped_large_asset",
+                        url=asset.url[:160],
+                        size_bytes=len(asset.content),
+                        max_bytes=self.config.parser.beautify_max_bytes,
+                    )
+                    result = self._identity_normalization_result(content)
+                else:
+                    beautify_detail = self._format_normalize_detail(
+                        index,
+                        total_assets,
+                        asset.url,
+                        "beautify",
+                    )
+                    self.progress.set_detail(beautify_detail)
+                    result = await self._await_with_stage_heartbeat(
+                        asyncio.to_thread(self.beautifier.beautify, content),
+                        stage=PipelineStage.NORMALIZE,
+                        detail=beautify_detail,
+                        heartbeat_event="normalize_heartbeat",
+                        log_fields={
+                            "url": asset.url[:160],
+                            "operation": "beautify",
+                        },
+                    )
 
                 if result.success:
                     # Store beautified content for use in parse/analyze stages
@@ -956,6 +972,35 @@ class Orchestrator:
         if len(label) > 90:
             return f"...{label[-87:]}"
         return label
+
+    def _format_normalize_detail(
+        self,
+        index: int,
+        total: int,
+        asset_url: str,
+        operation: str,
+    ) -> str:
+        """Build a concise progress detail for normalize-stage asset work."""
+        label = self._summarize_asset_url(asset_url)
+        return f"{index}/{max(total, 1)} {label} · {operation}"
+
+    def _should_skip_beautify(self, content: bytes) -> bool:
+        """Return True when beautify should be skipped for oversized assets."""
+        limit = max(int(self.config.parser.beautify_max_bytes), 0)
+        return limit > 0 and len(content) > limit
+
+    def _identity_normalization_result(self, content: str):
+        """Return a no-op normalization result for already-usable source."""
+        from bundleInspector.normalizer.beautify import NormalizationLevel, NormalizationResult
+
+        return NormalizationResult(
+            content=content,
+            original_content=content,
+            level=NormalizationLevel.NONE,
+            line_mapper=LineMapper.identity(content),
+            success=True,
+            errors=[],
+        )
 
     async def _await_with_stage_heartbeat(
         self,

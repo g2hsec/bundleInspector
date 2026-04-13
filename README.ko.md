@@ -68,7 +68,7 @@ correlator 벤치마크: [scripts/benchmark_correlator.py](scripts/benchmark_cor
 - 심화: [examples/scan-profiles/deep.yml](examples/scan-profiles/deep.yml)
   - SPA 비중이 큰 대상용
   - headless route exploration 사용
-  - 세 프로필 중 커버리지가 가장 높고 트래픽도 가장 큼
+  - 트래픽 계층 프로필 중 커버리지가 가장 높고 트래픽도 가장 큼
 
   예시 명령:
 
@@ -81,12 +81,30 @@ correlator 벤치마크: [scripts/benchmark_correlator.py](scripts/benchmark_cor
     --api-map -w all
   ```
 
+- `fast.yml`
+  - 대형 번들에서 로컬 normalize 시간이 주된 병목일 때 사용
+  - headless 브라우저 없음
+  - route exploration 없음
+  - 속도를 위해 beautify/source-map 정밀도를 명시적으로 일부 포기하는 프로필
+
+  예시 명령:
+
+  ```bash
+  bundleInspector scan https://target.example.com \
+    --config examples/scan-profiles/fast.yml \
+    --scope "*.example.com" \
+    --job-id target-fast \
+    --resume
+  ```
+
 프로필 사용 안내: [examples/scan-profiles/README.md](examples/scan-profiles/README.md)
 
 ### 프로필 비교표
 
 아래 표는 실무적인 트래픽 감각을 정리한 것이며, 절대적인 보장은 아닙니다.
 실제 요청량은 대상 프론트엔드의 동작, 발견되는 자산 수, 렌더링 과정에서 추가 API가 호출되는지에 따라 달라집니다.
+
+`fast`는 트래픽 계층 프로필이 아니라 속도/정밀도 tradeoff 프로필이므로, 아래 표에서는 의도적으로 제외했습니다.
 
 | 프로필 | 핵심 설정 | 권장 용도 | 현실적인 트래픽 감각 | 운영 위험도 |
 |---|---|---|---|---|
@@ -102,6 +120,8 @@ correlator 벤치마크: [scripts/benchmark_correlator.py](scripts/benchmark_cor
 - 기본 `scan` 설정은 보수적이지 않습니다. shipped 기본값은 headless 수집과 route exploration을 켜므로, 운영 대상에는 기본값보다 명시적인 프로필 사용이 맞습니다.
 - `ultra-safe`는 프로그램의 자동화 허용 범위가 불명확하거나, 가능한 한 낮은 트래픽으로 시작해야 할 때 가장 적절한 기본 선택입니다.
 - `conservative`는 가장 안전한 시작점이며, 버그바운티나 운영계 1차 확인에서는 보통 이 프로필이 맞습니다.
+- `ultra-safe`와 `conservative`는 기본 beautify 경로를 유지합니다. 이 둘은 저트래픽 프로필이지, 저정밀 프로필이 아닙니다.
+- `fast`는 속도 전용 프로필입니다. beautify와 sourcemap 해석을 끄므로, 그 정밀도 tradeoff를 받아들일 수 있을 때만 써야 합니다.
 - `standard`는 허가된 일반 진단에서는 쓸 수 있는 편이지만, 렌더링 과정에서 추가적인 프론트엔드/API 트래픽을 만들 수 있어 충분히 눈에 띕니다.
 - `deep`는 커버리지가 가장 높은 대신 운영 영향 위험도 가장 큽니다. 작은 서비스, 취약한 레거시 앱, 무거운 SPA 대상에서는 안전하지 않을 정도의 트래픽을 만들 수 있습니다.
 - BundleInspector는 DoS 도구는 아니지만, 원격 스캔을 잘못 설정하면 일부 프로그램 기준으로는 과도할 수 있습니다. 항상 대상 프로그램의 자동화 정책, 트래픽 제한, 테스트 규칙을 따라야 합니다.
@@ -466,7 +486,7 @@ bundleInspector version
 - `scope`: allowed/denied domain, path, subdomain, third-party policy
 - `auth`: cookies, headers, bearer token, basic auth
 - `crawler`: depth, pages, JS file 수, rate limit, headless, timeouts, retries
-- `parser`: tolerant, partial_on_error, extract/build toggles, beautify, sourcemap
+- `parser`: tolerant, partial_on_error, extract/build toggles, beautify, beautify_max_bytes, sourcemap
 - `rules`: enabled category, custom rules, masking, confidence, entropy
 - `output`: format, file, dir, raw content, snippet, severity, risk tier
 

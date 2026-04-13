@@ -1,5 +1,6 @@
-# Conservative remote web-scan profile.
-# Goal: minimize traffic and avoid interactive browser behavior.
+# Fast remote web-scan profile.
+# Goal: reduce local normalization time on large bundles when speed matters
+# more than normalized/source-map fidelity.
 
 scope:
   include_subdomains: true
@@ -7,10 +8,10 @@ scope:
 
 crawler:
   max_depth: 1
-  max_pages: 10
-  max_js_files: 120
-  rate_limit: 2.5
-  max_concurrent: 2
+  max_pages: 15
+  max_js_files: 180
+  rate_limit: 1.5
+  max_concurrent: 3
   request_timeout: 20.0
   page_timeout: 20.0
   max_redirects: 5
@@ -25,7 +26,7 @@ crawler:
 parser:
   tolerant: true
   partial_on_error: true
-  beautify: true
+  beautify: false
   resolve_sourcemaps: false
 
 rules:
@@ -34,7 +35,7 @@ rules:
 
 output:
   format: html
-  output_dir: artifacts/conservative
+  output_dir: artifacts/fast
   include_raw_content: false
 
 resume: true

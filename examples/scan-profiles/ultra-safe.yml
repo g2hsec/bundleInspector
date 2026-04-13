@@ -27,7 +27,7 @@ parser:
   tolerant: true
   partial_on_error: true
   beautify: true
-  resolve_sourcemaps: true
+  resolve_sourcemaps: false
 
 rules:
   min_confidence: medium

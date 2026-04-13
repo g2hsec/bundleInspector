@@ -208,6 +208,7 @@ class ParserConfig(BaseModel):
     # Beautify
     beautify: bool = True
     resolve_sourcemaps: bool = True
+    beautify_max_bytes: int = 1_000_000
 
 
 # =============================================================================

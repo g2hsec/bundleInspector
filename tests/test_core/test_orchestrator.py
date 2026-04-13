@@ -1900,6 +1900,68 @@ async def test_stage_normalize_emits_heartbeat_for_slow_beautify(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stage_normalize_skips_beautify_for_large_assets(monkeypatch):
+    """Oversized assets should skip beautify and keep identity normalization."""
+    config = Config()
+    config.parser.resolve_sourcemaps = False
+    config.parser.beautify_max_bytes = 8
+    orchestrator = Orchestrator(config)
+    orchestrator._seed_urls = ["https://example.com"]
+
+    source = b'const value = 1;\nfetch("/api/users");'
+    asset = JSAsset(url="https://example.com/static/large.js", content=source, content_hash="")
+    asset.compute_hash()
+    details: list[str] = []
+    orchestrator.progress.on_stage_detail = lambda stage, detail: details.append(detail)
+
+    async def _fake_persist_asset(asset):
+        return None
+
+    async def _fake_checkpoint(stage, seed_urls, js_refs=None, assets=None, findings=None, stage_state=None):
+        return None
+
+    monkeypatch.setattr(orchestrator, "_persist_asset", _fake_persist_asset)
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", _fake_checkpoint)
+
+    await orchestrator._stage_normalize([asset])
+
+    assert asset.content == source
+    assert asset.normalized_hash == asset.content_hash
+    assert any("beautify skipped (size limit)" in detail for detail in details)
+
+
+@pytest.mark.asyncio
+async def test_stage_parse_persists_regex_literal_ast_without_pattern_objects(monkeypatch):
+    """Parse stage should persist regex literal ASTs without JSON serialization errors."""
+    config = Config()
+    config.cache_dir = _make_test_dir() / "cache"
+    orchestrator = Orchestrator(config)
+    orchestrator._seed_urls = ["https://example.com"]
+
+    asset = JSAsset(
+        url="https://example.com/static/regex.js",
+        content=b"const re = /abc/i;",
+        content_hash="",
+    )
+    asset.compute_hash()
+
+    async def _fake_checkpoint(stage, seed_urls, js_refs=None, assets=None, findings=None, stage_state=None):
+        return None
+
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", _fake_checkpoint)
+
+    await orchestrator._stage_parse([asset])
+
+    assert asset.parse_success is True
+    assert asset.ast_hash
+    stored_ast = await orchestrator._artifact_store.get_ast(asset.content_hash, asset.ast_hash)
+    assert stored_ast is not None
+    literal = stored_ast["body"][0]["declarations"][0]["init"]
+    assert literal["regex"] == {"pattern": "abc", "flags": "i"}
+    assert literal["value"] is None
+
+
+@pytest.mark.asyncio
 async def test_stage_download_propagates_cancelled_error(monkeypatch):
     """Download stage should not swallow task cancellation signals."""
     config = Config()
