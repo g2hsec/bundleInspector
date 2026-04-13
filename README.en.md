@@ -69,7 +69,7 @@ Remote scan profiles: [examples/scan-profiles/README.md](examples/scan-profiles/
 - Deep: [examples/scan-profiles/deep.yml](examples/scan-profiles/deep.yml)
   - SPA-heavy targets
   - headless route exploration enabled
-  - highest coverage and highest traffic of the three
+  - highest coverage and highest traffic among the traffic-tier profiles
 
   Example command:
 
@@ -82,6 +82,22 @@ Remote scan profiles: [examples/scan-profiles/README.md](examples/scan-profiles/
     --api-map -w all
   ```
 
+- `fast.yml`
+  - use when local normalize time on very large bundles is the main bottleneck
+  - no headless browser
+  - no route exploration
+  - explicitly trades beautify/source-map fidelity for faster turnaround
+
+  Example command:
+
+  ```bash
+  bundleInspector scan https://target.example.com \
+    --config examples/scan-profiles/fast.yml \
+    --scope "*.example.com" \
+    --job-id target-fast \
+    --resume
+  ```
+
 Profile usage guide: [examples/scan-profiles/README.md](examples/scan-profiles/README.md)
 
 ### Profile Comparison
@@ -89,6 +105,9 @@ Profile usage guide: [examples/scan-profiles/README.md](examples/scan-profiles/R
 These are practical traffic expectations, not hard guarantees. Actual request
 volume depends on the target's frontend behavior, number of discovered assets,
 and whether rendering triggers additional API calls.
+
+`fast` is intentionally omitted from this table because it is a speed/precision
+tradeoff profile, not a traffic-tier profile.
 
 | Profile | Key settings | Typical use | Realistic traffic expectation | Operational risk |
 |---|---|---|---|---|
@@ -104,6 +123,8 @@ and whether rendering triggers additional API calls.
 - The default `scan` settings are not conservative. The shipped defaults enable headless collection and route exploration, so use an explicit profile instead of relying on defaults for production targets.
 - `ultra-safe` is the best default when a program's automation allowance is unclear or when you want the lowest practical traffic.
 - `conservative` is the safest starting point and is usually the right first choice for bug bounty or production triage.
+- `ultra-safe` and `conservative` keep the normal beautify path enabled. They are low-traffic profiles, not low-precision profiles.
+- `fast` is the explicit speed-focused profile. It disables beautify and sourcemap resolution, so use it only when that precision tradeoff is acceptable.
 - `standard` is often acceptable for authorized diagnosis, but it is still visible and can trigger additional frontend/API traffic during rendering.
 - `deep` has the highest coverage and the highest risk of noticeable operational impact. On small services, brittle legacy apps, or heavy SPA targets, it can create enough traffic to be treated as unsafe.
 - BundleInspector is not a DoS tool, but misconfigured remote scans can still be too aggressive for some programs. Always follow the target program's rules, traffic limits, and automation policy.
@@ -611,6 +632,7 @@ The shipped YAML subset works even without `PyYAML`.
 - `extract_imports`
 - `build_call_graph`
 - `beautify`
+- `beautify_max_bytes`
 - `resolve_sourcemaps`
 
 #### `rules`

@@ -7,6 +7,7 @@ Parses JavaScript into AST with error tolerance.
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 from typing import Any, Optional
 
 try:
@@ -361,10 +362,10 @@ class JSParser:
         _seen.add(node_id)
 
         if hasattr(node, "toDict"):
-            return node.toDict()
+            return self._sanitize_esprima_data(node.toDict())
 
         if isinstance(node, dict):
-            return node
+            return self._sanitize_esprima_data(node)
 
         # Manual conversion for esprima nodes
         result = {}
@@ -384,7 +385,27 @@ class JSParser:
             else:
                 result[key] = value
 
-        return result
+        return self._sanitize_esprima_data(result)
+
+    def _sanitize_esprima_data(self, value: Any) -> Any:
+        """Convert parser output into JSON-safe AST data."""
+        if value is None or isinstance(value, (int, float, bool, str)):
+            return value
+        if isinstance(value, re.Pattern):
+            # Regex literals are already represented by sibling `raw` and
+            # `regex` fields. Keeping the compiled Python object breaks AST
+            # persistence and checkpoint serialization.
+            return None
+        if isinstance(value, dict):
+            return {
+                key: self._sanitize_esprima_data(item)
+                for key, item in value.items()
+            }
+        if isinstance(value, (list, tuple)):
+            return [self._sanitize_esprima_data(item) for item in value]
+        if isinstance(value, set):
+            return [self._sanitize_esprima_data(item) for item in sorted(value, key=repr)]
+        return None
 
     def _parse_pyjsparser(self, source: str) -> ParseResult:
         """Parse using pyjsparser."""

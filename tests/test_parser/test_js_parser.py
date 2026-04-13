@@ -1,5 +1,7 @@
 """Tests for JS parser."""
 
+import json
+
 import pytest
 
 from bundleInspector.parser.js_parser import JSParser, parse_js
@@ -114,6 +116,18 @@ class TestJSParser:
         assert "left || right" in normalized
         assert result.success
         assert result.ast is not None
+
+    def test_parse_regex_literal_ast_is_json_serializable(self):
+        """Regex literal ASTs should not retain Python Pattern objects."""
+        result = parse_js("const re = /abc/i;")
+
+        assert result.success
+        assert result.ast is not None
+        json.dumps(result.ast)
+
+        literal = result.ast["body"][0]["declarations"][0]["init"]
+        assert literal["regex"] == {"pattern": "abc", "flags": "i"}
+        assert literal["value"] is None
 
     def test_parse_nullish_assignment_normalizes_to_plain_assignment(self):
         """`??=` should normalize to a parser-compatible plain assignment."""

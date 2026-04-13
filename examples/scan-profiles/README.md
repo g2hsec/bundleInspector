@@ -8,6 +8,7 @@ bundleInspector scan https://target.example.com --config examples/scan-profiles/
 bundleInspector scan https://target.example.com --config examples/scan-profiles/conservative.yml --job-id target
 bundleInspector scan https://target.example.com --config examples/scan-profiles/standard.yml --job-id target
 bundleInspector scan https://target.example.com --config examples/scan-profiles/deep.yml --job-id target
+bundleInspector scan https://target.example.com --config examples/scan-profiles/fast.yml --job-id target
 ```
 
 Recommended usage:
@@ -23,6 +24,7 @@ Recommended usage:
   - no headless browser
   - no route exploration
   - lowest traffic
+  - keeps beautify enabled so low-traffic mode does not silently reduce normalization fidelity
 
 - `standard.yml`
   - use for most production website diagnosis
@@ -33,13 +35,22 @@ Recommended usage:
 - `deep.yml`
   - use for SPA-heavy targets when lazy-loaded chunks matter
   - headless route exploration enabled
-  - highest coverage and highest traffic of the three profiles
+  - highest coverage and highest traffic among the traffic-tier profiles
+
+- `fast.yml`
+  - use when local normalization time on very large bundles is the main bottleneck
+  - no headless browser
+  - no route exploration
+  - explicitly trades beautify/source-map fidelity for faster turnaround
 
 ## Profile Comparison
 
 These are practical traffic expectations, not hard guarantees. Actual request
 volume depends on the target's frontend behavior, number of discovered assets,
 and whether rendering triggers additional API calls.
+
+`fast` is intentionally omitted from this table because it is a speed/precision
+tradeoff profile, not a traffic-tier profile.
 
 | Profile | Key settings | Typical use | Realistic traffic expectation | Operational risk |
 |---|---|---|---|---|
@@ -88,5 +99,7 @@ Notes:
 - `ultra-safe` is the lowest-impact profile and the safest choice when you are not sure what a program allows.
 - `conservative` is the safest profile here. `standard` is clearly visible in logs. `deep` can be operationally unsafe on small services, brittle legacy apps, or heavy SPA targets.
 - The default `bundleInspector scan ...` behavior is more aggressive than `conservative`, so do not rely on defaults for production systems or bug bounty targets.
+- `ultra-safe` and `conservative` keep beautify enabled. They are low-traffic profiles, not low-precision profiles.
+- `fast` is the only shipped profile that intentionally disables beautify and sourcemap resolution for speed. Use it only when that tradeoff is acceptable.
 - Always follow program-specific traffic limits, automation policy, and safe-harbor rules. If you do not have explicit permission for heavier testing, start with `ultra-safe` or `conservative`.
 

@@ -1933,7 +1933,19 @@ async def _run_local_analysis(
                     if analysis_config.parser.beautify:
                         original_hash = asset.content_hash or hashlib.sha256(asset.content).hexdigest()
                         content_str = asset.content.decode('utf-8', errors='replace')
-                        result = beautifier.beautify(content_str)
+                        if (
+                            analysis_config.parser.beautify_max_bytes > 0
+                            and len(asset.content) > analysis_config.parser.beautify_max_bytes
+                        ):
+                            logger.info(
+                                "beautify_skipped_large_asset",
+                                url=asset.url[:160],
+                                size_bytes=len(asset.content),
+                                max_bytes=analysis_config.parser.beautify_max_bytes,
+                            )
+                            result = beautifier.beautify(content_str, level=NormalizationLevel.NONE)
+                        else:
+                            result = beautifier.beautify(content_str)
                         if result.success:
                             normalized_content = result.content.encode('utf-8')
                             asset.content = normalized_content

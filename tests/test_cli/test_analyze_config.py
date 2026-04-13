@@ -618,6 +618,32 @@ async def test_local_analysis_preserves_original_content_hash_when_beautifying()
 
 
 @pytest.mark.asyncio
+async def test_local_analysis_skips_beautify_for_large_assets():
+    """Local analyze should skip beautify when the configured size limit is exceeded."""
+    js_path = _make_test_path("normalize_skip_large_bundle.js")
+    source = 'const  value=1;\nfetch("/api/users");'
+    js_path.write_text(source, encoding="utf-8")
+
+    config = Config()
+    config.parser.beautify_max_bytes = 8
+
+    report = await _run_local_analysis(
+        paths=[str(js_path)],
+        recursive=True,
+        include_json=False,
+        verbose=False,
+        quiet=True,
+        config=config,
+    )
+
+    asset = report.assets[0]
+    original_hash = hashlib.sha256(js_path.read_bytes()).hexdigest()
+
+    assert asset.content_hash == original_hash
+    assert asset.normalized_hash == asset.content_hash
+
+
+@pytest.mark.asyncio
 async def test_local_analysis_includes_commonjs_require_and_export_metadata():
     """Local analyze should annotate CommonJS require/import metadata for correlation."""
     bundle_dir = _make_test_path("commonjs_dir")
