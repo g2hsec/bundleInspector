@@ -348,6 +348,8 @@ Remote-scan behavior notes:
 - `--scope` adds additional allowed domains.
 - `--resume` reuses stored report/checkpoint state when possible instead of starting from scratch.
 - Headless collection is enabled by default unless `--no-headless` is supplied.
+- Normalize progress now includes the currently processed asset so long-running bundles are easier to identify.
+- `--debug` also surfaces Normalize asset-level detail such as sourcemap checks and heartbeat updates for long-running work.
 - `scan` may generate report output plus extra artifacts such as wordlists and API maps.
 - Default output is concise: banner, runtime header, progress bar, and final summary.
 - `--verbose` adds stage start and completion messages.

@@ -5,6 +5,7 @@ HTML report generator.
 from __future__ import annotations
 
 import json
+import re
 
 from jinja2 import Environment
 
@@ -340,9 +341,11 @@ class HTMLReporter(BaseReporter):
         for asset in report_data.get("assets", []):
             asset.pop("content", None)
             asset.pop("sourcemap_content", None)
-        report_json = json.dumps(report_data, ensure_ascii=False).replace(
-            "</script>",
+        report_json = re.sub(
+            r"</script>",
             "<\\/script>",
+            json.dumps(report_data, ensure_ascii=False),
+            flags=re.IGNORECASE,
         )
 
         env = Environment(autoescape=True)

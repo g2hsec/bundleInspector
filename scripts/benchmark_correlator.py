@@ -169,6 +169,9 @@ def main() -> int:
     parser.add_argument("--rounds", type=int, default=5, help="Benchmark rounds")
     args = parser.parse_args()
 
+    if args.rounds < 1:
+        parser.error("--rounds must be at least 1")
+
     result = run_benchmark(
         modules=args.modules,
         fanout=args.fanout,

@@ -1,5 +1,9 @@
 # Local editor / agent settings
 .claude/settings.local.json
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db
 
 # Local runtime cache and generated artifacts
 .bundleInspector/
@@ -8,8 +12,15 @@
 tests/.tmp_sandbox/
 api_map.json
 api_map.txt
+.coverage
+htmlcov/
+.mypy_cache/
+.ruff_cache/
 
 # Python cache artifacts
 **/__pycache__/
 *.py[cod]
+.venv/
+venv/
+env/
 

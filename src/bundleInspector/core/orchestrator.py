@@ -5,10 +5,13 @@ Pipeline orchestrator - main entry point.
 from __future__ import annotations
 
 import asyncio
+import json
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 import httpx
 import structlog
@@ -118,6 +121,7 @@ class Orchestrator:
         self._download_client: httpx.AsyncClient | None = None
         self._line_mappers: dict[str, LineMapper] = {}
         self._sourcemaps: dict[str, SourceMapInfo] = {}
+        self._normalize_heartbeat_seconds: float = 5.0
 
     def _init_storage(self) -> None:
         """Initialize persistent stores for the current job."""
@@ -713,6 +717,8 @@ class Orchestrator:
                         if self.dedup.add_content(result.content_hash, result.url):
                             assets.append(result)
                             await self._persist_asset(result)
+                except asyncio.CancelledError:
+                    raise
                 except BaseException as exc:
                     logger.warning("download_task_exception", error=str(exc))
                 finally:
@@ -812,45 +818,101 @@ class Orchestrator:
         await sourcemap_resolver.setup()
 
         try:
-            for asset in assets:
+            total_assets = len(assets)
+            for index, asset in enumerate(assets, 1):
                 if asset.content_hash in processed:
+                    self.progress.set_detail(
+                        self._format_normalize_detail(index, total_assets, asset.url, "skipped")
+                    )
                     self.progress.update(1)
                     continue
                 # Beautify
+                original_hash = asset.content_hash or self.dedup.compute_hash(asset.content)
                 content = asset.content.decode("utf-8", errors="replace")
-                result = self.beautifier.beautify(content)
+                beautify_detail = self._format_normalize_detail(
+                    index,
+                    total_assets,
+                    asset.url,
+                    "beautify",
+                )
+                self.progress.set_detail(beautify_detail)
+                result = await self._await_with_stage_heartbeat(
+                    asyncio.to_thread(self.beautifier.beautify, content),
+                    stage=PipelineStage.NORMALIZE,
+                    detail=beautify_detail,
+                    heartbeat_event="normalize_heartbeat",
+                    log_fields={
+                        "url": asset.url[:160],
+                        "operation": "beautify",
+                    },
+                )
 
                 if result.success:
                     # Store beautified content for use in parse/analyze stages
-                    asset.content = result.content.encode("utf-8")
+                    normalized_content = result.content.encode("utf-8")
+                    asset.content = normalized_content
                     content = result.content
-                    asset.size = len(asset.content)
-                    asset.compute_hash()  # Recompute hash for beautified content
+                    asset.size = len(normalized_content)
+                    asset.content_hash = original_hash
                     asset.normalized_hash = self.dedup.compute_hash(
-                        asset.content
+                        normalized_content
                     )
 
-                self._line_mappers[asset.content_hash] = result.line_mapper
+                self._line_mappers[original_hash] = result.line_mapper
 
                 # Resolve sourcemap
                 if self.config.parser.resolve_sourcemaps:
-                    sourcemap = await sourcemap_resolver.resolve(
-                        content, asset.url
+                    sourcemap_detail = self._format_normalize_detail(
+                        index,
+                        total_assets,
+                        asset.url,
+                        "sourcemap check",
+                    )
+                    self.progress.set_detail(sourcemap_detail)
+                    sourcemap = await self._await_with_stage_heartbeat(
+                        sourcemap_resolver.resolve(content, asset.url),
+                        stage=PipelineStage.NORMALIZE,
+                        detail=sourcemap_detail,
+                        heartbeat_event="normalize_heartbeat",
+                        log_fields={
+                            "url": asset.url[:160],
+                            "operation": "sourcemap_check",
+                        },
                     )
                     if sourcemap:
+                        self.progress.set_detail(
+                            self._format_normalize_detail(
+                                index,
+                                total_assets,
+                                asset.url,
+                                "sourcemap found",
+                            )
+                        )
                         asset.has_sourcemap = True
                         asset.sourcemap_url = sourcemap.url
                         if sourcemap.content:
                             asset.sourcemap_content = sourcemap.content.encode("utf-8")
                             asset.sourcemap_hash = await self._artifact_store.store_sourcemap(
                                 asset.sourcemap_content,
-                                asset.content_hash,
+                                original_hash,
                             ) if self._artifact_store else None
-                        self._sourcemaps[asset.content_hash] = sourcemap
+                        self._sourcemaps[original_hash] = sourcemap
+                    else:
+                        self.progress.set_detail(
+                            self._format_normalize_detail(
+                                index,
+                                total_assets,
+                                asset.url,
+                                "no sourcemap",
+                            )
+                        )
 
                 await self._persist_asset(asset)
+                self.progress.set_detail(
+                    self._format_normalize_detail(index, total_assets, asset.url, "saved")
+                )
 
-                processed.add(asset.content_hash)
+                processed.add(original_hash)
                 await self._store_checkpoint(
                     PipelineStage.DOWNLOAD,
                     self._seed_urls,
@@ -866,6 +928,62 @@ class Orchestrator:
 
         self.progress.complete_stage()
         logger.info("normalize_complete")
+
+    def _format_normalize_detail(
+        self,
+        index: int,
+        total: int,
+        asset_url: str,
+        operation: str,
+    ) -> str:
+        """Build a concise progress detail for normalize-stage asset work."""
+        return f"{index}/{max(total, 1)} {self._summarize_asset_url(asset_url)} · {operation}"
+
+    def _summarize_asset_url(self, asset_url: str) -> str:
+        """Return a compact host/path label for progress output."""
+        parsed = urlparse(asset_url)
+        host = parsed.netloc
+        path = parsed.path or ""
+        if host and path:
+            label = f"{host}{path}"
+        elif host:
+            label = host
+        elif path:
+            label = path
+        else:
+            label = asset_url
+
+        if len(label) > 90:
+            return f"...{label[-87:]}"
+        return label
+
+    async def _await_with_stage_heartbeat(
+        self,
+        awaitable,
+        *,
+        stage: PipelineStage,
+        detail: str,
+        heartbeat_event: str,
+        log_fields: Optional[dict[str, Any]] = None,
+    ):
+        """Await work while periodically refreshing progress detail for long-running operations."""
+        task = asyncio.create_task(awaitable)
+        heartbeat_seconds = max(self._normalize_heartbeat_seconds, 0.1)
+        started = perf_counter()
+
+        while True:
+            try:
+                return await asyncio.wait_for(asyncio.shield(task), timeout=heartbeat_seconds)
+            except asyncio.TimeoutError:
+                elapsed = perf_counter() - started
+                heartbeat_detail = f"{detail} ({elapsed:.0f}s elapsed)"
+                self.progress.set_detail(heartbeat_detail)
+                logger.debug(
+                    heartbeat_event,
+                    stage=stage.value,
+                    elapsed_seconds=round(elapsed, 2),
+                    **(log_fields or {}),
+                )
 
     async def _stage_parse(
         self,
@@ -889,7 +1007,7 @@ class Orchestrator:
 
             if result.success and result.ast:
                 asset.ast_hash = self.dedup.compute_hash(
-                    str(result.ast).encode()
+                    json.dumps(result.ast, separators=(",", ":"), sort_keys=True).encode()
                 )[:16]
                 # Store parse result for reuse in analyze stage
                 self._parse_results[asset.content_hash] = result
@@ -1955,12 +2073,14 @@ class BundleInspector:
         on_stage_start: Optional[callable] = None,
         on_stage_complete: Optional[callable] = None,
         on_progress: Optional[callable] = None,
+        on_stage_detail: Optional[callable] = None,
         on_resume: Optional[callable] = None,
     ):
         self.config = config or Config()
         self._on_stage_start = on_stage_start
         self._on_stage_complete = on_stage_complete
         self._on_progress = on_progress
+        self._on_stage_detail = on_stage_detail
         self._on_resume = on_resume
 
     async def scan(self, urls: list[str]) -> Report:
@@ -1993,6 +2113,8 @@ class BundleInspector:
             orchestrator.progress.on_stage_complete = self._on_stage_complete
         if self._on_progress:
             orchestrator.progress.on_progress = self._on_progress
+        if self._on_stage_detail:
+            orchestrator.progress.on_stage_detail = self._on_stage_detail
 
         return await orchestrator.run(urls)
 
@@ -2025,4 +2147,3 @@ class BundleInspector:
         """
         finder = cls()
         return await finder.scan([url])
-

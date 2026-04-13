@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+
 import pytest
 
 from bundleInspector.collector import headless as headless_module
@@ -685,6 +687,78 @@ async def test_headless_collector_replays_pending_route_before_continuing_resume
     assert state["route_links_complete"] is True
     assert "current_route_url" not in state
     assert "route_return_pending" not in state
+
+
+@pytest.mark.asyncio
+async def test_headless_collector_skips_external_route_links_without_revisiting_on_resume(_enable_headless):
+    """External route candidates should still advance resume progress."""
+    first = _FakeElement()
+    second = _FakeElement()
+    page = _FakePage(
+        evaluate_result=["/first", "https://cdn.example.net/out", "/second"],
+        selector_elements={
+            'a[href="/first"]': first,
+            'a[href="/second"]': second,
+        },
+    )
+    collector = HeadlessCollector(
+        CrawlerConfig(
+            page_timeout=1,
+            headless_wait_time=0,
+            explore_routes=True,
+            max_route_exploration=10,
+        )
+    )
+
+    await collector._explore_routes(page, "https://example.com/app", _scope())
+
+    assert first.click_count == 1
+    assert second.click_count == 1
+    assert collector.export_resume_state()["next_route_index"] == 3
+
+
+@pytest.mark.asyncio
+async def test_headless_collector_drops_scheduled_progress_after_collection_finishes(_enable_headless):
+    """Background progress notifications should not publish empty reset state after teardown begins."""
+    collector = HeadlessCollector(CrawlerConfig(explore_routes=False))
+    collector._active_page = _FakePage()
+    collector._active_page.url = "https://example.com/app"
+    collector._active_context = _FakeContext(_FakePage(), storage_state_data={"cookies": []})
+    collector._discovered_refs = [JSReference(url="https://example.com/static/app.js")]
+
+    progress_states: list[dict] = []
+
+    async def _on_progress(state: dict):
+        progress_states.append(state)
+
+    collector.on_progress = _on_progress
+    collector._schedule_progress_notification()
+    collector._collection_finished = True
+    collector.reset_resume_state()
+    await collector._wait_for_progress_notifications()
+
+    assert progress_states == []
+
+
+@pytest.mark.asyncio
+async def test_headless_collector_logs_background_progress_exceptions(_enable_headless, monkeypatch):
+    """Fire-and-forget progress tasks should surface exceptions through logger warnings."""
+    collector = HeadlessCollector(CrawlerConfig(explore_routes=False))
+    warnings: list[tuple[str, dict]] = []
+
+    async def _boom():
+        raise RuntimeError("synthetic progress failure")
+
+    monkeypatch.setattr(collector, "_notify_progress", _boom)
+    monkeypatch.setattr(headless_module.logger, "warning", lambda event, **kwargs: warnings.append((event, kwargs)))
+
+    collector._schedule_progress_notification()
+    await asyncio.sleep(0)
+    await collector._wait_for_progress_notifications()
+
+    assert warnings
+    assert warnings[0][0] == "headless_progress_notification_error"
+    assert warnings[0][1]["error"] == "synthetic progress failure"
 
 
 @pytest.mark.asyncio

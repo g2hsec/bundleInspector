@@ -80,7 +80,7 @@ class APIMapBuilder:
     Build API map from endpoint findings.
 
     Reconstructs the API structure as a tree:
-    domain ??path segments ??methods/parameters
+    domain → path segments → methods/parameters
     """
 
     def __init__(self):
@@ -143,7 +143,7 @@ class APIMapBuilder:
 
             route = current_routes[segment]
 
-            # Last segment ??add method and source info
+            # Last segment → add method and source info
             if i == len(segments) - 1:
                 route.add_method(method)
                 route.finding_count += 1
@@ -191,12 +191,12 @@ class APIMapBuilder:
                 normalized.append("{id}")
                 continue
 
-            # Already a curly-brace parameter placeholder ??preserve it
+            # Already a curly-brace parameter placeholder → preserve it
             if segment.startswith("{"):
                 normalized.append(segment)
                 continue
 
-            # Pure numeric ??likely an ID
+            # Pure numeric → likely an ID
             if segment.isdigit():
                 normalized.append("{id}")
                 continue
@@ -288,8 +288,8 @@ class APIMapBuilder:
 
         for i, (name, route) in enumerate(items):
             is_last = i == len(items) - 1
-            connector = "?붴?? " if is_last else "?쒋?? "
-            extension = "    " if is_last else "??  "
+            connector = "└── " if is_last else "├── "
+            extension = "    " if is_last else "│   "
 
             # Format: segment [METHODS] (N findings)
             methods_str = ""

@@ -534,21 +534,21 @@ class _CustomDeclarativeRuleBase(_CustomRuleBase):
         extracted_fields: dict[str, str],
         captures: dict[str, str],
         fallback_value: str = "",
-    ) -> tuple[str, str]:
+    ) -> tuple[str, str, bool]:
         """Resolve the finding's primary extracted value and value type."""
         if self.spec.extract.fields and extracted_fields:
             for field_name, field_spec in self.spec.extract.fields.items():
                 if field_spec.from_capture and field_name in extracted_fields:
-                    return extracted_fields[field_name], self.value_type or field_name
+                    return extracted_fields[field_name], self.value_type or field_name, True
         if extracted_fields:
             field_name, value = next(iter(extracted_fields.items()))
-            return value, self.value_type or field_name
+            return value, self.value_type or field_name, True
         if captures:
             capture_name, value = next(iter(captures.items()))
-            return value, self.value_type or capture_name
-        if fallback_value:
-            return fallback_value, self.value_type or "custom_match"
-        return "", self.value_type or "custom_match"
+            return value, self.value_type or capture_name, True
+        if fallback_value != "":
+            return fallback_value, self.value_type or "custom_match", True
+        return "", self.value_type or "custom_match", False
 
 
 class CustomRegexRule(_CustomRuleBase):
@@ -685,12 +685,12 @@ class CustomRegexMatcherRule(_CustomDeclarativeRuleBase):
         if self.matcher.capture_as:
             captures[self.matcher.capture_as] = extracted
         extracted_fields = self._normalize_fields(self._extract_fields(captures))
-        extracted_value, value_type = self._resolve_primary_value(
+        extracted_value, value_type, has_value = self._resolve_primary_value(
             extracted_fields,
             captures,
             fallback_value=extracted,
         )
-        if not extracted_value:
+        if not has_value:
             return None
         metadata = self._build_metadata(extracted_fields)
         return extracted_value, value_type, metadata
@@ -746,11 +746,11 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                     captures[self.pattern.callee_capture_as] = call_name
 
                 extracted_fields = self._normalize_fields(self._extract_fields(captures))
-                extracted_value, value_type = self._resolve_primary_value(
+                extracted_value, value_type, has_value = self._resolve_primary_value(
                     extracted_fields,
                     captures,
                 )
-                if not extracted_value:
+                if not has_value:
                     continue
 
                 line, column = _get_node_position(node)
@@ -940,11 +940,11 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                     captures[init_pattern.capture_as] = value
 
             extracted_fields = self._normalize_fields(self._extract_fields(captures))
-            extracted_value, value_type = self._resolve_primary_value(
+            extracted_value, value_type, has_value = self._resolve_primary_value(
                 extracted_fields,
                 captures,
             )
-            if not extracted_value:
+            if not has_value:
                 continue
 
             line, column = _get_node_position(node)
@@ -1020,11 +1020,11 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                     captures[right_pattern.capture_as] = value
 
             extracted_fields = self._normalize_fields(self._extract_fields(captures))
-            extracted_value, value_type = self._resolve_primary_value(
+            extracted_value, value_type, has_value = self._resolve_primary_value(
                 extracted_fields,
                 captures,
             )
-            if not extracted_value:
+            if not has_value:
                 continue
 
             line, column = _get_node_position(node)
@@ -1102,11 +1102,11 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                         captures[value_pattern.capture_as] = value
 
                 extracted_fields = self._normalize_fields(self._extract_fields(captures))
-                extracted_value, value_type = self._resolve_primary_value(
+                extracted_value, value_type, has_value = self._resolve_primary_value(
                     extracted_fields,
                     captures,
                 )
-                if not extracted_value:
+                if not has_value:
                     continue
 
                 line, column = _get_node_position(node)
@@ -1182,11 +1182,11 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 continue
 
             extracted_fields = self._normalize_fields(self._extract_fields(captures))
-            extracted_value, value_type = self._resolve_primary_value(
+            extracted_value, value_type, has_value = self._resolve_primary_value(
                 extracted_fields,
                 captures,
             )
-            if not extracted_value:
+            if not has_value:
                 continue
 
             line, column = _get_node_position(node)
@@ -1215,81 +1215,8 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         """Infer AST node kinds that may satisfy the configured semantic rule."""
         candidate_types: set[str] = set()
         for clause in self._iter_clauses():
-            for condition in clause.conditions:
-                if condition.ast:
-                    candidate_types.add(condition.ast.kind)
-                elif condition.right_any_of:
-                    candidate_types.add("AssignmentExpression")
-                elif condition.not_right_any_of:
-                    candidate_types.add("AssignmentExpression")
-                elif condition.right_contains_any_of:
-                    candidate_types.add("AssignmentExpression")
-                elif condition.not_right_contains_any_of:
-                    candidate_types.add("AssignmentExpression")
-                elif condition.regex_on_right:
-                    candidate_types.add("AssignmentExpression")
-                elif condition.not_regex_on_right:
-                    candidate_types.add("AssignmentExpression")
-                elif condition.init_any_of:
-                    candidate_types.add("VariableDeclarator")
-                elif condition.not_init_any_of:
-                    candidate_types.add("VariableDeclarator")
-                elif condition.init_contains_any_of:
-                    candidate_types.add("VariableDeclarator")
-                elif condition.not_init_contains_any_of:
-                    candidate_types.add("VariableDeclarator")
-                elif condition.regex_on_init:
-                    candidate_types.add("VariableDeclarator")
-                elif condition.not_regex_on_init:
-                    candidate_types.add("VariableDeclarator")
-                elif condition.value_any_of:
-                    candidate_types.add("Property")
-                elif condition.not_value_any_of:
-                    candidate_types.add("Property")
-                elif condition.value_contains_any_of:
-                    candidate_types.add("Property")
-                elif condition.not_value_contains_any_of:
-                    candidate_types.add("Property")
-                elif condition.regex_on_value:
-                    candidate_types.add("Property")
-                elif condition.not_regex_on_value:
-                    candidate_types.add("Property")
-                elif condition.arg_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.not_arg_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.arg_contains_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.not_arg_contains_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.regex_on_arg:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.not_regex_on_arg:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.object_arg_property_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.not_object_arg_property_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.object_arg_property_contains_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.not_object_arg_property_contains_any_of:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.regex_on_object_arg_property:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
-                elif condition.not_regex_on_object_arg_property:
-                    candidate_types.add("CallExpression")
-                    candidate_types.add("NewExpression")
+            for condition in self._iter_clause_conditions(clause):
+                candidate_types.update(self._candidate_types_for_condition(condition))
         return candidate_types or {"AssignmentExpression", "CallExpression", "NewExpression"}
 
     def _iter_clauses(self) -> Iterator[SemanticClauseSpec]:
@@ -1297,6 +1224,63 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         yield from self.matcher.logic.any
         yield from self.matcher.logic.all
         yield from self.matcher.logic.none
+
+    def _iter_clause_conditions(self, clause: SemanticClauseSpec) -> Iterator[SemanticConditionSpec]:
+        """Iterate all conditions that can influence clause matching."""
+        yield from clause.conditions
+        yield from clause.any_conditions
+        yield from clause.none_conditions
+
+    def _candidate_types_for_condition(self, condition: SemanticConditionSpec) -> set[str]:
+        """Infer the AST node kinds that could satisfy one semantic condition."""
+        candidate_types: set[str] = set()
+
+        if condition.ast:
+            candidate_types.add(condition.ast.kind)
+        if any((
+            condition.right_any_of,
+            condition.not_right_any_of,
+            condition.right_contains_any_of,
+            condition.not_right_contains_any_of,
+            condition.regex_on_right,
+            condition.not_regex_on_right,
+        )):
+            candidate_types.add("AssignmentExpression")
+        if any((
+            condition.init_any_of,
+            condition.not_init_any_of,
+            condition.init_contains_any_of,
+            condition.not_init_contains_any_of,
+            condition.regex_on_init,
+            condition.not_regex_on_init,
+        )):
+            candidate_types.add("VariableDeclarator")
+        if any((
+            condition.value_any_of,
+            condition.not_value_any_of,
+            condition.value_contains_any_of,
+            condition.not_value_contains_any_of,
+            condition.regex_on_value,
+            condition.not_regex_on_value,
+        )):
+            candidate_types.add("Property")
+        if any((
+            condition.arg_any_of,
+            condition.not_arg_any_of,
+            condition.arg_contains_any_of,
+            condition.not_arg_contains_any_of,
+            condition.regex_on_arg,
+            condition.not_regex_on_arg,
+            condition.object_arg_property_any_of,
+            condition.not_object_arg_property_any_of,
+            condition.object_arg_property_contains_any_of,
+            condition.not_object_arg_property_contains_any_of,
+            condition.regex_on_object_arg_property,
+            condition.not_regex_on_object_arg_property,
+        )):
+            candidate_types.update({"CallExpression", "NewExpression"})
+
+        return candidate_types
 
     def _match_logic(
         self,
@@ -2565,12 +2549,15 @@ def _extract_argument_value(
             return node.get("name")
         return None
     if arg_type == "MemberPath":
-        return _extract_member_path(node) or _resolve_member_lookup_path(node, constants)
+        return _first_resolved_value(
+            _extract_member_path(node),
+            _resolve_member_lookup_path(node, constants),
+        )
     if arg_type == "Any":
-        return (
-            _resolve_string_expr(node, constants)
-            or _extract_member_path(node)
-            or _resolve_member_lookup_path(node, constants)
+        return _first_resolved_value(
+            _resolve_string_expr(node, constants),
+            _extract_member_path(node),
+            _resolve_member_lookup_path(node, constants),
         )
     return None
 
@@ -2581,10 +2568,10 @@ def _resolve_invocation_argument_value(
     function_returns: Optional[dict[str, dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Resolve a practical semantic invocation argument as a string or static member path."""
-    return (
-        _resolve_string_expr(node, constants, function_returns)
-        or _extract_member_path(node)
-        or _resolve_member_lookup_path(node, constants)
+    return _first_resolved_value(
+        _resolve_string_expr(node, constants, function_returns),
+        _extract_member_path(node),
+        _resolve_member_lookup_path(node, constants),
     )
 
 
@@ -2594,11 +2581,19 @@ def _resolve_semantic_value_expr(
     function_returns: Optional[dict[str, dict[str, Any]]] = None,
 ) -> Optional[str]:
     """Resolve a practical semantic assignment/init/property value as a string or static member path."""
-    return (
-        _resolve_string_expr(node, constants, function_returns)
-        or _extract_member_path(node)
-        or _resolve_member_lookup_path(node, constants)
+    return _first_resolved_value(
+        _resolve_string_expr(node, constants, function_returns),
+        _extract_member_path(node),
+        _resolve_member_lookup_path(node, constants),
     )
+
+
+def _first_resolved_value(*candidates: Optional[str]) -> Optional[str]:
+    """Return the first resolved value, preserving empty strings as valid matches."""
+    for candidate in candidates:
+        if candidate is not None:
+            return candidate
+    return None
 
 
 def _extract_literal_string(node: Any) -> Optional[str]:

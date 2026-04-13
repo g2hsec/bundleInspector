@@ -493,14 +493,31 @@ async def _run_scan(
             PipelineStage.REPORT,
         ]
         stage_started_at: dict[PipelineStage, float] = {}
+        stage_runtime_detail: dict[PipelineStage, str] = {}
+        stage_counts: dict[PipelineStage, tuple[int, int]] = {}
+        last_debug_detail: dict[PipelineStage, str] = {}
 
         def _emit(message: str) -> None:
             progress.console.print(message)
 
+        def _compose_detail(stage: PipelineStage, default: str = "starting") -> str:
+            runtime_detail = stage_runtime_detail.get(stage, default)
+            counts = stage_counts.get(stage)
+            if not counts:
+                return runtime_detail
+
+            completed, total = counts
+            count_detail = f"{completed}/{total}" if total else f"{completed} items"
+            if runtime_detail and runtime_detail != "starting":
+                return f"{count_detail} · {runtime_detail}"
+            return count_detail
+
         def on_stage_start(stage: PipelineStage):
             label = _stage_label(stage)
             stage_started_at[stage] = perf_counter()
-            progress.update(task, stage_label=label, detail="starting")
+            stage_runtime_detail[stage] = "starting"
+            stage_counts.pop(stage, None)
+            progress.update(task, stage_label=label, detail=_compose_detail(stage))
             if verbose or debug:
                 _emit(f"[cyan]→ {label}[/cyan]")
 
@@ -508,6 +525,9 @@ async def _run_scan(
             label = _stage_label(stage)
             duration = perf_counter() - stage_started_at.get(stage, perf_counter())
             completed = stage_progress.completed + stage_progress.failed
+            stage_counts[stage] = (completed, stage_progress.total)
+            stage_runtime_detail.pop(stage, None)
+            last_debug_detail.pop(stage, None)
             detail = (
                 f"{completed}/{stage_progress.total} complete"
                 if stage_progress.total
@@ -524,6 +544,7 @@ async def _run_scan(
                 _emit(f"[green]✓ {label}[/green] {detail}")
 
         def on_progress(stage: PipelineStage, completed: int, total: int):
+            stage_counts[stage] = (completed, total)
             base = 0
             for ordered_stage in stage_order:
                 if ordered_stage == stage:
@@ -536,8 +557,19 @@ async def _run_scan(
                 task,
                 completed=base + stage_progress,
                 stage_label=_stage_label(stage),
-                detail=detail,
+                detail=_compose_detail(stage, default=detail),
             )
+
+        def on_stage_detail(stage: PipelineStage, detail: str):
+            stage_runtime_detail[stage] = detail
+            progress.update(
+                task,
+                stage_label=_stage_label(stage),
+                detail=_compose_detail(stage, default=detail),
+            )
+            if debug and last_debug_detail.get(stage) != detail:
+                last_debug_detail[stage] = detail
+                _emit(f"[dim]{_stage_label(stage)}[/dim] {detail}")
 
         def on_resume(report) -> None:
             progress.update(
@@ -556,6 +588,7 @@ async def _run_scan(
             on_stage_start=on_stage_start,
             on_stage_complete=on_stage_complete,
             on_progress=on_progress,
+            on_stage_detail=on_stage_detail,
             on_resume=on_resume,
         )
         report = await finder.scan(urls)
@@ -1074,6 +1107,16 @@ async def _run_local_analysis(
         job_root = analysis_config.cache_dir / analysis_config.job_id
         artifact_store = ArtifactStore(job_root / "artifacts")
         finding_store = FindingStore(job_root)
+    except PermissionError:
+        fallback_cache_dir = Path.cwd() / ".bundleInspector" / "cache"
+        fallback_cache_dir.mkdir(parents=True, exist_ok=True)
+        analysis_config.cache_dir = fallback_cache_dir
+        try:
+            job_root = analysis_config.cache_dir / analysis_config.job_id
+            artifact_store = ArtifactStore(job_root / "artifacts")
+            finding_store = FindingStore(job_root)
+        except Exception as e:
+            logger.warning("local_storage_init_error", error=str(e))
     except Exception as e:
         logger.warning("local_storage_init_error", error=str(e))
 
@@ -1888,16 +1931,18 @@ async def _run_local_analysis(
                     continue
                 try:
                     if analysis_config.parser.beautify:
+                        original_hash = asset.content_hash or hashlib.sha256(asset.content).hexdigest()
                         content_str = asset.content.decode('utf-8', errors='replace')
                         result = beautifier.beautify(content_str)
                         if result.success:
-                            asset.content = result.content.encode('utf-8')
-                            asset.size = len(asset.content)
-                            asset.compute_hash()
-                            asset.normalized_hash = hashlib.sha256(asset.content).hexdigest()
-                            line_mappers[asset.content_hash] = result.line_mapper
-                except Exception:
-                    pass
+                            normalized_content = result.content.encode('utf-8')
+                            asset.content = normalized_content
+                            asset.size = len(normalized_content)
+                            asset.content_hash = original_hash
+                            asset.normalized_hash = hashlib.sha256(normalized_content).hexdigest()
+                            line_mappers[original_hash] = result.line_mapper
+                except Exception as e:
+                    logger.warning("normalization_error", url=asset.url[:100], error=str(e))
                 await _store_asset(asset)
                 processed_normalized_hashes.add(asset.content_hash)
                 await _store_local_checkpoint(
@@ -2332,4 +2377,3 @@ def _generate_api_map(report, report_path: Path, quiet: bool) -> None:
 
 if __name__ == "__main__":
     main()
-

@@ -246,10 +246,10 @@ def _parse_quoted_string(text: str) -> str:
 
 
 def _split_key_value(text: str) -> tuple[str, str]:
-    parts = _split_top_level(text, ":", maxsplit=1)
-    if len(parts) != 2:
+    separator_index = _find_key_value_separator(text)
+    if separator_index is None:
         raise ValueError(f"Invalid YAML mapping entry: {text}")
-    return parts[0].strip(), parts[1].strip()
+    return text[:separator_index].strip(), text[separator_index + 1:].strip()
 
 
 def _try_parse_mapping_item(text: str) -> tuple[str, str] | None:
@@ -295,6 +295,38 @@ def _split_top_level(text: str, delimiter: str, maxsplit: int = -1) -> list[str]
     return parts
 
 
+def _find_key_value_separator(text: str) -> int | None:
+    """Find the first top-level YAML mapping delimiter."""
+    depth = 0
+    quote = ""
+
+    for index, char in enumerate(text):
+        if quote:
+            if char == quote:
+                quote = ""
+            continue
+
+        if char in {"'", '"'}:
+            quote = char
+            continue
+
+        if char in "{[":
+            depth += 1
+            continue
+        if char in "}]":
+            depth = max(depth - 1, 0)
+            continue
+
+        if char != ":" or depth != 0:
+            continue
+
+        next_char = text[index + 1] if index + 1 < len(text) else ""
+        if not next_char or next_char.isspace():
+            return index
+
+    return None
+
+
 def _looks_like_int(text: str) -> bool:
     return text.isdigit() or (text.startswith("-") and text[1:].isdigit())
 
@@ -307,5 +339,5 @@ def _looks_like_float(text: str) -> bool:
         return False
     if whole.startswith("-"):
         whole = whole[1:]
-    return whole.isdigit() and fraction.isdigit()
+    return (whole == "" or whole.isdigit()) and fraction.isdigit()
 
