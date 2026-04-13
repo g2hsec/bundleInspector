@@ -4,6 +4,7 @@ Any token-like literals in this module are fake sample values used for testing.
 They are not real secrets.
 """
 
+import hashlib
 import json
 import uuid
 from pathlib import Path
@@ -11,6 +12,7 @@ from pathlib import Path
 from click.testing import CliRunner
 import pytest
 
+import bundleInspector.cli as cli_module
 from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE
 from bundleInspector.cli import _run_local_analysis, main
 from bundleInspector.config import Config
@@ -555,6 +557,64 @@ async def test_local_analysis_includes_dynamic_then_default_import_bindings():
         and str(binding.get("scope") or "").startswith("function:arrow@")
         for binding in endpoint_findings[0].metadata["import_bindings"]
     )
+
+
+@pytest.mark.asyncio
+async def test_local_analysis_logs_normalization_warning(monkeypatch):
+    """Normalization exceptions should be logged instead of being silently swallowed."""
+    js_path = _make_test_path("normalize_warning_bundle.js")
+    js_path.write_text('fetch("/api/users");', encoding="utf-8")
+
+    warnings: list[tuple[str, dict]] = []
+
+    def _fake_warning(event: str, **kwargs):
+        warnings.append((event, kwargs))
+
+    def _boom(self, content: str):
+        raise RuntimeError("synthetic normalization failure")
+
+    monkeypatch.setattr(cli_module.logger, "warning", _fake_warning)
+    monkeypatch.setattr("bundleInspector.normalizer.beautify.Beautifier.beautify", _boom)
+
+    report = await _run_local_analysis(
+        paths=[str(js_path)],
+        recursive=True,
+        include_json=False,
+        verbose=False,
+        quiet=True,
+        config=Config(),
+    )
+
+    assert report.findings
+    assert warnings
+    assert warnings[0][0] == "normalization_error"
+    assert warnings[0][1]["error"] == "synthetic normalization failure"
+    assert warnings[0][1]["url"] == js_path.as_uri()
+
+
+@pytest.mark.asyncio
+async def test_local_analysis_preserves_original_content_hash_when_beautifying():
+    """Local normalize should keep the raw asset hash and track beautified bytes separately."""
+    js_path = _make_test_path("normalize_hash_bundle.js")
+    source = 'const  value=1;\nfetch("/api/users");'
+    js_path.write_text(source, encoding="utf-8")
+
+    report = await _run_local_analysis(
+        paths=[str(js_path)],
+        recursive=True,
+        include_json=False,
+        verbose=False,
+        quiet=True,
+        config=Config(),
+    )
+
+    assert report.assets
+    asset = report.assets[0]
+    original_hash = hashlib.sha256(js_path.read_bytes()).hexdigest()
+
+    assert asset.content_hash == original_hash
+    assert asset.normalized_hash is not None
+    assert asset.normalized_hash != asset.content_hash
 
 
 @pytest.mark.asyncio

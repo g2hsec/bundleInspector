@@ -9,6 +9,7 @@ import json
 from bundleInspector.reporter.html_reporter import HTMLReporter
 from bundleInspector.reporter.json_reporter import JSONReporter
 from bundleInspector.reporter.sarif_reporter import SARIFReporter
+from bundleInspector.reporter.wordlist_reporter import WordlistReporter
 from bundleInspector.storage.models import (
     Category,
     Confidence,
@@ -96,6 +97,42 @@ def test_sarif_reporter_prefers_original_source_location():
     assert location["region"]["startColumn"] == 5
     assert location["region"]["snippet"]["text"] == 'const endpoint = "/api/users";'
     assert related["artifactLocation"]["uri"] == "https://example.com/static/app.js"
+
+
+def test_sarif_reporter_ignores_non_positive_original_lines():
+    """SARIF should fall back to the finding line when original source lines are invalid."""
+    finding = Finding(
+        rule_id="endpoint-detector",
+        category=Category.ENDPOINT,
+        severity=Severity.MEDIUM,
+        confidence=Confidence.HIGH,
+        title="Endpoint",
+        evidence=Evidence(
+            file_url="https://example.com/static/app.js",
+            file_hash="hash-endpoint",
+            line=40,
+            column=2,
+            snippet='fetch("/api/users")',
+            snippet_lines=(0, 0),
+            original_file_url="src/app.ts",
+            original_line=-1,
+            original_column=4,
+        ),
+        extracted_value="/api/users",
+        metadata={
+            "original_snippet": 'const endpoint = "/api/users";',
+            "original_snippet_lines": [0, 0],
+        },
+    )
+    report = Report(findings=[finding])
+
+    sarif = json.loads(SARIFReporter().generate(report))
+    result = sarif["runs"][0]["results"][0]
+    location = result["locations"][0]["physicalLocation"]
+    flow_location = result["codeFlows"][0]["threadFlows"][0]["locations"][0]["location"]["physicalLocation"]
+
+    assert location["region"]["startLine"] == 40
+    assert flow_location["region"]["startLine"] == 40
 
 
 def test_json_reporter_prefers_original_source_location():
@@ -191,6 +228,35 @@ def test_html_reporter_embeds_machine_readable_json_without_raw_asset_content():
     assert "content" not in data["assets"][0]
 
 
+def test_html_reporter_escapes_script_end_tag_case_insensitively():
+    """Embedded JSON should escape mixed-case script end tags as well."""
+    report = Report(
+        findings=[
+            Finding(
+                rule_id="endpoint-detector",
+                category=Category.ENDPOINT,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.HIGH,
+                title="Endpoint",
+                evidence=Evidence(
+                    file_url="https://example.com/static/app.js",
+                    file_hash="hash-endpoint",
+                    line=12,
+                    column=2,
+                    snippet='fetch("</SCRIPT>")',
+                ),
+                extracted_value='</SCRIPT>',
+            )
+        ],
+    )
+
+    html = HTMLReporter().generate(report)
+    embedded_json = html.split('<script id="bundleInspector-report-data" type="application/json">', 1)[1].split("</script>", 1)[0]
+
+    assert "</SCRIPT>" not in embedded_json
+    assert "<\\/script>" in embedded_json
+
+
 def test_html_reporter_shows_original_source_location_and_snippet():
     """HTML should render original source-map-backed location and snippet details."""
     finding = Finding(
@@ -225,4 +291,48 @@ def test_html_reporter_shows_original_source_location_and_snippet():
     assert "src/app.ts:12" in html
     assert "Original Source Snippet" in html
     assert 'const endpoint = &#34;/api/users&#34;;' in html
+
+
+def test_wordlist_reporter_params_only_uses_endpoint_snippets():
+    """Parameter wordlists should not harvest names from non-endpoint findings."""
+    report = Report(
+        findings=[
+            Finding(
+                rule_id="secret-detector",
+                category=Category.SECRET,
+                severity=Severity.HIGH,
+                confidence=Confidence.HIGH,
+                title="Secret",
+                evidence=Evidence(
+                    file_url="file:///bundle.js",
+                    file_hash="hash-secret",
+                    line=1,
+                    column=0,
+                    snippet="{ userId: 1, accountId: 2 }",
+                ),
+                extracted_value="Bearer token",
+            ),
+            Finding(
+                rule_id="endpoint-detector",
+                category=Category.ENDPOINT,
+                severity=Severity.MEDIUM,
+                confidence=Confidence.HIGH,
+                title="Endpoint",
+                evidence=Evidence(
+                    file_url="file:///bundle.js",
+                    file_hash="hash-endpoint",
+                    line=2,
+                    column=0,
+                    snippet='fetch("/api/users?teamId=1")',
+                ),
+                extracted_value="/api/users?teamId=1",
+            ),
+        ]
+    )
+
+    params = WordlistReporter(mode="params").generate(report).splitlines()
+
+    assert "teamId" in params
+    assert "userId" not in params
+    assert "accountId" not in params
 

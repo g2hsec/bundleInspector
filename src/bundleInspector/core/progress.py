@@ -31,6 +31,7 @@ class StageProgress:
     total: int = 0
     completed: int = 0
     failed: int = 0
+    detail: str = ""
     started_at: Optional[datetime] = None
     completed_at: Optional[datetime] = None
 
@@ -60,6 +61,7 @@ class ProgressTracker:
     on_stage_start: Optional[Callable[[PipelineStage], None]] = None
     on_stage_complete: Optional[Callable[[PipelineStage, StageProgress], None]] = None
     on_progress: Optional[Callable[[PipelineStage, int, int], None]] = None
+    on_stage_detail: Optional[Callable[[PipelineStage, str], None]] = None
 
     def start_stage(self, stage: PipelineStage, total: int = 0) -> None:
         """Start a pipeline stage."""
@@ -93,6 +95,17 @@ class ProgressTracker:
         """Set total for current stage."""
         if self.current_stage in self.stages:
             self.stages[self.current_stage].total = total
+
+    def set_detail(self, detail: str) -> None:
+        """Update detail text for the current stage without changing counters."""
+        if self.current_stage not in self.stages:
+            return
+
+        progress = self.stages[self.current_stage]
+        progress.detail = detail
+
+        if self.on_stage_detail:
+            self.on_stage_detail(self.current_stage, detail)
 
     def complete_stage(self) -> None:
         """Complete current stage."""

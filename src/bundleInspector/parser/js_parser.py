@@ -164,6 +164,8 @@ class JSParser:
         result: list[str] = []
         state = "code"
         string_quote = ""
+        template_expr_stack: list[int] = []
+        regex_in_char_class = False
         i = 0
 
         while i < len(source):
@@ -181,11 +183,21 @@ class JSParser:
                     state = "block_comment"
                     i += 2
                     continue
+                if char == "/" and self._can_start_regex_literal(source, i):
+                    result.append(char)
+                    state = "regex"
+                    regex_in_char_class = False
+                    i += 1
+                    continue
                 if char in {"'", '"', "`"}:
                     string_quote = char
                     result.append(char)
                     state = "string"
                     i += 1
+                    continue
+                if char == "?" and next_char == "?" and i + 2 < len(source) and source[i + 2] == "=":
+                    result.append(" = ")
+                    i += 3
                     continue
                 if char == "?" and next_char == "?":
                     # Preserve width while downgrading to an older logical operator
@@ -193,17 +205,54 @@ class JSParser:
                     result.append("||")
                     i += 2
                     continue
+                if template_expr_stack:
+                    if char == "{":
+                        template_expr_stack[-1] += 1
+                    elif char == "}":
+                        template_expr_stack[-1] -= 1
+                        if template_expr_stack[-1] == 0:
+                            template_expr_stack.pop()
+                            result.append(char)
+                            state = "string"
+                            string_quote = "`"
+                            i += 1
+                            continue
                 result.append(char)
                 i += 1
                 continue
 
             if state == "string":
+                if string_quote == "`" and char == "$" and next_char == "{":
+                    result.append("${")
+                    template_expr_stack.append(1)
+                    state = "code"
+                    i += 2
+                    continue
                 result.append(char)
                 if char == "\\" and i + 1 < len(source):
                     result.append(source[i + 1])
                     i += 2
                     continue
                 if char == string_quote:
+                    state = "code"
+                i += 1
+                continue
+
+            if state == "regex":
+                result.append(char)
+                if char == "\\" and i + 1 < len(source):
+                    result.append(source[i + 1])
+                    i += 2
+                    continue
+                if char == "[":
+                    regex_in_char_class = True
+                    i += 1
+                    continue
+                if char == "]" and regex_in_char_class:
+                    regex_in_char_class = False
+                    i += 1
+                    continue
+                if char == "/" and not regex_in_char_class:
                     state = "code"
                 i += 1
                 continue
@@ -226,6 +275,41 @@ class JSParser:
                 continue
 
         return "".join(result)
+
+    def _can_start_regex_literal(self, source: str, index: int) -> bool:
+        """Heuristically detect regex literal openings in code context."""
+        prev = index - 1
+        while prev >= 0 and source[prev].isspace():
+            prev -= 1
+        if prev < 0:
+            return True
+
+        prev_char = source[prev]
+        if prev_char in "([{:;,=!?&|^~+-*%<>":
+            return True
+
+        if prev_char.isalnum() or prev_char in {"_", "$"}:
+            end = prev
+            while prev >= 0 and (source[prev].isalnum() or source[prev] in {"_", "$"}):
+                prev -= 1
+            token = source[prev + 1:end + 1]
+            return token in {
+                "return",
+                "throw",
+                "case",
+                "delete",
+                "void",
+                "typeof",
+                "instanceof",
+                "in",
+                "new",
+                "yield",
+                "await",
+                "else",
+                "do",
+            }
+
+        return False
 
     def _partial_parse_esprima(
         self,

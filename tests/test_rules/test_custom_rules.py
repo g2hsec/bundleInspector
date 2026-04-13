@@ -13,6 +13,7 @@ from bundleInspector.config import RuleConfig
 from bundleInspector.parser.ir_builder import IRBuilder
 from bundleInspector.parser.js_parser import JSParser
 from bundleInspector.rules.base import AnalysisContext
+from bundleInspector.rules.custom import CustomDeclarativeRuleSpec, CustomSemanticRule
 from bundleInspector.rules.engine import RuleEngine
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
@@ -22,6 +23,118 @@ TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 def _make_test_path(name: str) -> Path:
     """Create a unique path under the workspace-local sandbox."""
     return TEST_TMP_ROOT / f"{uuid.uuid4().hex}_{name}"
+
+
+def test_semantic_value_resolution_preserves_empty_string_literals():
+    """Semantic rules should be able to target empty-string values explicitly."""
+    source = 'const empty = "";'
+    parser = JSParser()
+    parse_result = parser.parse(source)
+    assert parse_result.success is True
+    assert parse_result.ast is not None
+
+    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-empty-string")
+    context = AnalysisContext(
+        file_url="file:///bundle.js",
+        file_hash="hash-empty-string",
+        source_content=source,
+        is_first_party=True,
+    )
+    spec = CustomDeclarativeRuleSpec.model_validate({
+        "id": "EMPTY_INIT",
+        "title": "Empty init",
+        "category": "secret",
+        "matcher": {
+            "type": "semantic",
+            "logic": {
+                "any": [
+                    {
+                        "and": [
+                            {
+                                "init_any_of": {
+                                    "any_of": [""],
+                                    "capture_as": "captured",
+                                }
+                            }
+                        ]
+                    }
+                ]
+            },
+        },
+        "extract": {
+            "fields": {
+                "value": {"from_capture": "captured"},
+            }
+        },
+    })
+    rule = CustomSemanticRule(spec)
+
+    findings = list(rule.match(ir, context))
+
+    assert findings
+    assert findings[0].extracted_value == ""
+
+
+def test_semantic_candidate_types_include_clause_level_or_hints():
+    """Clause-level `or`/`not` conditions should contribute candidate node types."""
+    spec = CustomDeclarativeRuleSpec.model_validate({
+        "id": "CANDIDATE_TYPES",
+        "title": "Candidate types",
+        "category": "secret",
+        "matcher": {
+            "type": "semantic",
+            "logic": {
+                "any": [
+                    {
+                        "or": [
+                            {"init_any_of": {"any_of": [""]}},
+                        ],
+                        "not": [
+                            {"value_any_of": {"any_of": ["skip"]}},
+                        ],
+                    }
+                ]
+            },
+        },
+        "extract": {"fields": {"value": {"static": "hit"}}},
+    })
+    rule = CustomSemanticRule(spec)
+
+    candidate_types = rule._candidate_node_types()
+
+    assert "VariableDeclarator" in candidate_types
+    assert "Property" in candidate_types
+
+
+def test_semantic_candidate_types_union_multiple_hints_from_one_condition():
+    """Candidate type inference should not drop secondary hints on composite conditions."""
+    spec = CustomDeclarativeRuleSpec.model_validate({
+        "id": "COMPOSITE_TYPES",
+        "title": "Composite types",
+        "category": "secret",
+        "matcher": {
+            "type": "semantic",
+            "logic": {
+                "any": [
+                    {
+                        "and": [
+                            {
+                                "ast": {"kind": "Property"},
+                                "right_any_of": {"any_of": ["x"]},
+                            }
+                        ]
+                    }
+                ]
+            },
+        },
+        "extract": {"fields": {"value": {"static": "hit"}}},
+    })
+    rule = CustomSemanticRule(spec)
+
+    candidate_types = rule._candidate_node_types()
+
+    assert "Property" in candidate_types
+    assert "AssignmentExpression" in candidate_types
 
 
 def test_load_custom_source_rule_and_match():

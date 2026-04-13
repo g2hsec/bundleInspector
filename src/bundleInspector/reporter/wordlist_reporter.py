@@ -176,6 +176,8 @@ class WordlistReporter(BaseReporter):
 
         # Also look for common API parameter patterns in source
         for finding in report.findings:
+            if finding.category != Category.ENDPOINT:
+                continue
             if finding.evidence.snippet:
                 # Match object property patterns: { key: value }
                 prop_matches = re.findall(

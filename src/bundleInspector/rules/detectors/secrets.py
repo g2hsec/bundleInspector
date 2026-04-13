@@ -46,7 +46,7 @@ class SecretDetector(BaseRule):
         (r"ABIA[0-9A-Z]{16}", "aws_access_key", Severity.CRITICAL),
         (r"ACCA[0-9A-Z]{16}", "aws_access_key", Severity.CRITICAL),
         (r"ASIA[0-9A-Z]{16}", "aws_temp_access_key", Severity.CRITICAL),
-        (r"(?:aws|amazon).{0,20}secret.{0,20}['\"][0-9a-zA-Z/+]{40}['\"]", "aws_secret_key", Severity.CRITICAL),
+        (r"(?:aws|amazon).{0,20}secret.{0,20}['\"]([0-9a-zA-Z/+]{40})['\"]", "aws_secret_key", Severity.CRITICAL),
 
         # Azure
         (r"(?:AccountKey|account_key|storage_key|storageKey)\s*[=:]\s*['\"]?([a-zA-Z0-9+/]{86}==)", "azure_storage_key", Severity.HIGH),
@@ -166,8 +166,8 @@ class SecretDetector(BaseRule):
         (r"SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}", "sendgrid_api_key", Severity.HIGH),
 
         # Mailgun
-        (r"key-[0-9a-zA-Z]{32}", "mailgun_api_key", Severity.HIGH),
-        (r"[a-f0-9]{32}-[a-f0-9]{8}-[a-f0-9]{8}", "mailgun_private_key", Severity.HIGH),
+        (r"(?<![0-9A-Za-z_-])key-[0-9a-zA-Z]{32}(?![0-9A-Za-z_-])", "mailgun_api_key", Severity.HIGH),
+        (r"(?<![0-9a-f])[a-f0-9]{32}-[a-f0-9]{8}-[a-f0-9]{8}(?![0-9a-f-])", "mailgun_private_key", Severity.HIGH),
 
         # Mailchimp
         (r"[a-f0-9]{32}-us[0-9]{1,2}", "mailchimp_api_key", Severity.HIGH),

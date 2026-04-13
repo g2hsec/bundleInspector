@@ -341,8 +341,9 @@ bundleInspector scan https://example.com --config config.yml
 원격 스캔 출력 메모:
 
 - 기본 출력은 배너, runtime header, 진행 표시, 최종 summary 중심입니다.
+- Normalize 단계는 현재 처리 중인 asset을 detail에 같이 보여줘서 큰 번들 때문에 오래 걸리는 구간을 식별하기 쉽습니다.
 - `--verbose`는 stage 시작과 완료를 더 보여줍니다.
-- `--debug`는 `--verbose` 성격을 포함하고 내부 debug logging도 활성화합니다.
+- `--debug`는 `--verbose` 성격을 포함하고 내부 debug logging을 활성화하며, Normalize 단계의 sourcemap 확인과 장시간 작업 heartbeat도 함께 보여줍니다.
 - `--no-banner`는 배너만 숨기고 진행 표시와 summary는 유지합니다.
 
 ### `analyze`

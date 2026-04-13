@@ -82,6 +82,53 @@ class TestJSParser:
             for node in result.ast.get("body", [])
         )
 
+    def test_parse_nested_template_literal_keeps_following_nullish_normalization(self):
+        """Nested template expressions should not prevent later `??` normalization."""
+        source = '''
+        const x = `a${`b${c ?? d}` + e}`;
+        const y = f ?? g;
+        '''
+        parser = JSParser()
+
+        normalized = parser._normalize_modern_syntax_for_esprima(source)
+        result = parser.parse(source)
+
+        assert "??" not in normalized
+        assert "c || d" in normalized
+        assert "f || g" in normalized
+        assert result.success
+        assert result.ast is not None
+
+    def test_parse_regex_literal_does_not_block_following_nullish_normalization(self):
+        """Regex literals containing quotes should not trap the normalizer in string state."""
+        source = r'''
+        const re = /['"]/g;
+        const value = left ?? right;
+        '''
+        parser = JSParser()
+
+        normalized = parser._normalize_modern_syntax_for_esprima(source)
+        result = parser.parse(source)
+
+        assert "/['\"]/g" in normalized
+        assert "left || right" in normalized
+        assert result.success
+        assert result.ast is not None
+
+    def test_parse_nullish_assignment_normalizes_to_plain_assignment(self):
+        """`??=` should normalize to a parser-compatible plain assignment."""
+        source = "value ??= fallback;"
+        parser = JSParser()
+
+        normalized = parser._normalize_modern_syntax_for_esprima(source)
+        result = parser.parse(source)
+
+        assert "??=" not in normalized
+        assert "||=" not in normalized
+        assert "value  =  fallback;" in normalized
+        assert result.success
+        assert result.ast is not None
+
     def test_parse_es_modules(self):
         """Test parsing ES modules."""
         source = '''

@@ -2,6 +2,9 @@
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
+import time
 import uuid
 from pathlib import Path
 
@@ -1377,6 +1380,46 @@ async def test_run_resumes_partial_parse_checkpoint_without_reparsing(monkeypatc
 
 
 @pytest.mark.asyncio
+async def test_stage_parse_persists_ast_with_resume_compatible_hash():
+    """Stage parse should persist ASTs under the same hash scheme used by the artifact store."""
+    cache_dir = _make_test_dir()
+    config = Config()
+    config.cache_dir = cache_dir
+    config.job_id = "ast-hash-compat"
+    config.ensure_dirs()
+
+    orchestrator = Orchestrator(config)
+    asset = JSAsset(
+        url="https://example.com/app.js",
+        content=b'fetch("/api/users");',
+        content_hash="",
+    )
+    asset.compute_hash()
+
+    await orchestrator._stage_parse([asset])
+
+    assert asset.ast_hash
+    assert orchestrator._artifact_store is not None
+    stored_ast = await orchestrator._artifact_store.get_ast(asset.content_hash, asset.ast_hash)
+    assert stored_ast is not None
+
+    restored = Orchestrator(config)
+    restored_asset = JSAsset(
+        url=asset.url,
+        content=asset.content,
+        content_hash="",
+        ast_hash=asset.ast_hash,
+        parse_success=True,
+    )
+    restored_asset.compute_hash()
+
+    await restored._restore_parse_results([restored_asset])
+
+    assert restored_asset.content_hash in restored._parse_results
+    assert restored._parse_results[restored_asset.content_hash].ast == stored_ast
+
+
+@pytest.mark.asyncio
 async def test_run_resumes_partial_analyze_checkpoint_without_reanalyzing(monkeypatch):
     """Resume should reuse findings already produced inside an unfinished analyze stage."""
     cache_dir = _make_test_dir()
@@ -1748,4 +1791,127 @@ async def test_stage_normalize_skips_completed_assets(monkeypatch):
     await orchestrator._stage_normalize([first, second], processed_hashes={first_hash})
 
     assert beautify_calls == ['const b=1;']
+
+
+@pytest.mark.asyncio
+async def test_stage_normalize_preserves_original_content_hash_and_tracks_normalized_hash(monkeypatch):
+    """Normalize should keep the raw asset hash stable while recording beautified bytes separately."""
+    config = Config()
+    config.parser.resolve_sourcemaps = False
+    orchestrator = Orchestrator(config)
+    orchestrator._seed_urls = ["https://example.com"]
+
+    source = b'const  value=1;\nfetch("/api/users");'
+    asset = JSAsset(url="https://example.com/a.js", content=source, content_hash="")
+    asset.compute_hash()
+    original_hash = asset.content_hash
+
+    async def _fake_persist_asset(asset):
+        return None
+
+    async def _fake_checkpoint(stage, seed_urls, js_refs=None, assets=None, findings=None, stage_state=None):
+        return None
+
+    monkeypatch.setattr(orchestrator, "_persist_asset", _fake_persist_asset)
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", _fake_checkpoint)
+
+    await orchestrator._stage_normalize([asset])
+
+    assert asset.content_hash == original_hash
+    assert asset.normalized_hash == hashlib.sha256(asset.content).hexdigest()
+    assert asset.normalized_hash != original_hash
+    assert original_hash in orchestrator._line_mappers
+
+
+@pytest.mark.asyncio
+async def test_stage_normalize_emits_asset_and_sourcemap_detail_updates(monkeypatch):
+    """Normalize should publish current asset and sourcemap status as stage detail updates."""
+    config = Config()
+    config.parser.resolve_sourcemaps = True
+    orchestrator = Orchestrator(config)
+    orchestrator._seed_urls = ["https://example.com"]
+
+    asset = JSAsset(url="https://example.com/static/app.js", content=b'const value=1;', content_hash="")
+    asset.compute_hash()
+    details: list[str] = []
+    orchestrator.progress.on_stage_detail = lambda stage, detail: details.append(detail)
+
+    async def _fake_persist_asset(asset):
+        return None
+
+    async def _fake_checkpoint(stage, seed_urls, js_refs=None, assets=None, findings=None, stage_state=None):
+        return None
+
+    async def _fake_setup(self):
+        return None
+
+    async def _fake_teardown(self):
+        return None
+
+    async def _fake_resolve(self, content, url):
+        return None
+
+    monkeypatch.setattr(orchestrator, "_persist_asset", _fake_persist_asset)
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", _fake_checkpoint)
+    monkeypatch.setattr("bundleInspector.core.orchestrator.SourceMapResolver.setup", _fake_setup)
+    monkeypatch.setattr("bundleInspector.core.orchestrator.SourceMapResolver.teardown", _fake_teardown)
+    monkeypatch.setattr("bundleInspector.core.orchestrator.SourceMapResolver.resolve", _fake_resolve)
+
+    await orchestrator._stage_normalize([asset])
+
+    assert any("example.com/static/app.js" in detail and "beautify" in detail for detail in details)
+    assert any("sourcemap check" in detail for detail in details)
+    assert any("no sourcemap" in detail for detail in details)
+
+
+@pytest.mark.asyncio
+async def test_stage_normalize_emits_heartbeat_for_slow_beautify(monkeypatch):
+    """Long-running normalize work should emit heartbeat detail updates instead of looking stuck."""
+    config = Config()
+    config.parser.resolve_sourcemaps = False
+    orchestrator = Orchestrator(config)
+    orchestrator._seed_urls = ["https://example.com"]
+    orchestrator._normalize_heartbeat_seconds = 0.1
+
+    asset = JSAsset(url="https://example.com/static/slow.js", content=b'const value=1;', content_hash="")
+    asset.compute_hash()
+    details: list[str] = []
+    orchestrator.progress.on_stage_detail = lambda stage, detail: details.append(detail)
+
+    original_beautify = orchestrator.beautifier.beautify
+
+    def _slow_beautify(content):
+        time.sleep(0.25)
+        return original_beautify(content)
+
+    async def _fake_persist_asset(asset):
+        return None
+
+    async def _fake_checkpoint(stage, seed_urls, js_refs=None, assets=None, findings=None, stage_state=None):
+        return None
+
+    monkeypatch.setattr(orchestrator.beautifier, "beautify", _slow_beautify)
+    monkeypatch.setattr(orchestrator, "_persist_asset", _fake_persist_asset)
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", _fake_checkpoint)
+
+    await orchestrator._stage_normalize([asset])
+
+    assert any("elapsed" in detail for detail in details)
+
+
+@pytest.mark.asyncio
+async def test_stage_download_propagates_cancelled_error(monkeypatch):
+    """Download stage should not swallow task cancellation signals."""
+    config = Config()
+    orchestrator = Orchestrator(config)
+    orchestrator._seed_urls = ["https://example.com"]
+    refs = [JSReference(url="https://example.com/app.js")]
+
+    async def _cancel(_ref):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(orchestrator, "_download_js", _cancel)
+
+    with pytest.raises(asyncio.CancelledError):
+        await orchestrator._stage_download(refs)
 

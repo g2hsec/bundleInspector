@@ -9,6 +9,8 @@ import pytest
 from tests.fixtures.fake_secrets import (
     FAKE_AWS_ACCESS_KEY,
     FAKE_GITHUB_PAT,
+    FAKE_MAILGUN_API_KEY,
+    FAKE_MAILGUN_PRIVATE_KEY,
     FAKE_STRIPE_LIVE,
 )
 from bundleInspector.parser.js_parser import parse_js
@@ -125,6 +127,46 @@ class TestSecretDetector:
         )
         assert db_finding is not None
         assert db_finding.severity == Severity.CRITICAL
+
+    def test_detect_aws_secret_key_extracts_value_only(self, detector, context):
+        """AWS secret extraction should not include assignment context or quotes."""
+        source = '''
+        const config = "aws_secret_key = \\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\"";
+        '''
+        findings = self._analyze(source, detector, context)
+
+        aws_secret = next((f for f in findings if f.value_type == "aws_secret_key"), None)
+        assert aws_secret is not None
+        assert aws_secret.extracted_value == "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+
+    def test_mailgun_api_key_requires_boundaries(self, detector, context):
+        """Mailgun API keys should not match inside larger identifiers."""
+        source = f'''
+        const embedded = "prefix{FAKE_MAILGUN_API_KEY}suffix";
+        const exact = "{FAKE_MAILGUN_API_KEY}";
+        '''
+        findings = self._analyze(source, detector, context)
+
+        assert any(f.value_type == "mailgun_api_key" and f.extracted_value == FAKE_MAILGUN_API_KEY for f in findings)
+        assert not any("prefixkey-" in f.extracted_value for f in findings)
+
+    def test_mailgun_private_key_requires_terminal_boundary(self, detector, context):
+        """Mailgun private key patterns should not match longer hex-dash identifiers."""
+        source = f'''
+        const embedded = "{FAKE_MAILGUN_PRIVATE_KEY}-z";
+        const exact = "{FAKE_MAILGUN_PRIVATE_KEY}";
+        '''
+        findings = self._analyze(source, detector, context)
+
+        assert any(
+            f.value_type == "mailgun_private_key"
+            and f.extracted_value == FAKE_MAILGUN_PRIVATE_KEY
+            for f in findings
+        )
+        assert not any(
+            f.value_type == "mailgun_private_key" and f.extracted_value.endswith("-z")
+            for f in findings
+        )
 
     def test_entropy_detection(self, detector, context):
         """Test high-entropy string detection."""

@@ -242,7 +242,12 @@ class SARIFReporter(BaseReporter):
                 break
 
         location_uri = finding.evidence.original_file_url or finding.evidence.file_url
-        start_line = finding.evidence.original_line or finding.evidence.line or 1
+        start_line = (
+            finding.evidence.original_line
+            if finding.evidence.original_line is not None and finding.evidence.original_line > 0
+            else finding.evidence.line if finding.evidence.line > 0
+            else 1
+        )
         original_column = finding.evidence.original_column
         start_column = ((original_column if original_column is not None else finding.evidence.column or 0) + 1)
         snippet_text = finding.metadata.get("original_snippet") or finding.evidence.snippet
@@ -292,7 +297,12 @@ class SARIFReporter(BaseReporter):
             snippet_start = finding.evidence.snippet_lines[0] if finding.evidence.snippet_lines else 0
         # Fall back to the finding's own line when snippet_lines is unset (0,0)
         if snippet_start < 1:
-            snippet_start = finding.evidence.original_line or finding.evidence.line or 1
+            snippet_start = (
+                finding.evidence.original_line
+                if finding.evidence.original_line is not None and finding.evidence.original_line > 0
+                else finding.evidence.line if finding.evidence.line > 0
+                else 1
+            )
         start_line = snippet_start
         snippet_uri = finding.evidence.original_file_url or finding.evidence.file_url
 

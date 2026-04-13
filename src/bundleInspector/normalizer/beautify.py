@@ -249,7 +249,7 @@ class Beautifier:
             def decode_escapes(match: re.Match) -> str:
                 s = match.group(1)
                 try:
-                    return f'"{re.sub(r"(?<!\\)\\x([0-9a-fA-F]{2})", lambda m: chr(int(m.group(1), 16)), s)}"'
+                    return f'"{self._decode_hex_escapes(s)}"'
                 except Exception:
                     return match.group(0)
 
@@ -263,7 +263,7 @@ class Beautifier:
             def decode_escapes_single(match: re.Match) -> str:
                 s = match.group(1)
                 try:
-                    return f"'{re.sub(r'(?<!\\)\\x([0-9a-fA-F]{2})', lambda m: chr(int(m.group(1), 16)), s)}'"
+                    return f"'{self._decode_hex_escapes(s)}'"
                 except Exception:
                     return match.group(0)
 
@@ -276,6 +276,57 @@ class Beautifier:
             errors.append(f"Escape decoding error: {e}")
 
         return content, errors
+
+    def _decode_hex_escapes(self, value: str) -> str:
+        """Decode practical `\\xNN` escapes without changing string structure."""
+        result: list[str] = []
+        index = 0
+
+        while index < len(value):
+            char = value[index]
+            if char != "\\":
+                result.append(char)
+                index += 1
+                continue
+
+            if index + 1 >= len(value):
+                result.append("\\")
+                break
+
+            next_char = value[index + 1]
+            if next_char == "\\":
+                # Keep escaped backslashes intact so later characters are
+                # interpreted with the same escape parity as the original JS.
+                result.append("\\\\")
+                index += 2
+                continue
+
+            if (
+                next_char == "x"
+                and index + 3 < len(value)
+                and all(ch in "0123456789abcdefABCDEF" for ch in value[index + 2:index + 4])
+            ):
+                decoded = chr(int(value[index + 2:index + 4], 16))
+                if self._is_safe_decoded_char(decoded):
+                    result.append(decoded)
+                else:
+                    result.append(value[index:index + 4])
+                index += 4
+                continue
+
+            result.append(char)
+            result.append(next_char)
+            index += 2
+
+        return "".join(result)
+
+    def _is_safe_decoded_char(self, char: str) -> bool:
+        """Keep structural escapes intact to avoid producing invalid JS."""
+        if char in {'"', "'", "\\", "\n", "\r", "\t", "\0"}:
+            return False
+        if ord(char) < 0x20:
+            return False
+        return True
 
 
 def beautify_js(content: str) -> str:

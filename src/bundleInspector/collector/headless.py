@@ -123,6 +123,8 @@ class HeadlessCollector(BaseCollector):
         self._active_context: BrowserContext | None = None
         self._active_page: Page | None = None
         self._resume_loaded: bool = False
+        self._collection_finished: bool = False
+        self._progress_tasks: set[asyncio.Task[None]] = set()
 
     async def setup(self) -> None:
         """Initialize browser."""
@@ -156,6 +158,7 @@ class HeadlessCollector(BaseCollector):
         if not self._resume_loaded:
             self.reset_resume_state()
         self._resume_loaded = False
+        self._collection_finished = False
 
         if not self._browser:
             await self.setup()
@@ -217,6 +220,8 @@ class HeadlessCollector(BaseCollector):
                 yield ref
 
         finally:
+            self._collection_finished = True
+            await self._wait_for_progress_notifications()
             self.reset_resume_state()
             self._active_page = None
             self._active_context = None
@@ -368,7 +373,11 @@ class HeadlessCollector(BaseCollector):
 
     async def _notify_progress(self) -> None:
         """Publish route-exploration progress when a callback is configured."""
+        if self._collection_finished:
+            return
         await self._capture_runtime_state()
+        if self._collection_finished:
+            return
         if not self.on_progress:
             return
         result = self.on_progress(self.export_resume_state())
@@ -435,6 +444,8 @@ class HeadlessCollector(BaseCollector):
         scope: ScopePolicy,
     ) -> None:
         """Handle incoming response."""
+        if self._collection_finished:
+            return
         url = response.url
 
         # Check if it's a JS response
@@ -494,11 +505,36 @@ class HeadlessCollector(BaseCollector):
 
     def _schedule_progress_notification(self) -> None:
         """Schedule a best-effort async progress callback from sync browser hooks."""
+        if self._collection_finished:
+            return
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        loop.create_task(self._notify_progress())
+        task = loop.create_task(self._notify_progress())
+        self._progress_tasks.add(task)
+        task.add_done_callback(self._on_progress_task_done)
+
+    def _on_progress_task_done(self, task: asyncio.Task[None]) -> None:
+        """Collect background progress task exceptions instead of leaking warnings."""
+        self._progress_tasks.discard(task)
+        if task.cancelled():
+            return
+        exc = task.exception()
+        if exc is not None:
+            setattr(task, "_bundleInspector_progress_logged", True)
+            logger.warning("headless_progress_notification_error", error=str(exc))
+
+    async def _wait_for_progress_notifications(self) -> None:
+        """Drain any in-flight progress callbacks before tearing state down."""
+        if not self._progress_tasks:
+            return
+        tasks = list(self._progress_tasks)
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+        for task, result in zip(tasks, results):
+            if isinstance(result, Exception) and not getattr(task, "_bundleInspector_progress_logged", False):
+                setattr(task, "_bundleInspector_progress_logged", True)
+                logger.warning("headless_progress_notification_error", error=str(result))
 
     async def _explore_routes(
         self,
@@ -552,6 +588,8 @@ class HeadlessCollector(BaseCollector):
             link_parsed = urlparse(full_url)
 
             if link_parsed.netloc.lower() != base_parsed.netloc.lower():
+                self._route_index += 1
+                await self._notify_progress()
                 continue
 
             if not scope.is_allowed(full_url):
