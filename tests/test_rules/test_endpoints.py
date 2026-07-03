@@ -1687,3 +1687,56 @@ class TestEndpointDetector:
             for f in findings
         )
 
+    def test_string_literal_method_key_is_honored(self, detector, context):
+        """A string-literal `method` key ({ "method": "POST" }) must set the HTTP method."""
+        source = '''
+        fetch("/api/things", { "method": "POST" });
+        '''
+        findings = self._analyze(source, detector, context)
+
+        assert any(
+            f.extracted_value == "/api/things" and f.metadata.get("method") == "POST"
+            for f in findings
+        )
+
+    def test_constant_bound_method_is_honored(self, detector, context):
+        """A `method` bound to a string constant is resolved instead of defaulting to GET."""
+        source = '''
+        const VERB = "PUT";
+        fetch("/api/things", { method: VERB });
+        '''
+        findings = self._analyze(source, detector, context)
+
+        assert any(
+            f.extracted_value == "/api/things" and f.metadata.get("method") == "PUT"
+            for f in findings
+        )
+
+    def test_axios_create_is_not_reported_as_http_endpoint(self, detector, context):
+        """axios.create is a client factory, not a request: its baseURL is not an api_endpoint."""
+        source = '''
+        const api = axios.create({ baseURL: "https://api.acme.io" });
+        api.get("/users");
+        '''
+        findings = self._analyze(source, detector, context)
+
+        # The joined request URL is still detected...
+        assert any(
+            f.extracted_value == "https://api.acme.io/users"
+            for f in findings
+        )
+        # ...but the bare baseURL must not leak as a standalone HTTP endpoint.
+        assert not any(
+            f.extracted_value == "https://api.acme.io" and f.value_type == "api_endpoint"
+            for f in findings
+        )
+
+    def test_identifier_containing_axios_is_not_an_http_call(self, detector, context):
+        """A user function whose name merely contains 'axios' is not treated as an axios request."""
+        source = '''
+        myAxiosHelper("https://example.com/login");
+        '''
+        findings = self._analyze(source, detector, context)
+
+        assert not any(f.value_type == "api_endpoint" for f in findings)
+
