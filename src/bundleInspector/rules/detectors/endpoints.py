@@ -49,6 +49,12 @@ class EndpointDetector(BaseRule):
         "get", "post", "put", "patch", "delete", "head", "options",
     }
 
+    # axios statics that are not HTTP requests (client factories/helpers).
+    # `axios.create` is a client factory handled by _build_client_base_urls, not a request.
+    AXIOS_NON_REQUEST_MEMBERS = {
+        "create", "all", "spread", "iscancel", "canceltoken", "getadapter",
+    }
+
     # URL patterns
     API_PATTERNS = [
         r"^/api/",
@@ -160,7 +166,13 @@ class EndpointDetector(BaseRule):
         object_name = call.full_name.split(".", 1)[0]
 
         is_exact_http = name_lower in self.HTTP_FUNCTIONS_EXACT
-        is_axios = "axios" in full_name_lower
+        # Match axios only when `axios` is the actual call target (axios(...), axios.get(...)),
+        # not any identifier that merely contains "axios" (e.g. myAxiosHelper), and skip
+        # non-request statics like axios.create.
+        is_axios = (
+            object_name.lower() == "axios"
+            and name_lower not in self.AXIOS_NON_REQUEST_MEMBERS
+        )
         # HTTP method names only match when used as obj.method (e.g., axios.get, http.post)
         is_method_call = (
             name_lower in self.HTTP_METHOD_FUNCTIONS
@@ -3704,11 +3716,20 @@ class EndpointDetector(BaseRule):
             options = call.arguments[1]
             if options.get("type") == "ObjectExpression":
                 for prop in options.get("properties", []):
-                    key = prop.get("key", {}).get("name", "")
-                    if key.lower() == "method":
-                        value = prop.get("value", {})
-                        if value.get("type") == "Literal":
-                            return str(value.get("value", "GET")).upper()
+                    key_node = prop.get("key", {})
+                    # Identifier keys expose `name`; string-literal keys ("method") expose `value`.
+                    key_name = key_node.get("name")
+                    if not isinstance(key_name, str) or not key_name:
+                        literal_key = key_node.get("value")
+                        key_name = literal_key if isinstance(literal_key, str) else ""
+                    if key_name.lower() == "method":
+                        # Resolve literal verbs and constant/identifier-bound verbs alike.
+                        return self._resolve_http_method_expr(
+                            prop.get("value", {}),
+                            constants,
+                            bool_constants,
+                            function_returns,
+                        )
             else:
                 resolved_options = self._resolve_object_expr(
                     options,
