@@ -24,7 +24,7 @@ for pentesters, bug-bounty hunters, and AppSec teams.
 
 - **Two modes** — `scan` a live site (crawl → render → download → analyze) or `analyze` local bundles with **zero network traffic**.
 - **Deep static extraction** — hidden REST / GraphQL / WebSocket endpoints, ~100 secret types, internal & staging domains, feature flags, and debug endpoints — resolved through template literals, string concatenation, ternaries, and constants.
-- **Offensive recon built in** — six enhancements: client-side access-control gating, **dormant/hidden endpoints**, replayable curl/fetch PoCs, IDOR + HTTP method-flip hints, full SPA route maps, and GraphQL/WebSocket surface.
+- **Offensive recon built in** — seven enhancements: client-side access-control gating, **dormant/hidden endpoints**, replayable curl/fetch PoCs, IDOR + HTTP method-flip hints, full SPA route maps, GraphQL/WebSocket surface, and **runtime-observed endpoints** (called at runtime but missed statically).
 - **Safe by default** — state-changing requests (`POST`/`PUT`/`DELETE`) the crawler induces are **blocked and confirmed, not sent**; per-domain rate limiting with adaptive backoff; SSRF & scope guards; secret masking.
 - **Fast** — file-level multiprocessing, an optional native (acorn) parser, content-hash dedup, and resumable checkpoints.
 - **Reports that fit your workflow** — JSON, a self-contained HTML report, and **SARIF** for GitHub Code Scanning — plus fuzzing wordlists and a reconstructed API map.
@@ -109,7 +109,7 @@ bundleInspector scan https://target.example.com --config examples/scan-profiles/
 | `convert <report>` | Convert a report between JSON ⇄ HTML |
 | `version` | Print the version |
 
-Most-used flags: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`.
+Most-used flags: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`, `--fail-on {severity}`.
 Full reference → [CLI section of the User Guide »](docs/USER_GUIDE.md#-cli-reference)
 
 ## 🔬 What It Finds
@@ -122,7 +122,7 @@ Full reference → [CLI section of the User Guide »](docs/USER_GUIDE.md#-cli-re
 | **Feature flags** | LaunchDarkly/Optimizely/Split keywords, `isFeatureEnabled`, admin/debug toggles |
 | **Debug** | `/debug` `/admin` `/actuator`, `console.log` of sensitive data, `debugger`, dev-only branches |
 
-Findings are risk-tiered **P0 → P3** (critical → informational) with impact/likelihood scoring, and enriched with the six recon enhancements — see the [Detection Coverage guide »](docs/USER_GUIDE.md#-detection-coverage).
+Findings are risk-tiered **P0 → P3** (critical → informational) with impact/likelihood scoring, and enriched with the seven recon enhancements — see the [Detection Coverage guide »](docs/USER_GUIDE.md#-detection-coverage).
 
 ## 📚 Documentation
 

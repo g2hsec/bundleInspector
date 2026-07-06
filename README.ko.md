@@ -24,7 +24,7 @@
 
 - **두 가지 모드** — 라이브 사이트를 `scan`(크롤 → 렌더 → 다운로드 → 분석)하거나, 로컬 번들을 **네트워크 트래픽 없이** `analyze`.
 - **깊이 있는 정적 추출** — 숨겨진 REST / GraphQL / WebSocket 엔드포인트, ~100종의 시크릿, 내부·스테이징 도메인, 피처 플래그, 디버그 엔드포인트를 템플릿 리터럴·문자열 결합·삼항식·상수까지 따라가며 해석.
-- **공격 정찰 기능 내장** — 6가지 고도화: 클라이언트 사이드 접근제어 게이팅, **휴면/은닉 엔드포인트**, 재현 가능한 curl/fetch PoC, IDOR + HTTP 메서드-플립 힌트, SPA 라우트 맵 전체 복원, GraphQL/WebSocket 표면.
+- **공격 정찰 기능 내장** — 7가지 고도화: 클라이언트 사이드 접근제어 게이팅, **휴면/은닉 엔드포인트**, 재현 가능한 curl/fetch PoC, IDOR + HTTP 메서드-플립 힌트, SPA 라우트 맵 전체 복원, GraphQL/WebSocket 표면, **런타임 관측 엔드포인트**(정적으론 못 찾았지만 실행 중 호출됨).
 - **기본이 안전** — 크롤러가 유발하는 상태변경 요청(`POST`/`PUT`/`DELETE`)은 **차단·확인하며 전송하지 않음**. 도메인별 레이트리밋 + 적응형 백오프, SSRF·스코프 가드, 시크릿 마스킹.
 - **빠름** — 파일 단위 멀티프로세싱, 선택적 네이티브(acorn) 파서, 콘텐츠 해시 중복 제거, 재개 가능한 체크포인트.
 - **워크플로에 맞는 리포트** — JSON, 단일 파일 HTML 리포트, **SARIF**(GitHub Code Scanning) — 여기에 퍼징 워드리스트와 복원된 API 맵까지.
@@ -109,7 +109,7 @@ bundleInspector scan https://target.example.com --config examples/scan-profiles/
 | `convert <report>` | 리포트를 JSON ⇄ HTML 로 변환 |
 | `version` | 버전 출력 |
 
-자주 쓰는 플래그: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`.
+자주 쓰는 플래그: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`, `--fail-on {심각도}`.
 전체 레퍼런스 → [사용설명서 CLI 섹션 »](docs/USER_GUIDE.ko.md#-cli-레퍼런스)
 
 ## 🔬 무엇을 찾나요
@@ -122,7 +122,7 @@ bundleInspector scan https://target.example.com --config examples/scan-profiles/
 | **피처 플래그** | LaunchDarkly/Optimizely/Split 키워드, `isFeatureEnabled`, admin/debug 토글 |
 | **디버그** | `/debug` `/admin` `/actuator`, 민감정보 `console.log`, `debugger`, dev 전용 분기 |
 
-모든 발견은 **P0 → P3**(치명적 → 정보성) 위험 등급 + 영향/가능성 점수가 매겨지고, 6가지 정찰 고도화로 보강됩니다 — [탐지 커버리지 가이드 »](docs/USER_GUIDE.ko.md#-탐지-커버리지) 참고.
+모든 발견은 **P0 → P3**(치명적 → 정보성) 위험 등급 + 영향/가능성 점수가 매겨지고, 7가지 정찰 고도화로 보강됩니다 — [탐지 커버리지 가이드 »](docs/USER_GUIDE.ko.md#-탐지-커버리지) 참고.
 
 ## 📚 문서
 

@@ -94,6 +94,7 @@ Runtime notes:
 - `client_side_gating_enabled`: enh1 — detect client-side access-control gating (default `true`)
 - `client_side_gating_severity`: enh1 — severity assigned to gated endpoints (default `medium`)
 - `dormant_endpoint_detection_enabled`: enh2 — detect dormant/hidden endpoints declared in JS but never called (default `true`)
+- `runtime_endpoint_surfacing_enabled`: enh7 — surface HTTP/WebSocket endpoints the app *called* at runtime but static analysis never found; scan-only, first-party scoped (default `true`)
 
 Runtime notes:
 

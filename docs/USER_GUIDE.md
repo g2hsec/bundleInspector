@@ -139,6 +139,7 @@ Crawl and analyze one or more live target URLs (at least one URL required).
 | `--rules-file PATH` | — | Load custom regex/AST/semantic rules |
 | `--job-id ID` | auto-uuid | Persistent job id for cache/resume |
 | `--resume` | off | Reuse the latest stored report/checkpoint for the job id |
+| `--fail-on {info,low,medium,high,critical}` | — | Exit code **2** if any finding is at or above this severity (CI gate) |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | Output verbosity controls |
 
 ### `analyze <paths…>` — local, no network
@@ -155,6 +156,7 @@ Analyze local files, directories, or glob patterns (at least one path required).
 | `-w, --wordlist {…}` / `--api-map` | — | Same as `scan` |
 | `--rules-file PATH` | — | Custom rules |
 | `--job-id ID` / `--resume` | — | Cache / resume |
+| `--fail-on {info,low,medium,high,critical}` | — | Exit code **2** if any finding is at or above this severity (CI gate) |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | Verbosity |
 
 > ⚠️ **`-r` differs per command:** in `scan` it is `--rate-limit`; in `analyze` it is `--recursive`.
@@ -347,7 +349,7 @@ BundleInspector will not mutate a target through its own UI driving:
 
 The **Chunk Analyzer** additionally surfaces Webpack/Vite code-split infrastructure and lazy/hidden routes.
 
-### The six enhancements
+### The seven enhancements
 
 | ID | Name | What it does |
 |---|---|---|
@@ -357,6 +359,7 @@ The **Chunk Analyzer** additionally surfaces Webpack/Vite code-split infrastruct
 | **enh4** | IDOR + HTTP method-flip | Detects IDOR/enumeration path parameters (`${…}`, `:id`, UUID, Mongo ObjectId, email, numeric) and tags `idor_candidate`; lists standard HTTP verbs **not yet seen** on each path as advisory fuzz hints. HTTP dedup keys on `(method, url)` so a hidden `DELETE` beside a benign `GET` survives. |
 | **enh5** | Framework client route maps | Reconstructs the SPA's full route table — including admin/internal/feature-flagged pages **never linked in nav** — from React Router, Vue Router, Angular, compiled JSX, and Next.js file routes, joining parent/child paths and associating per-route lazy chunks. Emits `client_route` findings; sensitive routes flagged. |
 | **enh6** | GraphQL + WebSocket surface | Extracts GraphQL operations (query/mutation/subscription + fields) from `gql` tagged templates and query props, and the WebSocket **message surface** from `.send()`/`.emit()` on WS/Socket.IO clients. |
+| **enh7** | Runtime-observed endpoints | The complement of enh2: HTTP/WebSocket endpoints the running app **actually called** during the crawl but static analysis never found (typically dynamically-assembled URLs). Surfaced as `runtime-observed` endpoint findings. Scan-only, first-party scoped, de-duplicated against static findings. |
 
 ### Risk tiers
 
@@ -487,7 +490,7 @@ The `scan` pipeline runs eight stages (the `analyze` command runs an equivalent 
 ## Notes & Limitations
 
 - **No built-in proxy support.** There is no `--proxy` flag; traffic is not routed through an upstream proxy such as Burp or ZAP. Intercept at the OS/network layer if you need to.
-- **Exit codes.** The CLI exits `0` on success **even when findings are present**, and `1` only on error or interrupt — there is no severity-based exit gate. In CI, decide pass/fail from the report or SARIF, not the process exit code.
+- **Exit codes.** `0` = success (even **with** findings), `1` = error or interrupt, `2` = the `--fail-on` severity gate tripped. Without `--fail-on` there is no severity-based gate, so a clean-exit-with-findings stays `0` — either use `--fail-on`, or decide pass/fail from the report/SARIF. (A malformed CLI invocation also exits `2` at parse time, per Click — but *before* the scan runs and with no report written, so it is distinguishable from a gate trip.)
 - **Config-only settings.** `interactive_clicking`, `block_state_changing_requests`, `min_severity`, and `min_risk_tier` have **no CLI flag** — set them in a `--config` YAML/JSON file.
 - **The `on_state_change_attempt` confirm hook** is a programmatic (Python API) hook, not a CLI option; without it, induced state-changing requests are simply blocked.
 - **Duplicate cookie names** in a header string resolve last-wins.
@@ -505,7 +508,7 @@ The `scan` pipeline runs eight stages (the `analyze` command runs an equivalent 
 | Secrets appear masked | Expected — set `rules.mask_secrets: false` in a config file only for local, trusted analysis |
 | Large local bundles are slow | Try `BUNDLEINSPECTOR_PARALLEL=auto`, or the `fast` profile (beautify off) |
 | Non-ASCII (Korean, etc.) console output looks garbled on Windows | Handled automatically — the CLI forces UTF-8 on stdout/stderr, so no `PYTHONIOENCODING` is needed; just use a UTF-8-capable terminal (e.g. Windows Terminal) |
-| `--cookies-from` returns no cookies | The DB (incl. its `-wal` sidecar) is copied first, so the browser may stay open; if it's still empty the values are OS-encrypted — export via a cookie extension to a JSON file and use `--cookies-file` |
+| `--cookies-from` returns no cookies | The DB (incl. `-wal`) is copied, so the browser may stay open. Chrome/Edge/Chromium encrypted values are decrypted automatically on Windows when the optional `cryptography` package is installed (`pip install cryptography`). Still empty → the profile likely uses app-bound encryption (Chrome 127+); export via a cookie extension to JSON and use `--cookies-file` |
 
 ---
 
