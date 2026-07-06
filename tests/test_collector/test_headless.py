@@ -976,21 +976,28 @@ async def test_headless_collector_drops_scheduled_progress_after_collection_fini
 async def test_headless_collector_logs_background_progress_exceptions(_enable_headless, monkeypatch):
     """Fire-and-forget progress tasks should surface exceptions through logger warnings."""
     collector = HeadlessCollector(CrawlerConfig(explore_routes=False))
-    warnings: list[tuple[str, dict]] = []
+    warnings: list[tuple] = []
 
     async def _boom():
         raise RuntimeError("synthetic progress failure")
 
     monkeypatch.setattr(collector, "_notify_progress", _boom)
-    monkeypatch.setattr(headless_module.logger, "warning", lambda event, **kwargs: warnings.append((event, kwargs)))
+    # `logger` here is a stdlib logging.Logger, so warning() takes a message +
+    # positional args (NOT structlog-style kwargs). The mock mirrors that real
+    # signature so this test would catch a regression to `warning(evt, error=..)`.
+    monkeypatch.setattr(
+        headless_module.logger,
+        "warning",
+        lambda msg, *args, **kwargs: warnings.append((msg, args, kwargs)),
+    )
 
     collector._schedule_progress_notification()
     await asyncio.sleep(0)
     await collector._wait_for_progress_notifications()
 
     assert warnings
-    assert warnings[0][0] == "headless_progress_notification_error"
-    assert warnings[0][1]["error"] == "synthetic progress failure"
+    assert "headless progress notification error" in warnings[0][0]
+    assert "synthetic progress failure" in str(warnings[0][1][0])
 
 
 @pytest.mark.asyncio
