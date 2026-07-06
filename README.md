@@ -36,10 +36,23 @@ Requires **Python 3.10+**. Headless scanning needs the Playwright Chromium binar
 ```bash
 git clone https://github.com/g2hsec/bundleInspector.git
 cd bundleInspector
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
+python -m venv .venv
+```
+
+Activate the virtualenv, then install:
+
+| Shell | Activate |
+|---|---|
+| **macOS / Linux (bash/zsh)** | `source .venv/bin/activate` |
+| **Windows PowerShell** | `.venv\Scripts\Activate.ps1` |
+| **Windows cmd** | `.venv\Scripts\activate.bat` |
+
+```bash
 pip install -e .
 playwright install chromium
 ```
+
+> **PowerShell** has no `&&` / `source` — run each line separately. If `Activate.ps1` is blocked ("running scripts is disabled"), run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` once in the session first.
 
 ## ⚡ Quick Start
 

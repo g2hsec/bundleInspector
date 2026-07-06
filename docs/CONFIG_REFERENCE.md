@@ -57,6 +57,8 @@ Runtime notes:
 - `headless_wait_time`: post-load wait
 - `explore_routes`: allow route exploration
 - `max_route_exploration`: route/click exploration cap
+- `interactive_clicking`: click buttons/tabs/role elements to trigger lazy JS (default `false` — highest-risk UI driving)
+- `block_state_changing_requests`: block non-idempotent (POST/PUT/PATCH/DELETE) requests the UI driving induces (default `true`; endpoint still recorded)
 - `max_retries`: HTTP retry count
 - `retry_delay`: retry delay seconds
 - `user_agent`: remote-scan user agent
@@ -72,6 +74,7 @@ Runtime notes:
 - `build_call_graph`: parser-model field
 - `beautify`: normalize/beautify JS before parse
 - `resolve_sourcemaps`: resolve source maps when available
+- `beautify_max_bytes`: skip beautify above this size in bytes (default `1000000`)
 
 Runtime notes:
 
@@ -88,6 +91,9 @@ Runtime notes:
 - `entropy_threshold`: entropy threshold for generic secret detection
 - `extract_headers`: endpoint-rule setting
 - `extract_parameters`: endpoint-rule setting
+- `client_side_gating_enabled`: enh1 — detect client-side access-control gating (default `true`)
+- `client_side_gating_severity`: enh1 — severity assigned to gated endpoints (default `medium`)
+- `dormant_endpoint_detection_enabled`: enh2 — detect dormant/hidden endpoints declared in JS but never called (default `true`)
 
 Runtime notes:
 

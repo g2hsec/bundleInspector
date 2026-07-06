@@ -36,10 +36,23 @@
 ```bash
 git clone https://github.com/g2hsec/bundleInspector.git
 cd bundleInspector
-python -m venv .venv && source .venv/bin/activate     # Windows: .venv\Scripts\Activate.ps1
+python -m venv .venv
+```
+
+가상환경 활성화 후 설치:
+
+| 셸 | 활성화 |
+|---|---|
+| **macOS / Linux (bash/zsh)** | `source .venv/bin/activate` |
+| **Windows PowerShell** | `.venv\Scripts\Activate.ps1` |
+| **Windows cmd** | `.venv\Scripts\activate.bat` |
+
+```bash
 pip install -e .
 playwright install chromium
 ```
+
+> **PowerShell에는 `&&`·`source`가 없습니다** — 각 줄을 따로 실행하세요. `Activate.ps1`이 차단되면("스크립트 실행이 사용 안 함") 세션에서 한 번 `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` 를 먼저 실행하세요.
 
 ## ⚡ 빠른 시작
 

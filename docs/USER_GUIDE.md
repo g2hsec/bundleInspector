@@ -21,6 +21,7 @@ For a quick overview, see the [README](../README.md).
 - [Custom Rules](#custom-rules)
 - [Python API](#python-api)
 - [How It Works](#how-it-works)
+- [Notes & Limitations](#notes--limitations)
 - [Troubleshooting](#troubleshooting)
 
 ---
@@ -44,10 +45,22 @@ Each asset is normalized (beautified, source-map resolved), parsed into an AST, 
 git clone https://github.com/g2hsec/bundleInspector.git
 cd bundleInspector
 python -m venv .venv
-source .venv/bin/activate            # Windows PowerShell: .venv\Scripts\Activate.ps1
+```
+
+Activate the virtualenv (pick your shell), then install:
+
+| Shell | Activate |
+|---|---|
+| macOS / Linux (bash/zsh) | `source .venv/bin/activate` |
+| Windows PowerShell | `.venv\Scripts\Activate.ps1` |
+| Windows cmd | `.venv\Scripts\activate.bat` |
+
+```bash
 pip install -e .
 playwright install chromium          # required for headless scanning
 ```
+
+> **Windows PowerShell** does not support `&&` or `source` — run each command on its own line. If activation fails with *"running scripts is disabled on this system"*, run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` once in the session, then re-run `.venv\Scripts\Activate.ps1`.
 
 Development install (tests, linting):
 
@@ -409,6 +422,21 @@ bundleInspector scan https://app.example.com --cookies-from chrome
 
 `--cookies-file` and `--cookies-from` are mutually exclusive. Auth header values are validated against CR/LF/NUL injection.
 
+### Reusing a full `Cookie:` header
+
+The easiest way to reuse a big browser session is `--cookies-file`: copy the whole `Cookie: …` header from DevTools into a text file and point at it. `--cookies-file` accepts any of:
+
+- a raw **cookie header string** — `Cookie: a=1; b=2; …` (the `Cookie:` prefix is optional),
+- a **Netscape/curl** cookie file,
+- a **JSON array** (browser-extension export) or **EditThisCookie** JSON.
+
+```bash
+# cookies.txt contains one line:  Cookie: WMONID=…; sso_key=…; JSESSIONID=…
+bundleInspector scan https://app.example.com --cookies-file cookies.txt --scope "*.example.com"
+```
+
+This is preferred over `-c name=value` for long sessions: it needs no shell escaping (values may contain `$`, `%`, `:`, `=`, empty values) and injects real cookies into the headless browser's cookie jar. Treat the file as a secret — it holds a live session; don't commit it.
+
 ---
 
 ## Custom Rules
@@ -456,6 +484,16 @@ The `scan` pipeline runs eight stages (the `analyze` command runs an equivalent 
 
 ---
 
+## Notes & Limitations
+
+- **No built-in proxy support.** There is no `--proxy` flag; traffic is not routed through an upstream proxy such as Burp or ZAP. Intercept at the OS/network layer if you need to.
+- **Exit codes.** The CLI exits `0` on success **even when findings are present**, and `1` only on error or interrupt — there is no severity-based exit gate. In CI, decide pass/fail from the report or SARIF, not the process exit code.
+- **Config-only settings.** `interactive_clicking`, `block_state_changing_requests`, `min_severity`, and `min_risk_tier` have **no CLI flag** — set them in a `--config` YAML/JSON file.
+- **The `on_state_change_attempt` confirm hook** is a programmatic (Python API) hook, not a CLI option; without it, induced state-changing requests are simply blocked.
+- **Duplicate cookie names** in a header string resolve last-wins.
+
+---
+
 ## Troubleshooting
 
 | Symptom | Fix |
@@ -466,6 +504,8 @@ The `scan` pipeline runs eight stages (the `analyze` command runs an equivalent 
 | Resume re-runs from scratch | The config changed under the same `--job-id` (profile/rules/scope/etc.), which invalidates stale state by design |
 | Secrets appear masked | Expected — set `rules.mask_secrets: false` in a config file only for local, trusted analysis |
 | Large local bundles are slow | Try `BUNDLEINSPECTOR_PARALLEL=auto`, or the `fast` profile (beautify off) |
+| Non-ASCII (Korean, etc.) console output looks garbled on Windows | Handled automatically — the CLI forces UTF-8 on stdout/stderr, so no `PYTHONIOENCODING` is needed; just use a UTF-8-capable terminal (e.g. Windows Terminal) |
+| `--cookies-from` returns no cookies | The DB (incl. its `-wal` sidecar) is copied first, so the browser may stay open; if it's still empty the values are OS-encrypted — export via a cookie extension to a JSON file and use `--cookies-file` |
 
 ---
 
