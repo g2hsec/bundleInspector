@@ -501,7 +501,8 @@ The `scan` pipeline runs eight stages (the `analyze` command runs an equivalent 
 
 | Symptom | Fix |
 |---|---|
-| `playwright` / browser errors on `scan` | Run `playwright install chromium`, or add `--no-headless` (or use a non-headless profile) |
+| `playwright` / browser errors on `scan` (e.g. `headless_browser_not_installed`, `Executable doesn't exist`) | Run `playwright install chromium`, or add `--no-headless` (or use a non-headless profile). The scan still runs its static/manifest collectors, but an SPA needs the headless browser to yield JS. |
+| `playwright install` fails with `SELF_SIGNED_CERT_IN_CHAIN` | A TLS-intercepting proxy (corporate MITM) is breaking Node's download. **Secure fix:** point Node at your proxy's root CA — `setx NODE_EXTRA_CA_CERTS C:\path\to\corp-root-ca.pem` then reopen the shell and re-run. **Quick (insecure) fix:** `$env:NODE_TLS_REJECT_UNAUTHORIZED=0; playwright install chromium` (one session only). If a proxy is required, also set `$env:HTTPS_PROXY`. |
 | Scan feels too aggressive / noisy | Use `--config examples/scan-profiles/conservative.yml`, raise `--rate-limit`, lower `max_concurrent` |
 | Native parser not used | Ensure Node.js is on `PATH`, `acorn` is resolvable, and `BUNDLEINSPECTOR_NATIVE_PARSER=1` — otherwise it silently uses esprima |
 | Resume re-runs from scratch | The config changed under the same `--job-id` (profile/rules/scope/etc.), which invalidates stale state by design |

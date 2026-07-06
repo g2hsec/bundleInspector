@@ -501,7 +501,8 @@ asyncio.run(main())
 
 | 증상 | 해결 |
 |---|---|
-| `scan`에서 `playwright`/브라우저 오류 | `playwright install chromium` 실행, 또는 `--no-headless`(혹은 비헤드리스 프로파일) 사용 |
+| `scan`에서 `playwright`/브라우저 오류(`headless_browser_not_installed`, `Executable doesn't exist` 등) | `playwright install chromium` 실행, 또는 `--no-headless`(혹은 비헤드리스 프로파일) 사용. 정적/매니페스트 수집은 계속 돌지만 SPA는 헤드리스 브라우저가 있어야 JS를 얻습니다. |
+| `playwright install`이 `SELF_SIGNED_CERT_IN_CHAIN`으로 실패 | TLS를 가로채는 프록시(사내 MITM)가 Node 다운로드를 깨뜨리는 경우. **안전한 해결:** 프록시 루트 CA를 지정 — `setx NODE_EXTRA_CA_CERTS C:\경로\corp-root-ca.pem` 후 셸 재시작하고 재실행. **빠른(비보안) 해결:** `$env:NODE_TLS_REJECT_UNAUTHORIZED=0; playwright install chromium` (해당 세션만). 프록시가 필요하면 `$env:HTTPS_PROXY`도 설정. |
 | 스캔이 너무 공격적/시끄러움 | `--config examples/scan-profiles/conservative.yml` 사용, `--rate-limit` 상향, `max_concurrent` 하향 |
 | 네이티브 파서가 안 쓰임 | Node.js가 `PATH`에 있고 `acorn`을 찾을 수 있으며 `BUNDLEINSPECTOR_NATIVE_PARSER=1`인지 확인 — 아니면 조용히 esprima 사용 |
 | 재개가 처음부터 다시 돎 | 동일 `--job-id`에서 설정(프로파일/룰/스코프 등)이 바뀌어 오래된 상태가 의도적으로 무효화됨 |
