@@ -12,14 +12,19 @@ import pytest
 
 from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE
 from bundleInspector.config import Config, CrawlerConfig
-from bundleInspector.core.orchestrator import Orchestrator
+from bundleInspector.core.orchestrator import BundleInspector, Orchestrator
 from bundleInspector.core.progress import PipelineStage
+from bundleInspector.core.resume_policy import (
+    build_remote_resume_signature,
+    build_stage_state_with_resume_signature,
+    embed_report_resume_signature,
+)
 from bundleInspector.normalizer.line_mapping import LineMapper, LineMapping
 from bundleInspector.normalizer.sourcemap import SourceMapInfo
 from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.storage.artifact_store import ArtifactStore
 from bundleInspector.storage.finding_store import FindingStore
-from bundleInspector.storage.models import Category, Confidence, Evidence, Finding, PipelineCheckpoint, Severity, JSAsset, JSReference, LoadMethod
+from bundleInspector.storage.models import Category, Confidence, Evidence, Finding, PipelineCheckpoint, Report, Severity, JSAsset, JSReference, LoadMethod
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
 TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -30,6 +35,13 @@ def _make_test_dir() -> Path:
     path = TEST_TMP_ROOT / f"{uuid.uuid4().hex}_orchestrator"
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def _resume_stage_state(config: Config, stage_state: dict | None = None) -> dict:
+    return build_stage_state_with_resume_signature(
+        stage_state,
+        build_remote_resume_signature(config),
+    )
 
 
 class _FakeCollector:
@@ -1297,6 +1309,7 @@ async def test_run_resumes_from_analyze_checkpoint(monkeypatch):
             stage="analyze",
             asset_hashes=[asset.content_hash],
             findings=[finding],
+            stage_state=_resume_stage_state(config),
         )
     )
 
@@ -1355,7 +1368,10 @@ async def test_run_resumes_partial_parse_checkpoint_without_reparsing(monkeypatc
             seed_urls=["https://example.com"],
             stage="normalize",
             asset_hashes=[asset.content_hash],
-            stage_state={"parse_complete_hashes": [asset.content_hash]},
+            stage_state=_resume_stage_state(
+                config,
+                {"parse_complete_hashes": [asset.content_hash]},
+            ),
         )
     )
 
@@ -1469,7 +1485,10 @@ async def test_run_resumes_partial_analyze_checkpoint_without_reanalyzing(monkey
             stage="parse",
             asset_hashes=[asset.content_hash],
             findings=[finding],
-            stage_state={"analyze_complete_hashes": [asset.content_hash]},
+            stage_state=_resume_stage_state(
+                config,
+                {"analyze_complete_hashes": [asset.content_hash]},
+            ),
         )
     )
 
@@ -1491,6 +1510,90 @@ async def test_run_resumes_partial_analyze_checkpoint_without_reanalyzing(monkey
     assert report.job_id == config.job_id
     assert report.summary.total_findings == 1
     assert report.findings[0].extracted_value == "/api/users"
+
+
+@pytest.mark.asyncio
+async def test_bundleinspector_scan_does_not_reuse_report_when_profile_changes(monkeypatch):
+    """Stored reports should not be resumed across analysis-affecting config changes."""
+    cache_dir = _make_test_dir()
+
+    conservative = Config()
+    conservative.cache_dir = cache_dir
+    conservative.job_id = "profile-mismatch-report"
+    conservative.resume = True
+    conservative.crawler.use_headless = False
+    conservative.crawler.max_depth = 1
+    conservative.ensure_dirs()
+
+    finding_store = FindingStore(cache_dir / conservative.job_id)
+    stale_report = Report(
+        job_id=conservative.job_id,
+        seed_urls=["https://example.com"],
+        config=embed_report_resume_signature(
+            conservative.to_dict(),
+            build_remote_resume_signature(conservative),
+        ),
+    )
+    await finding_store.store_report(stale_report)
+
+    deep = Config()
+    deep.cache_dir = cache_dir
+    deep.job_id = conservative.job_id
+    deep.resume = True
+    deep.crawler.use_headless = True
+    deep.crawler.explore_routes = True
+    deep.crawler.max_depth = 3
+    deep.ensure_dirs()
+
+    fresh_report = Report(job_id=deep.job_id, seed_urls=["https://example.com"])
+
+    async def _fake_run(self, seed_urls):
+        assert seed_urls == ["https://example.com"]
+        return fresh_report
+
+    monkeypatch.setattr(Orchestrator, "run", _fake_run)
+
+    report = await BundleInspector(deep).scan(["https://example.com"])
+
+    assert report is fresh_report
+    assert report.id != stale_report.id
+
+
+@pytest.mark.asyncio
+async def test_load_checkpoint_rejects_checkpoint_from_different_profile():
+    """Stored checkpoints should not resume across analysis-affecting config changes."""
+    cache_dir = _make_test_dir()
+
+    conservative = Config()
+    conservative.cache_dir = cache_dir
+    conservative.job_id = "profile-mismatch-checkpoint"
+    conservative.resume = True
+    conservative.crawler.use_headless = False
+    conservative.crawler.max_depth = 1
+    conservative.ensure_dirs()
+
+    finding_store = FindingStore(cache_dir / conservative.job_id)
+    await finding_store.store_checkpoint(
+        PipelineCheckpoint(
+            job_id=conservative.job_id,
+            seed_urls=["https://example.com"],
+            stage="analyze",
+            stage_state=_resume_stage_state(conservative),
+        )
+    )
+
+    deep = Config()
+    deep.cache_dir = cache_dir
+    deep.job_id = conservative.job_id
+    deep.resume = True
+    deep.crawler.use_headless = True
+    deep.crawler.explore_routes = True
+    deep.crawler.max_depth = 3
+    deep.ensure_dirs()
+
+    checkpoint = await Orchestrator(deep)._load_checkpoint(["https://example.com"])
+
+    assert checkpoint is None
 
 
 @pytest.mark.asyncio

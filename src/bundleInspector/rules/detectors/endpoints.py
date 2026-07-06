@@ -84,6 +84,27 @@ class EndpointDetector(BaseRule):
         "api_key=", "apikey=", "token=", "access_token=", "auth=", "graphql",
     )
 
+    # enh6: GraphQL + WebSocket message surface extraction.
+    GQL_TAG_NAMES = {"gql", "graphql"}
+    GRAPHQL_OP_KEYWORDS = {"query", "mutation", "subscription"}
+    GRAPHQL_QUERY_KEYS = {"query", "mutation", "subscription"}
+    WS_SEND_METHODS = {"send", "emit"}
+    WS_MESSAGE_KEYS = ("type", "event")
+    WS_RECEIVER_HINTS = {"ws", "socket", "sock", "conn", "connection", "stomp", "channel", "io"}
+    WS_CLIENT_CTORS = {"WebSocket", "SockJS", "ReconnectingWebSocket"}
+    WS_CLIENT_CALLS = {"io", "socketIO", "connect"}
+
+    # enh4: method-flip advisory verbs + IDOR path-parameter recognition.
+    STANDARD_HTTP_VERBS = ("GET", "POST", "PUT", "PATCH", "DELETE")
+    _RE_TEMPLATE = re.compile(r"\$\{([^}]*)\}")
+    _RE_EXPRESS = re.compile(r"^:[A-Za-z_]\w*$")
+    _RE_UUID = re.compile(
+        r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
+    )
+    _RE_OBJECTID = re.compile(r"^[0-9a-fA-F]{24}$")
+    _RE_EMAIL = re.compile(r"^[^@\s/]+@[^@\s/]+\.[^@\s/]+$")
+    _RE_NUMERIC = re.compile(r"^\d+$")
+
     def _is_placeholder_value(self, value: Any) -> bool:
         """Return True for placeholder strings used only for partial URL assembly."""
         return isinstance(value, str) and value.startswith("${") and value.endswith("}")
@@ -98,7 +119,8 @@ class EndpointDetector(BaseRule):
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Match endpoints in IR."""
-        seen_values = set()
+        # Per-call memo so the ~14 AST passes below walk the tree once, not ~14x.
+        self._node_cache: dict[int, list] = {}
         function_returns = self._build_function_return_table(
             ir.raw_ast or {},
             {},
@@ -112,8 +134,19 @@ class EndpointDetector(BaseRule):
             function_returns,
         )
         xhr_clients = self._build_xhr_client_names(ir.raw_ast or {})
+        # enh3: axios.create default headers per client instance (merged into request contracts).
+        client_headers = self._build_client_headers(
+            ir.raw_ast or {}, constants, bool_constants, function_returns
+        )
 
-        # Check function calls
+        # enh4: dedup on (method, url) for HTTP so distinct verbs on a path are preserved
+        # (a hidden DELETE next to a benign GET must not collapse); `seen_urls` keeps today's
+        # cross-type suppression (an http/ws url already emitted stays single vs the literal pass).
+        seen_http_keys: set[tuple[str, str]] = set()
+        seen_urls: set[str] = set()
+
+        # HTTP pass -- buffered so methods can be aggregated per path for method-flip hints.
+        http_results = []
         for call in ir.function_calls:
             for result in self._check_http_call(
                 call,
@@ -124,12 +157,29 @@ class EndpointDetector(BaseRule):
                 function_returns,
                 client_base_urls,
                 xhr_clients,
+                client_headers,
             ):
-                if result.extracted_value not in seen_values:
-                    seen_values.add(result.extracted_value)
-                    yield result
+                http_results.append(result)
+        methods_by_path: dict[str, set[str]] = {}
+        for result in http_results:
+            methods_by_path.setdefault(
+                self._endpoint_path(result.extracted_value), set()
+            ).add(result.metadata.get("method", "GET"))
+        for result in http_results:
+            key = (result.metadata.get("method", "GET"), result.extracted_value)
+            if key in seen_http_keys:
+                continue
+            seen_http_keys.add(key)
+            seen_urls.add(result.extracted_value)
+            observed = methods_by_path.get(self._endpoint_path(result.extracted_value), set())
+            flip = self._method_flip_candidates(observed)
+            if flip:
+                result.metadata["method_flip"] = flip
+                result.metadata["methods_observed"] = sorted(observed)
+            self._apply_idor(result)
+            yield result
 
-        # Check WebSocket constructors
+        # Check WebSocket constructors (no HTTP method -> url dedup only).
         for result in self._check_websocket_constructors(
             ir.raw_ast or {},
             context,
@@ -137,16 +187,520 @@ class EndpointDetector(BaseRule):
             bool_constants,
             function_returns,
         ):
-            if result.extracted_value not in seen_values:
-                seen_values.add(result.extracted_value)
-                yield result
+            if result.extracted_value in seen_urls:
+                continue
+            seen_urls.add(result.extracted_value)
+            self._apply_idor(result)
+            yield result
 
-        # Check string literals for URL patterns
+        # enh6: GraphQL operations + WebSocket message surface (after http/ws so existing
+        # endpoints claim their extracted_value first in the shared dedup set).
+        for result in self._check_graphql_operations(ir.raw_ast or {}, context, constants, bool_constants, function_returns):
+            if result.extracted_value in seen_urls:
+                continue
+            seen_urls.add(result.extracted_value)
+            yield result
+        for result in self._check_ws_messages(ir, ir.raw_ast or {}, context, constants, bool_constants, function_returns):
+            if result.extracted_value in seen_urls:
+                continue
+            seen_urls.add(result.extracted_value)
+            yield result
+
+        # Check string literals for URL patterns (suppressed if an http/ws url already emitted).
         for literal in ir.string_literals:
             for result in self._check_url_pattern(literal, context):
-                if result.extracted_value not in seen_values:
-                    seen_values.add(result.extracted_value)
-                    yield result
+                if result.extracted_value in seen_urls:
+                    continue
+                seen_urls.add(result.extracted_value)
+                self._apply_idor(result)
+                yield result
+
+    def _endpoint_path(self, url: str) -> str:
+        """Path portion of an endpoint url (query/fragment stripped)."""
+        if url.startswith(("http://", "https://", "ws://", "wss://")):
+            return urlsplit(url).path
+        if url.startswith("//"):
+            return urlsplit("https:" + url).path
+        return url.split("?", 1)[0].split("#", 1)[0]
+
+    def _method_flip_candidates(self, observed: set) -> list[str]:
+        """Standard HTTP verbs not yet observed on this path (advisory fuzz hints)."""
+        seen = {str(m).upper() for m in observed}
+        return [verb for verb in self.STANDARD_HTTP_VERBS if verb not in seen]
+
+    def _infer_param_type_from_name(self, name: str) -> str:
+        n = (name or "").strip().lower()
+        if "uuid" in n or "guid" in n:
+            return "uuid"
+        if "email" in n or "mail" in n:
+            return "email"
+        if n == "id" or n.endswith("id") or n.endswith("_id") or "num" in n or "count" in n or "index" in n:
+            return "numeric"
+        return "dynamic"
+
+    def _detect_path_params(self, url: str) -> list[dict]:
+        """Detect IDOR/enumeration path parameters (template/named/uuid/objectid/email/numeric)."""
+        params: list[dict] = []
+        for index, seg in enumerate(self._endpoint_path(url).split("/")):
+            if seg == "":
+                continue
+            template = self._RE_TEMPLATE.search(seg)
+            if template:
+                ptype, sub = "template", self._infer_param_type_from_name(template.group(1))
+            elif self._RE_EXPRESS.match(seg):
+                ptype, sub = "named", self._infer_param_type_from_name(seg[1:])
+            elif self._RE_UUID.match(seg):
+                ptype, sub = "uuid", "uuid"
+            elif self._RE_OBJECTID.match(seg):
+                ptype, sub = "objectid", "objectid"
+            elif self._RE_EMAIL.match(seg):
+                ptype, sub = "email", "email"
+            elif self._RE_NUMERIC.match(seg):
+                ptype, sub = "numeric", "numeric"
+            else:
+                continue
+            params.append({"position": index, "segment": seg, "type": ptype, "value_type": sub})
+        return params
+
+    @staticmethod
+    def _idor_inferred_type(params: list[dict]) -> str:
+        candidates = set()
+        for param in params:
+            candidates.add(param["type"])
+            candidates.add(param["value_type"])
+        for kind in ("uuid", "objectid", "email", "numeric", "dynamic"):
+            if kind in candidates:
+                return kind
+        return "dynamic"
+
+    def _apply_idor(self, result: "RuleResult") -> None:
+        """Tag an endpoint that carries IDOR/enumeration path params + raise INFO -> LOW."""
+        params = self._detect_path_params(result.extracted_value)
+        if not params:
+            return
+        if "idor_candidate" not in result.tags:
+            result.tags.append("idor_candidate")
+        result.metadata["idor_params"] = params
+        result.metadata["idor_inferred_type"] = self._idor_inferred_type(params)
+        if result.severity == Severity.INFO:
+            result.severity = Severity.LOW
+
+    # ---- enh6: GraphQL operations ----
+    def _is_graphql_document(self, s: str) -> bool:
+        s2 = re.sub(r"(?m)#.*$", "", s or "").strip()
+        if "{" not in s2 or "}" not in s2:
+            return False
+        if re.search(r"\b(query|mutation|subscription)\b\s*[A-Za-z_({]", s2):
+            return True
+        if s2.startswith("{") and re.search(r"\{\s*[A-Za-z_.]", s2) and '":' not in s2:
+            return True
+        return False
+
+    def _parse_graphql_document(self, doc: str) -> list[dict]:
+        doc = re.sub(r"(?m)#.*$", "", doc or "")[:20000]
+        tokens = re.findall(r'\.\.\.|[{}():]|"(?:\\.|[^"])*"|[A-Za-z_][A-Za-z0-9_]*', doc)
+        ops: list[dict] = []
+        brace = paren = 0
+        op = None
+        skip_frag_until = None
+        expect_name = False
+        prev = None
+        i, n = 0, len(tokens)
+        while i < n and len(ops) < 16:
+            t = tokens[i]; i += 1
+            if t == "(":
+                paren += 1; prev = t; continue
+            if t == ")":
+                paren = max(0, paren - 1); prev = t; continue
+            if t == "{":
+                if op is not None and op.get("open_at") is None:
+                    op["open_at"] = brace
+                elif op is None and brace == 0 and skip_frag_until is None:
+                    op = {"type": "query", "name": None, "open_at": 0, "fields": []}
+                brace += 1; prev = "{"; continue
+            if t == "}":
+                brace = max(0, brace - 1)
+                if skip_frag_until is not None and brace < skip_frag_until:
+                    skip_frag_until = None
+                elif op is not None and op.get("open_at") is not None and brace == op["open_at"]:
+                    ops.append({"type": op["type"], "name": op["name"], "fields": op["fields"][:32]})
+                    op = None
+                prev = "}"; continue
+            if t == "...":
+                if i < n and tokens[i] == "on":
+                    i += 2
+                elif i < n and re.match(r"[A-Za-z_]", tokens[i] or ""):
+                    i += 1
+                prev = "..."; continue
+            if t == ":" or t.startswith('"'):
+                prev = ":" if t == ":" else "str"; continue
+            # NAME token
+            if skip_frag_until is not None or paren > 0:
+                prev = t; continue
+            if brace == 0:
+                if expect_name and op is not None:
+                    op["name"] = t; expect_name = False; prev = t; continue
+                if t in self.GRAPHQL_OP_KEYWORDS:
+                    op = {"type": t, "name": None, "open_at": None, "fields": []}
+                    expect_name = True; prev = t; continue
+                if t == "fragment":
+                    skip_frag_until = 1; prev = t; continue
+                prev = t; continue
+            if op is not None and op.get("open_at") is not None and brace == op["open_at"] + 1 and prev in ("{", "}", ")"):
+                if i < n and tokens[i] == ":":       # alias -> real field follows ':'
+                    i += 1
+                    if i < n and re.match(r"[A-Za-z_]", tokens[i] or ""):
+                        field = tokens[i]; i += 1
+                        if field not in op["fields"] and len(op["fields"]) < 32:
+                            op["fields"].append(field)
+                    prev = "field"; continue
+                if t not in op["fields"] and len(op["fields"]) < 32:
+                    op["fields"].append(t)
+                prev = "field"; continue
+            prev = t; continue
+        return ops
+
+    def _check_graphql_operations(self, ast, context, constants, bool_constants, function_returns):
+        seen = set()
+        for node in self._iter_nodes(ast):
+            t = node.get("type")
+            doc = source = None
+            if t == "TaggedTemplateExpression":
+                tag = node.get("tag", {})
+                tagname = tag.get("name") if tag.get("type") == "Identifier" else (tag.get("property") or {}).get("name")
+                if tagname in self.GQL_TAG_NAMES:
+                    quasis = (node.get("quasi") or {}).get("quasis", [])
+                    doc = " ".join(((q.get("value") or {}).get("cooked") or "") for q in quasis)
+                    source = "gql_tag"
+            elif t == "CallExpression":
+                callee = node.get("callee", {})
+                if callee.get("type") == "Identifier" and callee.get("name") in self.GQL_TAG_NAMES:
+                    arg = (node.get("arguments") or [None])[0]
+                    r = self._resolve_string_expr(arg, constants, bool_constants, function_returns, allow_placeholders=False) if isinstance(arg, dict) else ""
+                    if r and r != _BLOCKED_STRING:
+                        doc, source = r, "gql_call"
+            elif t == "Property":
+                if self._extract_property_name(node.get("key", {})) in self.GRAPHQL_QUERY_KEYS:
+                    r = self._resolve_string_expr(node.get("value", {}), constants, bool_constants, function_returns, allow_placeholders=False)
+                    if r and r != _BLOCKED_STRING:
+                        doc, source = r, "query_property"
+            if not doc or not self._is_graphql_document(doc):
+                continue
+            start = node.get("loc", {}).get("start", {})
+            for info in self._parse_graphql_document(doc):
+                typ, name, fields = info["type"], info["name"], info["fields"]
+                sig = f"{typ} {name}" if name else (f"{typ} {{{fields[0]}}}" if fields else typ)
+                if sig in seen:
+                    continue
+                seen.add(sig)
+                yield RuleResult(
+                    rule_id=self.id, category=self.category, severity=Severity.INFO,
+                    confidence=Confidence.HIGH if name else Confidence.MEDIUM,
+                    title=f"GraphQL {typ}: {name or '(anonymous)'}",
+                    description=f"GraphQL {typ} '{name or '(anonymous)'}' selecting fields: {', '.join(fields[:8])}",
+                    extracted_value=sig, value_type="graphql_operation",
+                    line=start.get("line", 0), column=start.get("column", 0),
+                    ast_node_type=t, tags=["graphql", typ],
+                    metadata={"operation_type": typ, "operation_name": name or "", "fields": fields, "source": source},
+                )
+
+    # ---- enh6: WebSocket messages ----
+    def _build_ws_client_names(self, ast) -> set:
+        names = set()
+        for node in self._iter_nodes(ast):
+            if node.get("type") != "VariableDeclarator":
+                continue
+            init = node.get("init") or {}
+            name = (node.get("id") or {}).get("name")
+            if not name or not isinstance(init, dict):
+                continue
+            if init.get("type") == "NewExpression":
+                path = self._extract_member_path(init.get("callee", {}))
+                if any(path.endswith(ctor) for ctor in self.WS_CLIENT_CTORS):
+                    names.add(name)
+            elif init.get("type") == "CallExpression":
+                path = self._extract_member_path(init.get("callee", {}))
+                base = path.split(".")[-1] if path else ""
+                if base in self.WS_CLIENT_CALLS or path.endswith("io.connect"):
+                    names.add(name)
+        return names
+
+    def _check_ws_messages(self, ir, ast, context, constants, bool_constants, function_returns):
+        ws_clients = self._build_ws_client_names(ast)
+        seen = set()
+        for call in ir.function_calls:
+            name_lower = call.name.lower()
+            if name_lower not in self.WS_SEND_METHODS or "." not in call.full_name:
+                continue
+            object_name = call.full_name.split(".", 1)[0]
+            onl = object_name.lower()
+            if not (object_name in ws_clients or onl in self.WS_RECEIVER_HINTS
+                    or any(hint in onl for hint in self.WS_RECEIVER_HINTS)):
+                continue   # primary FP guard: exclude res.send / EventEmitter.emit / etc.
+            transport = "socketio" if name_lower == "emit" else "websocket"
+            results = []
+            args = call.arguments or []
+            if name_lower == "emit":
+                ev = self._resolve_string_expr(args[0] if args else {}, constants, bool_constants, function_returns, allow_placeholders=False)
+                if ev and ev != _BLOCKED_STRING and not ev.startswith("${"):
+                    results.append(("event", ev))
+            else:
+                arg0 = args[0] if args else {}
+                payload = arg0
+                if isinstance(arg0, dict) and arg0.get("type") == "CallExpression" \
+                        and self._extract_member_path(arg0.get("callee", {})).endswith("JSON.stringify"):
+                    payload = (arg0.get("arguments") or [None])[0] or {}
+                obj = self._resolve_object_expr(payload, constants, bool_constants, function_returns, allow_placeholders=False) if isinstance(payload, dict) else None
+                emitted = False
+                if isinstance(obj, dict):
+                    for key in self.WS_MESSAGE_KEYS:
+                        v = obj.get(key)
+                        if isinstance(v, str) and v:
+                            results.append((key, v)); emitted = True; break
+                if not emitted and object_name in ws_clients:
+                    raw = self._resolve_string_expr(arg0 if isinstance(arg0, dict) else {}, constants, bool_constants, function_returns, allow_placeholders=False)
+                    if raw and raw != _BLOCKED_STRING and not raw.startswith("${"):
+                        results.append(("raw", raw))
+            for message_key, msgname in results:
+                dedup = (transport, message_key, msgname)
+                if dedup in seen:
+                    continue
+                seen.add(dedup)
+                yield RuleResult(
+                    rule_id=self.id, category=self.category, severity=Severity.INFO,
+                    confidence=Confidence.HIGH if message_key != "raw" else Confidence.MEDIUM,
+                    title=f"WS Message: {msgname}",
+                    description=f"WebSocket {transport} message '{msgname}' sent via {call.full_name}",
+                    extracted_value=msgname, value_type="ws_message", line=call.line, column=call.column,
+                    ast_node_type="CallExpression", tags=["websocket", "ws_message", transport],
+                    metadata={"message_key": message_key, "transport": transport, "method": name_lower, "receiver": object_name},
+                )
+
+    # enh3: header/body/query names that carry credentials (for auth classification + redaction).
+    _AUTH_HEADER_NAMES = ("x-api-key", "apikey", "api-key", "x-auth-token", "x-access-token", "x-token")
+    _AUTH_QUERY_NAMES = ("token", "access_token", "api_key", "apikey", "auth", "key")
+    _SECRET_LIKE = re.compile(
+        r"AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,}|sk_live_[0-9a-zA-Z]{20,}|ghp_[0-9a-zA-Z]{30,}|"
+        r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+|[0-9a-fA-F]{32,}"
+    )
+
+    def _object_prop_node(self, node, key: str):
+        """Value node of property `key` in an ObjectExpression (or None)."""
+        if not isinstance(node, dict) or node.get("type") != "ObjectExpression":
+            return None
+        for prop in node.get("properties", []):
+            if prop.get("type") == "SpreadElement":
+                continue
+            if self._extract_property_name(prop.get("key", {})) == key:
+                return prop.get("value")
+        return None
+
+    def _ast_value_type(self, node) -> str:
+        if not isinstance(node, dict):
+            return "unknown"
+        t = node.get("type")
+        if t == "Literal":
+            v = node.get("value")
+            if isinstance(v, bool):
+                return "boolean"
+            if isinstance(v, (int, float)):
+                return "number"
+            if v is None:
+                return "null"
+            return "string"
+        if t == "TemplateLiteral":
+            return "string"
+        if t == "BinaryExpression" and node.get("operator") == "+":
+            return "string"
+        if t == "ArrayExpression":
+            return "array"
+        if t == "ObjectExpression":
+            return "object"
+        return "unknown"
+
+    def _shape_of(self, obj_node) -> dict:
+        shape: dict = {}
+        props = obj_node.get("properties", []) if isinstance(obj_node, dict) else []
+        for prop in props[:50]:
+            if prop.get("type") == "SpreadElement":
+                continue
+            name = self._extract_property_name(prop.get("key", {}))
+            if name:
+                shape[name] = self._ast_value_type(prop.get("value", {}))
+        if len(props) > 50:
+            shape["__truncated__"] = True
+        return shape
+
+    def _locate_config_and_body_args(self, call, is_fetch, is_axios, is_xhr_open):
+        args = call.arguments or []
+        if is_xhr_open:
+            return None, None
+        if is_fetch:
+            config = args[1] if len(args) > 1 else None
+            body = self._object_prop_node(config, "body") if config else None
+            return config, body
+        name = call.name.lower()
+        if name in ("get", "head", "delete", "options"):
+            return (args[1] if len(args) > 1 else None), None
+        if name in ("post", "put", "patch"):
+            return (args[2] if len(args) > 2 else None), (args[1] if len(args) > 1 else None)
+        config = args[0] if args else None
+        body = self._object_prop_node(config, "data") if config else None
+        return config, body
+
+    def _extract_headers(self, config_node, constants, bool_constants, function_returns) -> dict:
+        headers: dict = {}
+        hdr = self._object_prop_node(config_node, "headers")
+        if not isinstance(hdr, dict) or hdr.get("type") != "ObjectExpression":
+            return headers
+        for prop in hdr.get("properties", []):
+            if prop.get("type") == "SpreadElement":
+                continue
+            name = self._extract_property_name(prop.get("key", {}))
+            if not name:
+                continue
+            val = self._resolve_string_expr(prop.get("value", {}), constants, bool_constants, function_returns, allow_placeholders=True)
+            if val == _BLOCKED_STRING or val == "":
+                val = "${...}"
+            headers[name] = val
+        return headers
+
+    def _classify_auth(self, headers: dict, query_params: dict):
+        lower = {k.lower(): (k, v) for k, v in headers.items()}
+        if "authorization" in lower:
+            orig, v = lower["authorization"]
+            vl = str(v).lower()
+            scheme = ("bearer" if vl.startswith("bearer") else "basic" if vl.startswith("basic")
+                      else "digest" if vl.startswith("digest") else "bearer?")
+            return {"scheme": scheme, "in": "header", "header": orig}
+        for name in self._AUTH_HEADER_NAMES:
+            if name in lower:
+                return {"scheme": "apikey", "in": "header", "header": lower[name][0]}
+        if "cookie" in lower:
+            return {"scheme": "cookie", "in": "header", "header": lower["cookie"][0]}
+        for pname in query_params:
+            if pname.lower() in self._AUTH_QUERY_NAMES:
+                return {"scheme": "apikey", "in": "query", "header": pname}
+        return None
+
+    def _extract_body(self, body_node, constants, bool_constants, function_returns) -> dict:
+        if not isinstance(body_node, dict):
+            return {"kind": "none", "shape": {}, "raw_preview": None}
+        t = body_node.get("type")
+        if t == "CallExpression":
+            path = self._extract_member_path(body_node.get("callee", {}))
+            if path.endswith("JSON.stringify"):
+                arg = (body_node.get("arguments") or [None])[0]
+                if isinstance(arg, dict) and arg.get("type") == "ObjectExpression":
+                    return {"kind": "json", "shape": self._shape_of(arg), "raw_preview": None}
+                return {"kind": "json", "shape": {}, "raw_preview": None}
+        if t == "NewExpression":
+            path = self._extract_member_path(body_node.get("callee", {}))
+            if path.endswith("FormData"):
+                return {"kind": "form", "shape": {}, "raw_preview": None}
+            if path.endswith("URLSearchParams"):
+                arg = (body_node.get("arguments") or [None])[0]
+                if isinstance(arg, dict) and arg.get("type") == "ObjectExpression":
+                    return {"kind": "urlencoded", "shape": self._shape_of(arg), "raw_preview": None}
+                return {"kind": "urlencoded", "shape": {}, "raw_preview": None}
+        if t == "ObjectExpression":
+            return {"kind": "json", "shape": self._shape_of(body_node), "raw_preview": None}
+        resolved = self._resolve_string_expr(body_node, constants, bool_constants, function_returns, allow_placeholders=True)
+        if resolved and resolved != _BLOCKED_STRING and "=" in resolved:
+            keys = {p.split("=", 1)[0]: "string" for p in resolved.split("&") if "=" in p}
+            if keys:
+                return {"kind": "urlencoded", "shape": keys, "raw_preview": resolved[:200]}
+        if resolved and resolved != _BLOCKED_STRING:
+            return {"kind": "raw", "shape": {}, "raw_preview": resolved[:200]}
+        return {"kind": "unknown", "shape": {}, "raw_preview": None}
+
+    def _extract_query_params(self, url, config_node, constants, bool_constants, function_returns) -> dict:
+        params: dict = {}
+        if "?" in url:
+            for pair in urlsplit(url).query.split("&"):
+                if not pair:
+                    continue
+                if "=" in pair:
+                    k, v = pair.split("=", 1)
+                    params[k] = v
+                else:
+                    params[pair] = ""
+        pnode = self._object_prop_node(config_node, "params")
+        if isinstance(pnode, dict) and pnode.get("type") == "ObjectExpression":
+            for prop in pnode.get("properties", []):
+                name = self._extract_property_name(prop.get("key", {}))
+                if not name:
+                    continue
+                val = self._resolve_string_expr(prop.get("value", {}), constants, bool_constants, function_returns, allow_placeholders=True)
+                params[name] = val if (val and val != _BLOCKED_STRING) else self._ast_value_type(prop.get("value", {}))
+        return params
+
+    def _redact_sensitive(self, name: str, value) -> str:
+        """Redact credential-shaped header/param values (secure default: raw secrets never
+        enter finding metadata / disk). Placeholders pass through."""
+        if not isinstance(value, str) or value.startswith("${"):
+            return value if isinstance(value, str) else str(value)
+        lname = name.lower()
+        sensitive_name = lname == "authorization" or lname == "cookie" or lname in self._AUTH_HEADER_NAMES or lname in self._AUTH_QUERY_NAMES
+        if sensitive_name or self._SECRET_LIKE.search(value):
+            vl = value.lower()
+            if vl.startswith("bearer"):
+                scheme = "BEARER"
+            elif vl.startswith("basic"):
+                scheme = "BASIC"
+            elif "api" in lname or "key" in lname:
+                scheme = "APIKEY"
+            else:
+                scheme = "TOKEN"
+            return f"<REDACTED_{scheme}>"
+        return value
+
+    def _build_client_headers(self, ast, constants, bool_constants, function_returns) -> dict:
+        """Map an axios-instance variable name -> default headers from axios.create({headers})."""
+        result: dict = {}
+        for node in self._iter_nodes(ast):
+            if node.get("type") != "VariableDeclarator":
+                continue
+            init = node.get("init") or {}
+            if not isinstance(init, dict) or init.get("type") != "CallExpression":
+                continue
+            if not self._extract_member_path(init.get("callee", {})).endswith("axios.create"):
+                continue
+            cfg = (init.get("arguments") or [None])[0]
+            headers = self._extract_headers(cfg, constants, bool_constants, function_returns) if isinstance(cfg, dict) else {}
+            name = (node.get("id") or {}).get("name")
+            if name and headers:
+                result[name] = headers
+        return result
+
+    def _extract_request_contract(self, call, is_fetch, is_axios, is_xhr_open, url, method,
+                                  constants, bool_constants, function_returns, base_headers=None) -> dict:
+        """Assemble a replayable request contract (method/headers/auth/body-shape/query) for an
+        HTTP call finding. Reuses the static resolver, so it never changes which endpoints are found."""
+        config_node, body_node = self._locate_config_and_body_args(call, is_fetch, is_axios, is_xhr_open)
+        notes = []
+        if is_xhr_open:
+            notes.append("XHR headers/body set via setRequestHeader/send (not statically linked)")
+        headers_raw = dict(base_headers or {})   # axios.create client defaults, overridden by call headers
+        headers_raw.update(self._extract_headers(config_node, constants, bool_constants, function_returns))
+        query_params = self._extract_query_params(url, config_node, constants, bool_constants, function_returns)
+        auth = self._classify_auth(headers_raw, query_params)   # classify BEFORE redaction
+        body = self._extract_body(body_node, constants, bool_constants, function_returns)
+        content_type = next((v for k, v in headers_raw.items() if k.lower() == "content-type"), None)
+        headers = {k: self._redact_sensitive(k, v) for k, v in headers_raw.items()}
+        query_params = {k: (self._redact_sensitive(k, v) if isinstance(v, str) else v) for k, v in query_params.items()}
+        allvals = list(headers.values()) + [str(v) for v in query_params.values()]
+        if "${" in url or any("${" in str(v) for v in allvals):
+            confidence = "medium"
+        elif config_node is not None and not headers and body.get("kind") in ("none", "unknown") and not query_params:
+            confidence = "low"
+        else:
+            confidence = "high"
+        return {
+            "method": method, "url": url, "headers": headers, "auth": auth,
+            "query_params": query_params, "body": body, "content_type": content_type,
+            "confidence": confidence, "notes": notes,
+        }
 
     def _check_http_call(
         self,
@@ -158,6 +712,7 @@ class EndpointDetector(BaseRule):
         function_returns: dict[str, dict[str, Any]],
         client_base_urls: dict[str, str],
         xhr_clients: set[str],
+        client_headers: dict = None,
     ) -> Iterator[RuleResult]:
         """Check if function call is an HTTP request."""
         # Check if it's an HTTP function using exact matching
@@ -240,6 +795,19 @@ class EndpointDetector(BaseRule):
                 resolved_arg_object=resolved_arg_object,
             )
 
+        contract = self._extract_request_contract(
+            call,
+            is_exact_http and name_lower == "fetch",
+            is_axios,
+            is_xhr_open,
+            url,
+            method,
+            constants,
+            bool_constants,
+            function_returns,
+            base_headers=(client_headers or {}).get(object_name, {}),
+        )
+
         yield RuleResult(
             rule_id=self.id,
             category=self.category,
@@ -257,6 +825,7 @@ class EndpointDetector(BaseRule):
                 "method": method,
                 "function": call.full_name,
                 "base_url": base_url,
+                "request_contract": contract,
             },
         )
 
@@ -3414,18 +3983,37 @@ class EndpointDetector(BaseRule):
         return None
 
     def _iter_nodes(self, node: Any) -> Iterator[dict[str, Any]]:
-        """Iterate all AST nodes depth-first."""
+        """
+        Iterate all AST nodes depth-first.
+
+        Memoized per match() call: the ~14 lookup-table passes (5-pass constant/bool
+        fixpoints + base-url/xhr/function-return builders) each re-walk the same
+        immutable AST. The actual traversal lives in _iter_nodes_uncached; this
+        wrapper only stores and replays its output for a given node, so the yielded
+        nodes and their order are identical to the un-memoized traversal.
+        """
+        cache = getattr(self, "_node_cache", None)
+        if cache is None:
+            return self._iter_nodes_uncached(node)
+        cached = cache.get(id(node))
+        if cached is None:
+            cached = list(self._iter_nodes_uncached(node))
+            cache[id(node)] = cached
+        return iter(cached)
+
+    def _iter_nodes_uncached(self, node: Any) -> Iterator[dict[str, Any]]:
+        """Depth-first traversal yielding every dict node (the original _iter_nodes body)."""
         if not isinstance(node, dict):
             return
 
         yield node
         for value in node.values():
             if isinstance(value, dict):
-                yield from self._iter_nodes(value)
+                yield from self._iter_nodes_uncached(value)
             elif isinstance(value, list):
                 for item in value:
                     if isinstance(item, dict):
-                        yield from self._iter_nodes(item)
+                        yield from self._iter_nodes_uncached(item)
 
     def _extract_object_string_values(
         self,

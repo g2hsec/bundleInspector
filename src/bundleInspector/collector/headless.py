@@ -87,6 +87,10 @@ class HeadlessCollector(BaseCollector):
         '.nav-link',
         '.tab',
     ]
+    # Non-idempotent HTTP methods that mutate server state. Requests using these that are
+    # induced by interactive clicking are blocked (or confirmed) so a scan never changes the
+    # target's state.
+    _MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
 
     def __init__(
         self,
@@ -125,6 +129,18 @@ class HeadlessCollector(BaseCollector):
         self._resume_loaded: bool = False
         self._collection_finished: bool = False
         self._progress_tasks: set[asyncio.Task[None]] = set()
+        # enh2: URLs the running app actually requested (xhr/fetch), as (METHOD, url).
+        # Accumulates for the collector's lifetime -- deliberately NOT cleared by
+        # reset_resume_state so observations survive per-page route exploration.
+        self._observed_requests: set[tuple[str, str]] = set()
+        # Safety: while True, state-changing requests induced by interactive clicking are
+        # intercepted at the network layer. Confirmation handler (if set) is asked before
+        # allowing one; otherwise it is blocked. _blocked_state_changes records what was stopped.
+        self._suppress_mutations: bool = False
+        self._blocked_state_changes: list[dict[str, Any]] = []
+        self.on_state_change_attempt: (
+            Callable[[dict[str, Any]], Awaitable[bool] | bool] | None
+        ) = None
 
     async def setup(self) -> None:
         """Initialize browser."""
@@ -226,6 +242,11 @@ class HeadlessCollector(BaseCollector):
             self._active_page = None
             self._active_context = None
             await context.close()
+
+    @property
+    def observed_requests(self) -> set[tuple[str, str]]:
+        """enh2: (METHOD, url) pairs the running app actually requested via xhr/fetch."""
+        return self._observed_requests
 
     def reset_resume_state(self) -> None:
         """Reset in-flight route exploration resume state."""
@@ -406,6 +427,10 @@ class HeadlessCollector(BaseCollector):
             "viewport": {"width": 1920, "height": 1080},
             "ignore_https_errors": True,
         }
+        # Block service workers while the state-change guard is on so no request can bypass
+        # the "**/*" route interception via a SW-originated fetch.
+        if self.config.block_state_changing_requests:
+            context_options["service_workers"] = "block"
         if self._browser_storage_state:
             context_options["storage_state"] = dict(self._browser_storage_state)
 
@@ -425,17 +450,71 @@ class HeadlessCollector(BaseCollector):
                 })
             await context.add_cookies(cookies)
 
-        # Add auth headers via route
-        if self.auth.headers or self.auth.bearer_token or self.auth.basic_auth:
-            auth_headers = self.auth.get_auth_headers()
+        # Network route handler: (1) inject auth headers, and (2) enforce the state-change
+        # guard so the tool's UI driving never mutates the target. Installed whenever the
+        # guard is on (default) or auth is configured; controlled by block_state_changing_
+        # requests ALONE (not coupled to interactive_clicking), so route-link exploration is
+        # covered too. While _suppress_mutations is armed (whole exploration phase), any
+        # non-idempotent request is recorded and then blocked/confirmed rather than sent.
+        has_auth = bool(self.auth.headers or self.auth.bearer_token or self.auth.basic_auth)
+        guard_state_changes = bool(self.config.block_state_changing_requests)
+        if has_auth or guard_state_changes:
+            auth_headers = self.auth.get_auth_headers() if has_auth else {}
 
-            async def add_auth_headers(route, request):
-                headers = {**request.headers, **auth_headers}
-                await route.continue_(headers=headers)
+            async def _route_handler(route, request):
+                if (
+                    guard_state_changes
+                    and self._suppress_mutations
+                    and request.method.upper() in self._MUTATING_HTTP_METHODS
+                ):
+                    if not await self._confirm_state_change(request):
+                        await route.abort()
+                        return
+                if auth_headers:
+                    await route.continue_(headers={**request.headers, **auth_headers})
+                else:
+                    await route.continue_()
 
-            await context.route("**/*", add_auth_headers)
+            await context.route("**/*", _route_handler)
 
         return context
+
+    async def _confirm_state_change(self, request) -> bool:
+        """Decide whether a state-changing request induced by UI driving may proceed.
+
+        The endpoint is ALWAYS recorded first (as an observed request + a blocked entry) so
+        discovery is preserved even though the request is not sent. Default is to BLOCK
+        (return False) so the scanner never mutates the target. If an ``on_state_change_attempt``
+        handler is set it is asked to confirm (pause-and-ask), and the request proceeds only if
+        the handler approves.
+        """
+        method = request.method.upper()
+        url = request.url
+        info = {
+            "method": method,
+            "url": url,
+            "resource_type": getattr(request, "resource_type", ""),
+        }
+        # Preserve endpoint intel: an aborted request produces no response, so record it here
+        # (feeds enh2's observed-request baseline) before we potentially block it.
+        self._observed_requests.add((method, url))
+        allowed = False
+        handler = self.on_state_change_attempt
+        if handler is not None:
+            try:
+                result = handler(info)
+                if isawaitable(result):
+                    result = await result
+                allowed = bool(result)
+            except Exception as e:
+                logger.debug(f"state-change confirm handler error: {e}")
+                allowed = False
+        if not allowed:
+            self._blocked_state_changes.append(info)
+            logger.info(
+                f"Blocked state-changing request during UI exploration: {method} {url[:200]}"
+            )
+        return allowed
 
     def _on_response(
         self,
@@ -447,6 +526,16 @@ class HeadlessCollector(BaseCollector):
         if self._collection_finished:
             return
         url = response.url
+
+        # enh2: record API calls the running app actually made (dormant-endpoint baseline).
+        # Capture xhr/fetch regardless of JS content-type or scope; the dormancy diff does
+        # its own host scoping. Best-effort -- never let capture break collection.
+        try:
+            request = response.request
+            if request.resource_type in ("xhr", "fetch"):
+                self._observed_requests.add((request.method.upper(), url))
+        except Exception as e:
+            logger.debug(f"observed-request capture failed: {e}")
 
         # Check if it's a JS response
         content_type = response.headers.get("content-type", "")
@@ -542,9 +631,28 @@ class HeadlessCollector(BaseCollector):
         base_url: str,
         scope: ScopePolicy,
     ) -> None:
+        """Explore SPA routes/UI to trigger lazy-loaded chunks.
+
+        The tool's own UI driving (route-link clicks AND interactive button/tab clicks) can
+        make the app fire state-changing requests. The guard is armed for the ENTIRE
+        exploration phase (not per click) so route-link and interactive clicks are both
+        covered, plus a trailing settle to catch a click's slightly-deferred request before
+        disarming. Requests the app fires OUTSIDE this phase (initial page load) are not
+        touched, preserving normal rendering and detection.
         """
-        Explore SPA routes to trigger lazy-loaded chunks.
-        """
+        self._suppress_mutations = True
+        try:
+            await self._explore_routes_impl(page, base_url, scope)
+            await asyncio.sleep(0.5)  # settle: catch late click-induced requests
+        finally:
+            self._suppress_mutations = False
+
+    async def _explore_routes_impl(
+        self,
+        page: Page,
+        base_url: str,
+        scope: ScopePolicy,
+    ) -> None:
         explored = 0
 
         if self._route_return_pending and self._route_current_url:
@@ -639,8 +747,11 @@ class HeadlessCollector(BaseCollector):
                 self._route_index += 1
                 await self._notify_progress()
 
-        # Also try clicking common UI elements that might trigger lazy loads
-        if not self._interactive_complete:
+        # Also try clicking common UI elements (buttons/tabs) that might trigger lazy loads.
+        # OFF by default: these clicks are the highest-risk driver of app state changes. The
+        # network guard is armed for the whole exploration phase by _explore_routes (below),
+        # so any non-idempotent request these clicks induce is blocked/confirmed, not sent.
+        if self.config.interactive_clicking and not self._interactive_complete:
             try:
                 await self._click_interactive_elements(page)
             except Exception as e:
@@ -776,6 +887,24 @@ class HeadlessMultiPageCollector(BaseCollector):
         self._inflight_links_complete: bool = False
         self._resume_loaded = False
         self.on_page_complete: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
+
+    @property
+    def observed_requests(self) -> set[tuple[str, str]]:
+        """enh2: observed xhr/fetch calls accumulated across all crawled pages."""
+        return self._collector.observed_requests
+
+    @property
+    def blocked_state_changes(self) -> list[dict[str, Any]]:
+        """State-changing requests blocked during interactive clicking across all pages."""
+        return self._collector._blocked_state_changes
+
+    @property
+    def on_state_change_attempt(self):
+        return self._collector.on_state_change_attempt
+
+    @on_state_change_attempt.setter
+    def on_state_change_attempt(self, handler) -> None:
+        self._collector.on_state_change_attempt = handler
 
     async def setup(self) -> None:
         await self._collector.setup()

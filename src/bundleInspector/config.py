@@ -174,6 +174,19 @@ class CrawlerConfig(BaseModel):
     explore_routes: bool = True
     max_route_exploration: int = 20
 
+    # Interactive UI exploration: clicking buttons/tabs/role elements to trigger lazy-loaded
+    # JS chunks. OFF by default -- such clicks are the highest-risk way to drive the app to
+    # issue its own state-changing requests (form submits, deletes, purchases). Route-link
+    # exploration (explore_routes) stays on but is covered by the same guard below.
+    interactive_clicking: bool = False
+    # Session guard: while the tool is actively driving the UI (route-link + interactive
+    # clicks), block any non-idempotent (POST/PUT/PATCH/DELETE) request it induces instead of
+    # sending it to the target. The endpoint is still recorded (so discovery is not lost); a
+    # wired confirmation handler is asked first (pause-and-confirm) and the request proceeds
+    # only if approved. Default ON. Service workers are blocked while this is on so no request
+    # bypasses the guard. Disable only on a target you own and intend to mutate.
+    block_state_changing_requests: bool = True
+
     # Retry
     max_retries: int = 3
     retry_delay: float = 1.0
@@ -236,6 +249,13 @@ class RuleConfig(BaseModel):
     # Endpoint detection
     extract_headers: bool = True
     extract_parameters: bool = True
+
+    # enh1: client-side access-control gating detection
+    client_side_gating_enabled: bool = True
+    client_side_gating_severity: str = "medium"
+
+    # enh2: dormant / hidden endpoint detection (declared in JS but never called at runtime)
+    dormant_endpoint_detection_enabled: bool = True
 
 
 # =============================================================================

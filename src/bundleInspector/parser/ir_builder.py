@@ -9,6 +9,7 @@ from __future__ import annotations
 from typing import Any, Optional
 
 from bundleInspector.storage.models import (
+    GuardCondition,
     IntermediateRepresentation,
     StringLiteral,
     FunctionCall,
@@ -453,16 +454,206 @@ class IRBuilder:
             return self._derive_function_name(value, prefix)
         return ""
 
+    # ---- enh1: client-side access-control guard extraction ----
+    def _node_line_range(self, node) -> tuple:
+        if not isinstance(node, dict):
+            return (0, 0)
+        loc = node.get("loc") or {}
+        start = (loc.get("start") or {}).get("line", 0)
+        end = (loc.get("end") or {}).get("line", start)
+        return (start, end)
+
+    def _node_offset_range(self, node) -> tuple:
+        """Absolute [start, end) char offsets from the node's `range`; (0, -1) if absent."""
+        if not isinstance(node, dict):
+            return (0, -1)
+        rng = node.get("range")
+        if isinstance(rng, (list, tuple)) and len(rng) >= 2:
+            try:
+                return (int(rng[0]), int(rng[1]))
+            except (TypeError, ValueError):
+                return (0, -1)
+        return (0, -1)
+
+    def _enclosing_func(self, line: int):
+        best = None
+        for fd in self._current_ir.function_defs:
+            if fd.line <= line <= fd.end_line:
+                if best is None or (fd.end_line - fd.line) < (best.end_line - best.line):
+                    best = fd
+        return best
+
+    def _enclosing_func_end(self, line: int) -> int:
+        best = self._enclosing_func(line)
+        return best.end_line if best else line + 100
+
+    def _enclosing_func_end_offset(self, line: int) -> int:
+        best = self._enclosing_func(line)
+        return best.end_offset if best and best.end_offset >= 0 else -1
+
+    def _member_path(self, node):
+        parts = []
+        cur = node
+        while isinstance(cur, dict) and cur.get("type") == "MemberExpression":
+            prop = cur.get("property") or {}
+            if not cur.get("computed") and prop.get("type") == "Identifier":
+                parts.append(prop.get("name") or "")
+            elif cur.get("computed") and prop.get("type") == "Literal":
+                parts.append(str(prop.get("value")))
+            else:
+                return None
+            cur = cur.get("object")
+        if isinstance(cur, dict) and cur.get("type") == "Identifier":
+            parts.append(cur.get("name") or "")
+            return ".".join(reversed([p for p in parts if p]))
+        return None
+
+    def _collect_test_tokens(self, test) -> list:
+        tokens, seen = [], set()
+
+        def add(tok):
+            if tok and tok not in seen:
+                seen.add(tok); tokens.append(tok)
+
+        def walk(node):
+            if not isinstance(node, dict):
+                return
+            t = node.get("type")
+            if t in ("FunctionExpression", "ArrowFunctionExpression", "FunctionDeclaration"):
+                return
+            if t == "Identifier":
+                add(node.get("name")); return
+            if t == "MemberExpression":
+                prop = node.get("property") or {}
+                if not node.get("computed") and prop.get("type") == "Identifier":
+                    add(prop.get("name"))
+                elif node.get("computed") and prop.get("type") == "Literal" and isinstance(prop.get("value"), str):
+                    add(prop.get("value"))
+                path = self._member_path(node)
+                if path:
+                    add(path)
+                obj = node.get("object")
+                if isinstance(obj, dict):
+                    walk(obj)
+                if node.get("computed"):
+                    walk(prop)
+                return
+            if t == "CallExpression":
+                walk(node.get("callee") or {})
+                for arg in node.get("arguments", []):
+                    if isinstance(arg, dict) and arg.get("type") == "Literal" and isinstance(arg.get("value"), str):
+                        add(arg.get("value"))
+                    else:
+                        walk(arg)
+                return
+            for v in node.values():
+                if isinstance(v, dict):
+                    walk(v)
+                elif isinstance(v, list):
+                    for it in v:
+                        if isinstance(it, dict):
+                            walk(it)
+
+        walk(test)
+        return tokens
+
+    def _consequent_is_exit(self, node) -> bool:
+        if not isinstance(node, dict):
+            return False
+        t = node.get("type")
+        if t in ("ReturnStatement", "ThrowStatement", "ContinueStatement", "BreakStatement"):
+            return True
+        if t == "BlockStatement":
+            body = node.get("body", [])
+            return bool(body) and self._consequent_is_exit(body[-1])
+        return False
+
+    def _is_negative_test(self, test) -> bool:
+        if not isinstance(test, dict):
+            return False
+        t = test.get("type")
+        if t == "UnaryExpression" and test.get("operator") == "!":
+            return True
+        if t == "BinaryExpression":
+            op = test.get("operator")
+            if op in ("!==", "!="):
+                return True
+            if op in ("==", "==="):
+                for side in (test.get("left"), test.get("right")):
+                    if isinstance(side, dict) and side.get("type") == "Literal" and side.get("value") is False:
+                        return True
+        return False
+
+    def _record_guard(self, tokens, guarded_start, guarded_end, test_start, test_end,
+                      node_kind, polarity, guarded_off=(0, -1), test_off=(0, -1)):
+        self._current_ir.guard_conditions.append(GuardCondition(
+            scope=self._current_scope, node_kind=node_kind, polarity=polarity,
+            guarded_start=guarded_start, guarded_end=guarded_end,
+            test_start=test_start, test_end=test_end, test_start_line=test_start,
+            guarded_start_off=guarded_off[0], guarded_end_off=guarded_off[1],
+            test_start_off=test_off[0], test_end_off=test_off[1],
+            tokens=list(tokens),
+        ))
+
+    def _visit_IfStatement(self, node: dict):
+        test = node.get("test") or {}
+        consequent = node.get("consequent") or {}
+        tokens = self._collect_test_tokens(test)
+        t_start, t_end = self._node_line_range(test)
+        t_off = self._node_offset_range(test)
+        if tokens:
+            c_start, c_end = self._node_line_range(consequent)
+            if c_start:
+                self._record_guard(tokens, c_start, c_end, t_start, t_end, "if", "positive",
+                                   self._node_offset_range(consequent), t_off)
+            if self._consequent_is_exit(consequent) and self._is_negative_test(test):
+                if_start, if_end = self._node_line_range(node)
+                _, if_off_end = self._node_offset_range(node)
+                func_off_end = self._enclosing_func_end_offset(if_start)
+                operand = test.get("argument") if test.get("type") == "UnaryExpression" else test
+                neg_tokens = self._collect_test_tokens(operand) or tokens
+                self._record_guard(neg_tokens, if_end + 1, self._enclosing_func_end(if_start),
+                                   t_start, t_end, "early_return", "negative_early_return",
+                                   (if_off_end, func_off_end), t_off)
+        return None
+
+    def _visit_ConditionalExpression(self, node: dict):
+        test = node.get("test") or {}
+        tokens = self._collect_test_tokens(test)
+        if tokens:
+            consequent = node.get("consequent") or {}
+            c_start, c_end = self._node_line_range(consequent)
+            t_start, t_end = self._node_line_range(test)
+            if c_start:
+                self._record_guard(tokens, c_start, c_end, t_start, t_end, "ternary", "positive",
+                                   self._node_offset_range(consequent), self._node_offset_range(test))
+        return None
+
+    def _visit_LogicalExpression(self, node: dict):
+        if node.get("operator") == "&&":
+            left = node.get("left") or {}
+            right = node.get("right") or {}
+            tokens = self._collect_test_tokens(left)
+            if tokens:
+                r_start, r_end = self._node_line_range(right)
+                l_start, l_end = self._node_line_range(left)
+                if r_start:
+                    self._record_guard(tokens, r_start, r_end, l_start, l_end, "logical", "positive",
+                                       self._node_offset_range(right), self._node_offset_range(left))
+        return None
+
     def _record_function_def(self, node: dict, func_name: str) -> None:
         """Record a function definition for later call-graph use."""
         loc = node.get("loc", {})
         start = loc.get("start", {})
         end = loc.get("end", {})
+        _, end_offset = self._node_offset_range(node)
         self._current_ir.function_defs.append(FunctionDef(
             name=func_name,
             scope=f"function:{func_name}",
             line=start.get("line", 0),
             end_line=end.get("line", start.get("line", 0)),
+            end_offset=end_offset,
         ))
 
     def _finalize_call_graph(self) -> None:

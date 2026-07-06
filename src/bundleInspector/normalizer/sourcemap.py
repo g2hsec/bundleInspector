@@ -13,7 +13,10 @@ from dataclasses import dataclass
 from typing import Any, Optional
 from urllib.parse import urljoin
 
-import httpx
+# NOTE: httpx is imported lazily inside the two async methods that need it (setup /
+# _fetch_sourcemap). This keeps `import bundleInspector.normalizer.sourcemap` httpx-free so
+# the light per-asset analysis module (which imports SourceMapResolver for offline position
+# mapping only) does not drag httpx into spawned worker processes.
 
 
 @dataclass
@@ -59,6 +62,8 @@ class SourceMapResolver:
 
     async def setup(self) -> None:
         """Initialize HTTP client."""
+        import httpx
+
         self._client = httpx.AsyncClient(
             timeout=self.timeout,
             follow_redirects=True,
@@ -130,6 +135,8 @@ class SourceMapResolver:
 
     async def _fetch_sourcemap(self, url: str) -> Optional[SourceMapInfo]:
         """Fetch and parse external source map."""
+        import httpx
+
         if not self._client:
             await self.setup()
         if not self._client:

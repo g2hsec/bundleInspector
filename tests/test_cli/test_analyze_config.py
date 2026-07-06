@@ -16,6 +16,10 @@ import bundleInspector.cli as cli_module
 from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE
 from bundleInspector.cli import _run_local_analysis, main
 from bundleInspector.config import Config
+from bundleInspector.core.resume_policy import (
+    build_local_resume_signature,
+    build_stage_state_with_resume_signature,
+)
 from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.storage.artifact_store import ArtifactStore
 from bundleInspector.storage.finding_store import FindingStore
@@ -28,6 +32,23 @@ TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
 def _make_test_path(name: str) -> Path:
     """Create a unique path under the workspace-local sandbox."""
     return (TEST_TMP_ROOT / f"{uuid.uuid4().hex}_{name}").resolve()
+
+
+def _local_resume_stage_state(
+    config: Config,
+    *,
+    recursive: bool = True,
+    include_json: bool = False,
+    stage_state: dict | None = None,
+) -> dict:
+    return build_stage_state_with_resume_signature(
+        stage_state,
+        build_local_resume_signature(
+            config,
+            recursive=recursive,
+            include_json=include_json,
+        ),
+    )
 
 
 def test_analyze_uses_config_file_and_custom_rules():
@@ -159,6 +180,63 @@ def test_analyze_resume_reuses_latest_stored_report():
     assert any(f["rule_id"] == "custom-debug-marker" for f in report_after["findings"])
 
 
+def test_analyze_resume_ignores_stored_report_when_analysis_config_changes():
+    """Analyze should not reuse a stored report across parser/rule config changes."""
+    js_path = _make_test_path("bundle_resume_mismatch.js")
+    report_path = _make_test_path("report_resume_mismatch.json")
+    cache_dir = _make_test_path("cache_resume_mismatch")
+    config_a = _make_test_path("config_resume_a.json")
+    config_b = _make_test_path("config_resume_b.json")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    js_path.write_text('const marker = "INTERNAL_DEBUG_MARKER";', encoding="utf-8")
+    config_a.write_text(
+        json.dumps(
+            {
+                "output": {"format": "json", "output_file": str(report_path)},
+                "cache_dir": str(cache_dir),
+                "parser": {"beautify": True},
+            }
+        ),
+        encoding="utf-8",
+    )
+    config_b.write_text(
+        json.dumps(
+            {
+                "output": {"format": "json", "output_file": str(report_path)},
+                "cache_dir": str(cache_dir),
+                "parser": {"beautify": False},
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    first = CliRunner().invoke(
+        main,
+        ["analyze", str(js_path), "--config", str(config_a), "--job-id", "resume-config-change", "--quiet"],
+    )
+    assert first.exit_code == 0, first.output
+    report_before = json.loads(report_path.read_text(encoding="utf-8"))
+
+    second = CliRunner().invoke(
+        main,
+        [
+            "analyze",
+            str(js_path),
+            "--config",
+            str(config_b),
+            "--job-id",
+            "resume-config-change",
+            "--resume",
+            "--quiet",
+        ],
+    )
+    assert second.exit_code == 0, second.output
+    report_after = json.loads(report_path.read_text(encoding="utf-8"))
+
+    assert report_after["id"] != report_before["id"]
+
+
 def test_analyze_honors_output_dir_and_secret_masking_from_config():
     """Analyze should honor output.output_dir and rules.mask_secrets from config files."""
     js_path = _make_test_path("bundle_secret.js")
@@ -253,6 +331,7 @@ async def test_local_analysis_resumes_from_checkpoint_without_final_report():
             stage="analyze",
             asset_hashes=[asset.content_hash],
             findings=[finding],
+            stage_state=_local_resume_stage_state(config),
         )
     )
 
@@ -267,6 +346,80 @@ async def test_local_analysis_resumes_from_checkpoint_without_final_report():
 
     assert report.job_id == config.job_id
     assert any(f.rule_id == "custom-debug-marker" for f in report.findings)
+
+
+@pytest.mark.asyncio
+async def test_local_analysis_ignores_checkpoint_when_analysis_config_changes():
+    """Local analysis should not resume a stale checkpoint from a different config profile."""
+    cache_dir = _make_test_path("cache_resume_signature_mismatch")
+    js_path = _make_test_path("resume_signature_mismatch_bundle.js")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    js_path.write_text('fetch("/api/users");', encoding="utf-8")
+
+    stale_config = Config()
+    stale_config.cache_dir = cache_dir
+    stale_config.job_id = "local-signature-mismatch-job"
+    stale_config.resume = True
+    stale_config.parser.beautify = True
+    stale_config.ensure_dirs()
+
+    artifact_store = ArtifactStore(cache_dir / stale_config.job_id / "artifacts")
+    finding_store = FindingStore(cache_dir / stale_config.job_id)
+
+    stale_asset = JSAsset(
+        url=js_path.as_uri(),
+        content=b'const marker = "STALE_CHECKPOINT";',
+        content_hash="",
+        parse_success=True,
+    )
+    stale_asset.compute_hash()
+    await artifact_store.store_js(stale_asset.content, stale_asset.url)
+    await artifact_store.store_asset_meta(stale_asset)
+
+    stale_finding = Finding(
+        rule_id="stale-checkpoint",
+        category=Category.DEBUG,
+        severity=Severity.INFO,
+        confidence=Confidence.HIGH,
+        title="Stale Finding",
+        evidence=Evidence(
+            file_url=stale_asset.url,
+            file_hash=stale_asset.content_hash,
+            line=1,
+            column=0,
+        ),
+        extracted_value="STALE_CHECKPOINT",
+    )
+    await finding_store.store_checkpoint(
+        PipelineCheckpoint(
+            job_id=stale_config.job_id,
+            seed_urls=[str(js_path)],
+            stage="analyze",
+            asset_hashes=[stale_asset.content_hash],
+            findings=[stale_finding],
+            stage_state=_local_resume_stage_state(stale_config),
+        )
+    )
+
+    fresh_config = Config()
+    fresh_config.cache_dir = cache_dir
+    fresh_config.job_id = stale_config.job_id
+    fresh_config.resume = True
+    fresh_config.parser.beautify = False
+    fresh_config.ensure_dirs()
+
+    report = await _run_local_analysis(
+        paths=[str(js_path)],
+        recursive=True,
+        include_json=False,
+        verbose=False,
+        quiet=True,
+        config=fresh_config,
+    )
+
+    assert report.job_id == fresh_config.job_id
+    assert all(f.rule_id != "stale-checkpoint" for f in report.findings)
+    assert any(f.category == Category.ENDPOINT for f in report.findings)
 
 
 @pytest.mark.asyncio
@@ -322,7 +475,10 @@ async def test_local_analysis_resumes_partial_analyze_checkpoint():
             stage="parse",
             asset_hashes=[asset.content_hash],
             findings=[finding],
-            stage_state={"analyze_complete_hashes": [asset.content_hash]},
+            stage_state=_local_resume_stage_state(
+                config,
+                stage_state={"analyze_complete_hashes": [asset.content_hash]},
+            ),
         )
     )
 
@@ -467,7 +623,10 @@ async def test_local_analysis_resumes_partial_normalize_checkpoint(monkeypatch):
             seed_urls=[str(js_path)],
             stage="collect",
             asset_hashes=[asset.content_hash],
-            stage_state={"normalize_complete_hashes": [asset.content_hash]},
+            stage_state=_local_resume_stage_state(
+                config,
+                stage_state={"normalize_complete_hashes": [asset.content_hash]},
+            ),
         )
     )
 

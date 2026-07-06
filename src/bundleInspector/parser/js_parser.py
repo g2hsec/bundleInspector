@@ -22,6 +22,8 @@ try:
 except ImportError:
     PYJSPARSER_AVAILABLE = False
 
+from bundleInspector.parser import native_acorn
+
 
 @dataclass
 class ParseResult:
@@ -69,6 +71,20 @@ class JSParser:
         Returns:
             ParseResult with AST and metadata
         """
+        # Optional native (acorn) fast path -- opt-in via BUNDLEINSPECTOR_NATIVE_PARSER.
+        # Returns an ESTree AST equivalent to esprima's on parseable input (and a more
+        # complete one on modern syntax). Any failure yields None -> esprima fallback,
+        # so detection can never degrade relative to the default parser.
+        native_ast = native_acorn.parse_source(source)
+        if native_ast is not None:
+            return ParseResult(
+                success=True,
+                ast=native_ast,
+                errors=[],
+                partial=False,
+                parser_used="acorn",
+            )
+
         if self._parser == "esprima":
             return self._parse_esprima(source)
         elif self._parser == "pyjsparser":

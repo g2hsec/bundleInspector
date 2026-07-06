@@ -19,9 +19,19 @@ class _FakeFrame:
 
 
 class _FakeRequest:
-    def __init__(self, frame_url: str | None = "https://example.com/frame", headers: dict[str, str] | None = None):
+    def __init__(
+        self,
+        frame_url: str | None = "https://example.com/frame",
+        headers: dict[str, str] | None = None,
+        method: str = "GET",
+        resource_type: str = "document",
+        url: str = "https://example.com/api",
+    ):
         self.frame = _FakeFrame(frame_url) if frame_url else None
         self.headers = headers or {}
+        self.method = method
+        self.resource_type = resource_type
+        self.url = url
 
 
 class _FakeResponse:
@@ -30,18 +40,28 @@ class _FakeResponse:
         url: str,
         content_type: str = "application/javascript",
         frame_url: str | None = "https://example.com/frame",
+        method: str = "GET",
+        resource_type: str = "document",
     ):
         self.url = url
         self.headers = {"content-type": content_type}
-        self.request = _FakeRequest(frame_url=frame_url)
+        self.request = _FakeRequest(
+            frame_url=frame_url, method=method, resource_type=resource_type
+        )
 
 
 class _FakeRoute:
     def __init__(self):
         self.continued_headers: dict[str, str] | None = None
+        self.continued: bool = False
+        self.aborted: bool = False
 
-    async def continue_(self, headers: dict[str, str]) -> None:
+    async def continue_(self, headers: dict[str, str] | None = None) -> None:
+        self.continued = True
         self.continued_headers = headers
+
+    async def abort(self) -> None:
+        self.aborted = True
 
 
 class _FakeElement:
@@ -185,6 +205,217 @@ async def test_headless_create_context_applies_cookies_and_auth_headers(_enable_
         "X-Test": "1",
         "Authorization": "Bearer secret-token",
     }
+
+
+def test_headless_captures_xhr_fetch_requests_for_dormant_baseline(_enable_headless):
+    """enh2: _on_response records xhr/fetch URLs (with method) and ignores non-API resources."""
+    collector = HeadlessCollector(CrawlerConfig())
+    scope = _scope()
+
+    collector._on_response(
+        _FakeResponse("https://example.com/api/v1/users", content_type="application/json",
+                      method="GET", resource_type="xhr"),
+        "https://example.com", scope,
+    )
+    collector._on_response(
+        _FakeResponse("https://example.com/api/v1/orders", content_type="application/json",
+                      method="POST", resource_type="fetch"),
+        "https://example.com", scope,
+    )
+    # Non-API resources must NOT be recorded as observed API calls.
+    collector._on_response(
+        _FakeResponse("https://example.com/app.js", content_type="application/javascript",
+                      method="GET", resource_type="script"),
+        "https://example.com", scope,
+    )
+    collector._on_response(
+        _FakeResponse("https://example.com/style.css", content_type="text/css",
+                      method="GET", resource_type="stylesheet"),
+        "https://example.com", scope,
+    )
+
+    assert collector.observed_requests == {
+        ("GET", "https://example.com/api/v1/users"),
+        ("POST", "https://example.com/api/v1/orders"),
+    }
+
+
+def test_headless_observed_requests_survive_reset_resume_state(_enable_headless):
+    """Observations accumulate across per-page route exploration (reset must not clear them)."""
+    collector = HeadlessCollector(CrawlerConfig())
+    collector._on_response(
+        _FakeResponse("https://example.com/api/x", content_type="application/json",
+                      method="GET", resource_type="xhr"),
+        "https://example.com", _scope(),
+    )
+    collector.reset_resume_state()
+    assert ("GET", "https://example.com/api/x") in collector.observed_requests
+
+
+async def _route_handler_for(config, auth=None):
+    """Build a context via _create_context and return (collector, installed route handler)."""
+    page = _FakePage()
+    context = _FakeContext(page)
+    browser = _FakeBrowser(context)
+    collector = HeadlessCollector(config, auth)
+    collector._browser = browser
+    created = await collector._create_context("https://example.com/app")
+    handler = created.routes[-1][1] if created.routes else None
+    return collector, handler
+
+
+@pytest.mark.asyncio
+async def test_state_change_guard_installed_by_default(_enable_headless):
+    # block_state_changing_requests defaults True => guard handler installed even with no auth,
+    # and service workers are blocked so nothing bypasses it. Interactive clicking stays off.
+    page = _FakePage()
+    context = _FakeContext(page)
+    browser = _FakeBrowser(context)
+    collector = HeadlessCollector(CrawlerConfig())
+    collector._browser = browser
+    created = await collector._create_context("https://example.com/app")
+    assert created.routes and created.routes[-1][0] == "**/*"
+    assert browser.new_context_calls[0].get("service_workers") == "block"
+    assert collector.config.interactive_clicking is False
+
+
+@pytest.mark.asyncio
+async def test_guard_not_installed_when_disabled_and_no_auth(_enable_headless):
+    collector, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False)
+    )
+    assert handler is None
+
+
+@pytest.mark.asyncio
+async def test_state_change_blocked_and_endpoint_recorded(_enable_headless):
+    collector, handler = await _route_handler_for(CrawlerConfig())  # guard on by default
+    assert handler is not None
+    collector._suppress_mutations = True  # exploration phase in flight
+    for method in ("POST", "PUT", "PATCH", "DELETE"):
+        route = _FakeRoute()
+        url = f"https://example.com/api/{method.lower()}"
+        await handler(route, _FakeRequest(method=method, resource_type="xhr", url=url))
+        assert route.aborted and not route.continued, method
+    assert {b["method"] for b in collector._blocked_state_changes} == {"POST", "PUT", "PATCH", "DELETE"}
+    # Blocked endpoints are still recorded for discovery (never sent, but observed).
+    assert ("POST", "https://example.com/api/post") in collector.observed_requests
+
+
+@pytest.mark.asyncio
+async def test_idempotent_requests_pass_during_exploration(_enable_headless):
+    collector, handler = await _route_handler_for(CrawlerConfig())
+    collector._suppress_mutations = True
+    for method in ("GET", "HEAD", "OPTIONS"):
+        route = _FakeRoute()
+        await handler(route, _FakeRequest(method=method))
+        assert route.continued and not route.aborted, method
+    assert collector._blocked_state_changes == []
+
+
+@pytest.mark.asyncio
+async def test_state_change_passes_outside_exploration(_enable_headless):
+    # The app's own load-time POSTs (outside the exploration phase) must NOT be blocked.
+    collector, handler = await _route_handler_for(CrawlerConfig())
+    assert collector._suppress_mutations is False
+    route = _FakeRoute()
+    await handler(route, _FakeRequest(method="POST", resource_type="xhr"))
+    assert route.continued and not route.aborted
+    assert collector._blocked_state_changes == []
+
+
+@pytest.mark.asyncio
+async def test_confirm_handler_can_allow_state_change(_enable_headless):
+    collector, handler = await _route_handler_for(CrawlerConfig())
+    seen = []
+    collector.on_state_change_attempt = lambda info: (seen.append(info) or True)
+    collector._suppress_mutations = True
+    route = _FakeRoute()
+    await handler(route, _FakeRequest(method="POST", url="https://example.com/api/delete"))
+    assert route.continued and not route.aborted
+    assert seen and seen[0]["method"] == "POST" and seen[0]["url"].endswith("/api/delete")
+    assert collector._blocked_state_changes == []
+    # Even when allowed, the endpoint is recorded.
+    assert ("POST", "https://example.com/api/delete") in collector.observed_requests
+
+
+@pytest.mark.asyncio
+async def test_async_confirm_handler_can_deny_state_change(_enable_headless):
+    collector, handler = await _route_handler_for(CrawlerConfig())
+
+    async def deny(info):
+        return False
+
+    collector.on_state_change_attempt = deny
+    collector._suppress_mutations = True
+    route = _FakeRoute()
+    await handler(route, _FakeRequest(method="DELETE"))
+    assert route.aborted and not route.continued
+    assert len(collector._blocked_state_changes) == 1
+
+
+@pytest.mark.asyncio
+async def test_explore_routes_arms_guard_for_route_link_clicks(_enable_headless):
+    # Regression: route-link clicks must run with the guard armed (route-link-induced
+    # mutations are covered, not just interactive-element clicks).
+    armed = {"during_click": None}
+
+    class _ProbeElement:
+        def __init__(self, collector):
+            self.click_count = 0
+            self._c = collector
+
+        async def click(self):
+            self.click_count += 1
+            armed["during_click"] = self._c._suppress_mutations
+
+    collector = HeadlessCollector(
+        CrawlerConfig(page_timeout=1, headless_wait_time=0, explore_routes=True,
+                      max_route_exploration=10)
+    )
+    probe = _ProbeElement(collector)
+    page = _FakePage(
+        evaluate_result=["/first"],
+        selector_elements={'a[href="/first"]': probe},
+    )
+    await collector._explore_routes(page, "https://example.com/app", _scope())
+    assert probe.click_count == 1
+    assert armed["during_click"] is True          # armed while the route link was clicked
+    assert collector._suppress_mutations is False  # disarmed after the phase
+
+
+@pytest.mark.asyncio
+async def test_interactive_clicking_disabled_skips_element_clicks(_enable_headless):
+    # interactive_clicking off (default) => _explore_routes must NOT click UI button/tab elements.
+    clickable = _FakeElement()
+    page = _FakePage(
+        evaluate_result=[],
+        selector_lists={HeadlessCollector._INTERACTIVE_SELECTORS[0]: [clickable]},
+    )
+    collector = HeadlessCollector(
+        CrawlerConfig(page_timeout=1, headless_wait_time=0, explore_routes=True,
+                      interactive_clicking=False)
+    )
+    await collector._explore_routes(page, "https://example.com/app", _scope())
+    assert clickable.click_count == 0
+    assert collector._interactive_complete is False
+
+
+@pytest.mark.asyncio
+async def test_interactive_clicking_enabled_arms_and_disarms_suppression(_enable_headless):
+    clickable = _FakeElement()
+    page = _FakePage(
+        evaluate_result=[],
+        selector_lists={HeadlessCollector._INTERACTIVE_SELECTORS[0]: [clickable]},
+    )
+    collector = HeadlessCollector(
+        CrawlerConfig(page_timeout=1, headless_wait_time=0, explore_routes=True,
+                      interactive_clicking=True)
+    )
+    await collector._explore_routes(page, "https://example.com/app", _scope())
+    assert clickable.click_count == 1
+    assert collector._interactive_complete is True
+    assert collector._suppress_mutations is False  # window closed after the phase
 
 
 @pytest.mark.asyncio
@@ -633,6 +864,7 @@ async def test_headless_collector_resumes_route_exploration_from_saved_route_ind
             headless_wait_time=0,
             explore_routes=True,
             max_route_exploration=10,
+            interactive_clicking=True,  # exercise the interactive path (default is off)
         )
     )
     collector.load_resume_state({

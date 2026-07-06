@@ -34,6 +34,13 @@ from bundleInspector.config import (
 )
 from bundleInspector.core.orchestrator import BundleInspector
 from bundleInspector.core.progress import PipelineStage
+from bundleInspector.core.resume_policy import (
+    build_local_resume_signature,
+    build_stage_state_with_resume_signature,
+    checkpoint_matches_resume_signature,
+    embed_report_resume_signature,
+    report_matches_resume_signature,
+)
 from bundleInspector.reporter.json_reporter import JSONReporter
 from bundleInspector.reporter.html_reporter import HTMLReporter
 from bundleInspector.reporter.sarif_reporter import SARIFReporter
@@ -1115,11 +1122,20 @@ async def _run_local_analysis(
     analysis_config = config or Config()
     analysis_config.ensure_dirs()
     analysis_config.job_id = analysis_config.job_id or str(uuid.uuid4())
+    resume_signature = build_local_resume_signature(
+        analysis_config,
+        recursive=recursive,
+        include_json=include_json,
+    )
 
     if analysis_config.resume and analysis_config.job_id:
         resumed = await _try_resume_local_report(
             analysis_config.cache_dir,
             analysis_config.job_id,
+            paths=paths,
+            config=analysis_config,
+            recursive=recursive,
+            include_json=include_json,
         )
         if resumed is not None:
             if not quiet:
@@ -1806,7 +1822,14 @@ async def _run_local_analysis(
         if not analysis_config.resume or not finding_store:
             return None
         try:
-            return await finding_store.get_checkpoint()
+            checkpoint = await finding_store.get_checkpoint()
+            if checkpoint_matches_resume_signature(
+                checkpoint,
+                seed_urls=paths,
+                expected_signature=resume_signature,
+            ):
+                return checkpoint
+            return None
         except Exception as e:
             logger.warning("local_checkpoint_load_error", job_id=analysis_config.job_id, error=str(e))
             return None
@@ -1824,7 +1847,10 @@ async def _run_local_analysis(
                 for content_hash, mapper in (line_mappers_map or {}).items()
             },
             findings=findings or [],
-            stage_state=stage_state or {},
+            stage_state=build_stage_state_with_resume_signature(
+                stage_state,
+                resume_signature,
+            ),
         )
         try:
             await finding_store.store_checkpoint(checkpoint)
@@ -2118,13 +2144,16 @@ async def _run_local_analysis(
         report = Report(
             job_id=analysis_config.job_id,
             seed_urls=paths,
-            config={
-                **analysis_config.to_dict(),
-                "mode": "local_analysis",
-                "paths": paths,
-                "recursive": recursive,
-                "include_json": include_json,
-            },
+            config=embed_report_resume_signature(
+                {
+                    **analysis_config.to_dict(),
+                    "mode": "local_analysis",
+                    "paths": paths,
+                    "recursive": recursive,
+                    "include_json": include_json,
+                },
+                resume_signature,
+            ),
             assets=assets,
             findings=findings,
             correlations=correlations,
@@ -2144,13 +2173,33 @@ async def _run_local_analysis(
             progress_bar.stop()
 
 
-async def _try_resume_local_report(cache_dir: Path, job_id: str):
+async def _try_resume_local_report(
+    cache_dir: Path,
+    job_id: str,
+    *,
+    paths: list[str],
+    config: Config,
+    recursive: bool,
+    include_json: bool,
+):
     """Resume local analysis from the latest stored report when available."""
     from bundleInspector.storage.finding_store import FindingStore
 
     try:
         store = FindingStore(cache_dir / job_id)
-        return await store.get_latest_report()
+        report = await store.get_latest_report()
+        expected_signature = build_local_resume_signature(
+            config,
+            recursive=recursive,
+            include_json=include_json,
+        )
+        if report_matches_resume_signature(
+            report,
+            seed_urls=paths,
+            expected_signature=expected_signature,
+        ):
+            return report
+        return None
     except Exception as e:
         logger.warning("local_resume_report_load_error", job_id=job_id, error=str(e))
         return None
