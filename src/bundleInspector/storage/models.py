@@ -376,6 +376,26 @@ class FunctionDef(BaseModel):
     scope: str = ""
     line: int = 0
     end_line: int = 0
+    end_offset: int = -1       # absolute char offset of the function's end (for enh1 early-return guards)
+
+
+class GuardCondition(BaseModel):
+    """enh1: a client-side conditional guarding a source region (for access-control detection)."""
+    scope: str = ""
+    node_kind: str = ""        # if | ternary | logical | early_return
+    polarity: str = ""         # positive | negative_early_return
+    guarded_start: int = 0
+    guarded_end: int = 0
+    test_start: int = 0
+    test_end: int = 0
+    test_start_line: int = 0
+    # Absolute char-offset ranges (minified/single-line safe; line ranges collapse there).
+    guarded_start_off: int = 0
+    guarded_end_off: int = -1
+    test_start_off: int = 0
+    test_end_off: int = -1
+    tokens: list[str] = Field(default_factory=list)
+    kind: str = ""             # filled by classify_guard: role|permission|flag|feature|entitlement|generic-authz
 
 
 class IntermediateRepresentation(BaseModel):
@@ -390,6 +410,7 @@ class IntermediateRepresentation(BaseModel):
     exports: list[ExportDecl] = Field(default_factory=list)
     identifiers: dict[str, list[Identifier]] = Field(default_factory=dict)
     call_graph: dict[str, list[str]] = Field(default_factory=dict)
+    guard_conditions: list[GuardCondition] = Field(default_factory=list)
 
     # Raw AST (optional, for advanced analysis)
     raw_ast: Optional[dict[str, Any]] = None

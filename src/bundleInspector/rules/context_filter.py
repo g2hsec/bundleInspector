@@ -10,6 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Optional
+from urllib.parse import urlsplit
 
 from bundleInspector.storage.models import (
     Category,
@@ -122,6 +123,68 @@ class ContextFilter:
             re.compile(p) for p in self.NON_SECRET_VALUE_PATTERNS
         ]
 
+    # Endpoint value types whose resolved path makes a bare `api_path` fragment redundant.
+    ENDPOINT_VALUE_TYPES = ("api_endpoint", "full_url", "websocket_url")
+
+    # Line-context hints that mark a finding as documentation/example (downgrade, never drop).
+    DOC_CONTEXT_HINTS = {
+        "example", "sample", "demo", "readme", "docs", "documentation",
+        "guide", "guides", "tutorial", "snippet", "reference",
+    }
+
+    @staticmethod
+    def _normalize_endpoint_path(value: str) -> str:
+        """Extract the path portion of an endpoint value (query/fragment stripped)."""
+        if value.startswith(("http://", "https://", "ws://", "wss://")):
+            path = urlsplit(value).path or "/"
+        else:
+            path = value
+        return path.split("?", 1)[0].split("#", 1)[0]
+
+    def _endpoint_paths(self, findings: list[Finding]) -> set[str]:
+        """Resolved endpoint paths in this file (for redundant api_path removal)."""
+        paths: set[str] = set()
+        for finding in findings:
+            if finding.category == Category.ENDPOINT and finding.value_type in self.ENDPOINT_VALUE_TYPES:
+                paths.add(self._normalize_endpoint_path(finding.extracted_value))
+        return paths
+
+    def _is_redundant_api_path(self, finding: Finding, endpoint_paths: set[str]) -> bool:
+        """
+        True when this `api_path` fragment is a literal segment-prefix of a resolved endpoint
+        in the same file. Segment boundary (`e == P or e.startswith(P + '/')`) ensures
+        /api/v1/user is NOT removed by /api/v1/users. The retained endpoint still carries the
+        path, so removal loses zero detection.
+        """
+        raw = finding.extracted_value
+        trimmed = raw.split("?", 1)[0].rstrip("/")
+        if not trimmed:
+            return False
+        for endpoint in endpoint_paths:
+            if endpoint == trimmed or endpoint == raw or endpoint.startswith(trimmed + "/"):
+                return True
+        return False
+
+    def _line_has_doc_context(self, source_content: str, line: int) -> bool:
+        """True when the finding's own source line reads like docs/example (string contents masked)."""
+        if not source_content or line <= 0:
+            return False
+        lines = source_content.split("\n")
+        if line - 1 >= len(lines):
+            return False
+        # Mask string-literal contents so e.g. "api.example.com" inside a string cannot trigger.
+        masked = re.sub(r'(["\'`])(?:\\.|(?!\1).)*\1', '""', lines[line - 1]).lower()
+        return any(hint in masked for hint in self.DOC_CONTEXT_HINTS)
+
+    def _apply_doc_downgrade(self, finding: Finding, source_content: str) -> None:
+        """Downgrade a DOMAIN/DEBUG finding to LOW + tag when it sits on a documentation line."""
+        if self._line_has_doc_context(source_content, finding.evidence.line):
+            if finding.confidence != Confidence.LOW:
+                finding.confidence = Confidence.LOW
+            if "doc-context" not in finding.tags:
+                finding.tags.append("doc-context")
+            finding.metadata["downgrade_reason"] = "documentation_context"
+
     def filter_findings(
         self,
         findings: list[Finding],
@@ -147,9 +210,27 @@ class ContextFilter:
         # Check if this is a test/mock file
         is_test_file = self._is_test_file(file_url)
 
+        # FP-reduction pre-pass: resolved endpoint paths, used to drop redundant api_path fragments.
+        endpoint_paths = self._endpoint_paths(findings)
+
         for finding in findings:
-            # Only apply context filtering to secrets
-            if finding.category != Category.SECRET:
+            category = finding.category
+
+            # ENDPOINT: drop only api_path fragments already covered by a resolved endpoint.
+            if category == Category.ENDPOINT:
+                if finding.value_type == "api_path" and self._is_redundant_api_path(finding, endpoint_paths):
+                    continue  # redundant (the endpoint keeps the path) -> zero detection loss
+                filtered.append(finding)
+                continue
+
+            # DOMAIN / DEBUG: downgrade (never drop) findings on documentation/example lines.
+            if category in (Category.DOMAIN, Category.DEBUG):
+                self._apply_doc_downgrade(finding, source_content)
+                filtered.append(finding)
+                continue
+
+            # FLAG / other non-secret categories: unchanged.
+            if category != Category.SECRET:
                 filtered.append(finding)
                 continue
 

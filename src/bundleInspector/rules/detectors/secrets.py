@@ -19,6 +19,40 @@ from bundleInspector.storage.models import (
 )
 
 
+def _extract_required_prefix(pattern: str) -> "str | None":
+    """
+    Return a leading literal substring that MUST appear in any match of `pattern`,
+    or None if one cannot be soundly determined.
+
+    Used as a cheap, exact pre-filter for the secret-pattern loop: if the required
+    literal is absent from a candidate string, the pattern cannot possibly match, so
+    it is skipped. Only a contiguous run of leading top-level LITERAL characters is
+    collected, after skipping leading zero-width assertions (`^`, `\\b`, lookarounds).
+    Quantified/optional/class/alternation constructs stop collection, so the prefix is
+    always mandatory (never optional) and skipping on its absence never drops a match.
+    Any parsing difficulty yields None (the pattern then always runs).
+    """
+    try:
+        parsed = re._parser.parse(pattern)
+    except Exception:
+        return None
+    chars: list[str] = []
+    started = False
+    for op, av in parsed:
+        name = getattr(op, "name", str(op))
+        if name == "LITERAL":
+            try:
+                chars.append(chr(av))
+            except (ValueError, TypeError):
+                break
+            started = True
+        elif name in ("AT", "ASSERT", "ASSERT_NOT") and not started:
+            continue  # leading zero-width assertion: following literals stay mandatory
+        else:
+            break
+    return "".join(chars) if chars else None
+
+
 class SecretDetector(BaseRule):
     """
     Detect hardcoded secrets in JavaScript.
@@ -281,6 +315,23 @@ class SecretDetector(BaseRule):
         (r"['\"]?(?:auth|authorization)['\"]?\s*[:=]\s*['\"](?:Bearer |Basic )?([a-zA-Z0-9_.-]{20,})['\"]", "auth_header", Severity.MEDIUM, Confidence.MEDIUM),
     ]
 
+    # Precompiled patterns (perf). Each secret entry carries a sound required-literal
+    # prefilter so most non-secret string literals skip the regex entirely. Compiled with
+    # the SAME flags as the original call sites (SECRET: none/case-sensitive via re.search;
+    # GENERIC: re.IGNORECASE via re.finditer) so matches are byte-identical.
+    _COMPILED_SECRET_PATTERNS = [
+        # Disable the required-literal prefilter for case-insensitive patterns: a
+        # case-sensitive substring check could wrongly skip a case-varied match (FN).
+        # No current pattern is IGNORECASE, so this only future-proofs the prefilter.
+        (_cp, _t, _s, None if (_cp.flags & re.IGNORECASE) else _extract_required_prefix(_p))
+        for (_p, _t, _s) in SECRET_PATTERNS
+        for _cp in (re.compile(_p),)
+    ]
+    _COMPILED_GENERIC_PATTERNS = [
+        (re.compile(_p, re.IGNORECASE), _t, _s, _c)
+        for (_p, _t, _s, _c) in GENERIC_PATTERNS
+    ]
+
     # Exclude patterns (placeholder, test values)
     EXCLUDE_PATTERNS = [
         r"^your[-_]?(api[-_]?)?(key|token|secret)",  # your-api-key-here
@@ -306,6 +357,13 @@ class SecretDetector(BaseRule):
         r"(?:session(?:[_-]?(?:id|token|key))?|sess(?:ion|id)?|jsessionid|phpsessid|"
         r"connect\.sid|nextauth\.session-token|next-auth\.session-token|"
         r"session_cookie|cookie_token|cookie)",
+        re.IGNORECASE,
+    )
+
+    # Secret-related vocabulary; used to gate context-less entropy hits down to LOW.
+    _SECRET_CONTEXT_LINE = re.compile(
+        r"secret|token|key|password|passwd|pwd|auth|credential|apikey|bearer|"
+        r"private|access[_-]?token|client[_-]?secret",
         re.IGNORECASE,
     )
 
@@ -338,9 +396,11 @@ class SecretDetector(BaseRule):
             if self._is_excluded(value):
                 continue
 
-            # Check known patterns
-            for pattern, secret_type, severity in self.SECRET_PATTERNS:
-                match = re.search(pattern, value)
+            # Check known patterns (precompiled + sound required-literal prefilter)
+            for pattern, secret_type, severity, required in self._COMPILED_SECRET_PATTERNS:
+                if required is not None and required not in value:
+                    continue
+                match = pattern.search(value)
                 if match:
                     matched_value = match.group(0)
                     if len(match.groups()) > 0:
@@ -390,8 +450,8 @@ class SecretDetector(BaseRule):
 
         # Scan source content for generic assignment-context patterns
         if context.source_content:
-            for pattern, secret_type, severity, confidence in self.GENERIC_PATTERNS:
-                for match in re.finditer(pattern, context.source_content, re.IGNORECASE):
+            for pattern, secret_type, severity, confidence in self._COMPILED_GENERIC_PATTERNS:
+                for match in pattern.finditer(context.source_content):
                     matched_value = match.group(0)
                     if len(match.groups()) > 0:
                         matched_value = match.group(1)
@@ -444,6 +504,22 @@ class SecretDetector(BaseRule):
             if normalized > 0.9 and bigram > 3.0 and diversity >= 3:
                 confidence = Confidence.HIGH
 
+            tags = ["secret", "entropy"]
+            metadata = {
+                "entropy": entropy,
+                "normalized_entropy": normalized,
+                "bigram_entropy": bigram,
+                "char_class_diversity": diversity,
+            }
+            # Context gate: demote (never drop) high-entropy blobs on lines without secret
+            # vocabulary, so real credential-context secrets rank above bland random strings.
+            if not self._line_has_secret_context(
+                self._source_line(context.source_content or "", literal.line)
+            ):
+                confidence = Confidence.LOW
+                tags.append("entropy-no-context")
+                metadata["downgrade_reason"] = "no_secret_context"
+
             yield RuleResult(
                 rule_id=self.id,
                 category=self.category,
@@ -456,13 +532,8 @@ class SecretDetector(BaseRule):
                 line=literal.line,
                 column=literal.column,
                 ast_node_type="Literal",
-                tags=["secret", "entropy"],
-                metadata={
-                    "entropy": entropy,
-                    "normalized_entropy": normalized,
-                    "bigram_entropy": bigram,
-                    "char_class_diversity": diversity,
-                },
+                tags=tags,
+                metadata=metadata,
             )
             emitted_values.add(value)
 
@@ -472,15 +543,18 @@ class SecretDetector(BaseRule):
             if re.match(pattern, value, re.IGNORECASE):
                 return True
 
-        # Exclude common false positives
-        if value.startswith("http://") or value.startswith("https://"):
-            # URLs without credentials are not secrets, unless they
-            # contain credential-like query parameters
-            if "@" not in value:
-                credential_params = ("key=", "token=", "secret=", "password=",
-                                     "auth=", "api_key=", "apikey=", "access_token=")
-                if not any(kw in value.lower() for kw in credential_params):
-                    return True
+        # Exclude scheme URLs without embedded credentials -- re-reported by the Domain/
+        # Endpoint detectors, never a secret. Credential-bearing URLs (token=, user:pass@)
+        # keep the same guard so they still reach secret detection.
+        credential_params = ("key=", "token=", "secret=", "password=",
+                             "auth=", "api_key=", "apikey=", "access_token=")
+        if value.startswith(("http://", "https://", "s3://", "gs://", "ws://", "wss://")):
+            if "@" not in value and not any(kw in value.lower() for kw in credential_params):
+                return True
+
+        # Inline data: URIs (base64 assets/sourcemaps) are provably not credentials.
+        if value.startswith("data:"):
+            return True
 
         # Exclude file paths
         if value.startswith("/") and "/" in value[1:]:
@@ -523,6 +597,10 @@ class SecretDetector(BaseRule):
         if index >= len(lines):
             return ""
         return lines[index]
+
+    def _line_has_secret_context(self, line_text: str) -> bool:
+        """True when the finding's line carries secret-related vocabulary (assignment context)."""
+        return bool(line_text and self._SECRET_CONTEXT_LINE.search(line_text))
 
     def _looks_like_secret(self, value: str) -> bool:
         """
@@ -593,6 +671,12 @@ class SecretDetector(BaseRule):
             r"^[a-z]+(-[a-z0-9]+)+$",
             # Webpack chunk names
             r"^(chunk|vendors|main|runtime)[~\-.]",
+            # Valid dotted DNS hostname (always re-reported by DomainDetector, never a secret)
+            r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$",
+            # Webpack/content-hash asset filename (e.g. app.4f3c2b1a.chunk.js)
+            r"^[a-z0-9_.-]+\.[0-9a-f]{6,}\.(?:js|mjs|cjs|css|map|chunk\.js)$",
+            # 4+ segment lowercase dotted namespace / i18n key (no hex/secret structure)
+            r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*){3,}$",
         ]
 
         for pattern in non_secret_patterns:

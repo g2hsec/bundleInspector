@@ -92,6 +92,7 @@ Notes:
 
 - `resume: true` is set in these profiles, but you still need `--job-id` if you
   want stable per-target persistence across runs.
+- Resume is config-aware. If you reuse the same `--job-id` with a different profile or analysis-affecting settings, BundleInspector will ignore stale reports/checkpoints and run the deeper profile instead of silently reusing old results.
 - CLI flags override config values when supplied explicitly.
 - `output.output_dir` is pre-filled so repeated runs have a predictable default
   report location unless `-o/--output` overrides it.

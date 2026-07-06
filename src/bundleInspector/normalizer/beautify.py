@@ -123,87 +123,75 @@ class Beautifier:
                 errors=[str(e)],
             )
 
+    # Characters treated as intra-line whitespace (newlines handled separately).
+    _INLINE_WHITESPACE = " \t\r\f\v"
+    _ANY_WHITESPACE = " \t\r\f\v\n"
+
     def _create_line_mapping(
         self,
         original: str,
         beautified: str,
     ) -> LineMapper:
         """
-        Create line mapping between original and beautified.
+        Create a line mapping between original and beautified content.
 
-        This is an approximation - exact mapping would require
-        token-level analysis.
+        Beautification only inserts/removes whitespace and newlines while
+        preserving the order of non-whitespace tokens. We exploit that to align
+        the two texts in a single O(n) pass over their characters: for each
+        beautified line we record the original position of that line's first
+        non-whitespace character.
+
+        This replaces a fuzzy per-line difflib similarity search that was
+        O(beautified_lines * len(original)^2) - pathologically slow (tens of
+        seconds on a single ~50KB minified line, the dominant pipeline cost)
+        and near-useless on minified input (it mapped every line to line 1,
+        column 0). The offset alignment is both linear and more accurate.
         """
         mapper = LineMapper()
 
-        original_lines = original.split("\n")
-        beautified_lines = beautified.split("\n")
+        inline_ws = self._INLINE_WHITESPACE
+        any_ws = self._ANY_WHITESPACE
+        olen = len(original)
+        oi = 0
+        original_line = 1
+        original_column = 0
 
-        # Simple heuristic: map based on content similarity
-        # For more accuracy, we'd need to track tokens through beautification
+        beautified_line = 1
+        at_line_start = True
 
-        original_line = 0
-        for beautified_line, beautified_content in enumerate(beautified_lines, 1):
-            # Find best matching original line
-            best_match = self._find_best_match(
-                beautified_content,
-                original_lines,
-                start_from=original_line,
-            )
+        for ch in beautified:
+            if ch == "\n":
+                beautified_line += 1
+                at_line_start = True
+                continue
+            if ch in inline_ws:
+                continue
 
-            if best_match is not None:
-                original_line = best_match
+            # Non-whitespace token char: advance original past any whitespace to
+            # reach the corresponding token character.
+            while oi < olen and original[oi] in any_ws:
+                if original[oi] == "\n":
+                    original_line += 1
+                    original_column = 0
+                else:
+                    original_column += 1
+                oi += 1
+
+            if at_line_start:
                 mapper.add_mapping(LineMapping(
-                    original_line=original_line + 1,
-                    original_column=0,
+                    original_line=original_line,
+                    original_column=original_column,
                     normalized_line=beautified_line,
                     normalized_column=0,
                 ))
-            else:
-                original_line = min(original_line + 1, len(original_lines) - 1)
+                at_line_start = False
+
+            # Consume the matching original character.
+            if oi < olen:
+                original_column += 1
+                oi += 1
 
         return mapper
-
-    def _find_best_match(
-        self,
-        content: str,
-        original_lines: list[str],
-        start_from: int,
-    ) -> Optional[int]:
-        """Find best matching original line."""
-        content = content.strip()
-        if not content:
-            return None
-
-        # Look in a window around start_from
-        window = 50
-        half_window = window // 2
-        start = max(0, start_from - half_window)
-        end = min(len(original_lines), start_from + half_window)
-
-        best_match = None
-        best_score = 0
-
-        for i in range(start, end):
-            original = original_lines[i].strip()
-            if not original:
-                continue
-
-            # Simple similarity: common substring length
-            score = self._similarity_score(content, original)
-            if score > best_score:
-                best_score = score
-                best_match = i
-
-        return best_match if best_score > 0.3 else None
-
-    def _similarity_score(self, a: str, b: str) -> float:
-        """Calculate similarity score between two strings (0.0 to 1.0)."""
-        if not a or not b:
-            return 0.0
-
-        from difflib import SequenceMatcher
-        return SequenceMatcher(None, a, b).ratio()
 
     def _light_deobfuscate(self, content: str) -> tuple[str, list[str]]:
         """

@@ -47,6 +47,7 @@ class RuleEngine:
         from bundleInspector.rules.detectors.flags import FlagDetector
         from bundleInspector.rules.detectors.debug import DebugDetector
         from bundleInspector.parser.chunk_analyzer import ChunkAnalyzer
+        from bundleInspector.rules.detectors.routes import RouteDetector
         from bundleInspector.rules.context_filter import ContextFilter
 
         self.register(EndpointDetector())
@@ -55,6 +56,7 @@ class RuleEngine:
         self.register(FlagDetector())
         self.register(DebugDetector())
         self.register(ChunkAnalyzer())
+        self.register(RouteDetector())
 
         # Initialize context filter for false positive reduction
         self._context_filter = ContextFilter()
@@ -137,6 +139,13 @@ class RuleEngine:
                 source_content=context.source_content,
                 file_url=context.file_url,
             )
+
+        # enh1: flag endpoints reachable only behind a client-side access-control guard.
+        try:
+            from bundleInspector.rules.access_control import annotate_client_side_gating
+            annotate_client_side_gating(findings, ir, context.source_content, self.config)
+        except Exception as e:
+            logger.warning("access_control_error", error=str(e))
 
         return findings
 

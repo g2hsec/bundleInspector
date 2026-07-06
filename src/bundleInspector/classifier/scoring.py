@@ -83,6 +83,10 @@ class ScoreCalculator:
         if finding.value_type in high_likelihood_types:
             base += 0.2
 
+        # enh4: IDOR/enumeration path params raise exploit likelihood.
+        if "idor_candidate" in finding.tags:
+            base += 0.15
+
         return min(base, 1.0)
 
     def calculate_confidence(self, finding: Finding) -> float:
