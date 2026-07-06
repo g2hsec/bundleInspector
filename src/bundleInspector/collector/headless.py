@@ -133,6 +133,8 @@ class HeadlessCollector(BaseCollector):
         # Accumulates for the collector's lifetime -- deliberately NOT cleared by
         # reset_resume_state so observations survive per-page route exploration.
         self._observed_requests: set[tuple[str, str]] = set()
+        # enh7: WebSocket URLs the running app actually opened (runtime surface baseline).
+        self._observed_websockets: set[str] = set()
         # Safety: while True, state-changing requests induced by interactive clicking are
         # intercepted at the network layer. Confirmation handler (if set) is asked before
         # allowing one; otherwise it is blocked. _blocked_state_changes records what was stopped.
@@ -194,6 +196,8 @@ class HeadlessCollector(BaseCollector):
 
             # Set up response handler
             page.on("response", lambda res: self._on_response(res, url, scope))
+            # enh7: capture runtime WebSocket endpoints (pure observation, no state change).
+            page.on("websocket", self._on_websocket)
 
             seen_urls: set[str] = set()
             async for ref in self._drain_discovered_refs(scope, seen_urls):
@@ -248,10 +252,26 @@ class HeadlessCollector(BaseCollector):
             self._active_context = None
             await context.close()
 
+    def _on_websocket(self, ws) -> None:
+        """enh7: record a WebSocket URL the app opened at runtime. Best-effort, read-only."""
+        if self._collection_finished:
+            return
+        try:
+            url = getattr(ws, "url", None)
+            if isinstance(url, str) and url.strip():
+                self._observed_websockets.add(url)
+        except Exception as e:
+            logger.debug(f"observed-websocket capture failed: {e}")
+
     @property
     def observed_requests(self) -> set[tuple[str, str]]:
         """enh2: (METHOD, url) pairs the running app actually requested via xhr/fetch."""
         return self._observed_requests
+
+    @property
+    def observed_websockets(self) -> set[str]:
+        """enh7: WebSocket URLs the running app opened at runtime."""
+        return self._observed_websockets
 
     def reset_resume_state(self) -> None:
         """Reset in-flight route exploration resume state."""
@@ -897,6 +917,11 @@ class HeadlessMultiPageCollector(BaseCollector):
     def observed_requests(self) -> set[tuple[str, str]]:
         """enh2: observed xhr/fetch calls accumulated across all crawled pages."""
         return self._collector.observed_requests
+
+    @property
+    def observed_websockets(self) -> set[str]:
+        """enh7: WebSocket URLs opened across all crawled pages."""
+        return self._collector.observed_websockets
 
     @property
     def blocked_state_changes(self) -> list[dict[str, Any]]:

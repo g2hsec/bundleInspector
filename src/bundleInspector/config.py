@@ -257,6 +257,10 @@ class RuleConfig(BaseModel):
     # enh2: dormant / hidden endpoint detection (declared in JS but never called at runtime)
     dormant_endpoint_detection_enabled: bool = True
 
+    # enh7: runtime endpoint surfacing (HTTP/WS the app CALLED at runtime but static analysis
+    # never found -- the complement of dormant detection). Scan-only; first-party scoped.
+    runtime_endpoint_surfacing_enabled: bool = True
+
 
 # =============================================================================
 # Output Configuration

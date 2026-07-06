@@ -157,6 +157,8 @@ class Orchestrator:
         # enh2: xhr/fetch URLs the app actually called at runtime -- baseline for
         # dormant/hidden endpoint detection (declared in JS but never exercised).
         self._observed_requests: set[tuple[str, str]] = set()
+        # enh7: WebSocket URLs opened at runtime -- baseline for runtime endpoint surfacing.
+        self._observed_websockets: set[str] = set()
 
     def _init_storage(self) -> None:
         """Initialize persistent stores for the current job."""
@@ -660,6 +662,10 @@ class Orchestrator:
             observed = getattr(collector, "observed_requests", None)
             if observed:
                 self._observed_requests.update(observed)
+            # enh7: also harvest runtime WebSocket URLs for runtime endpoint surfacing.
+            observed_ws = getattr(collector, "observed_websockets", None)
+            if observed_ws:
+                self._observed_websockets.update(observed_ws)
             phase_state_map.pop(phase_name, None)
             completed.add(phase_name)
             if on_phase_complete:
@@ -1375,6 +1381,28 @@ class Orchestrator:
                 )
         except Exception as e:
             logger.warning("dormant_endpoint_error", error=str(e))
+
+        # enh7: surface endpoints the app CALLED at runtime but static analysis missed
+        # (complement of dormant). Additive + first-party scoped; no-op without a baseline.
+        try:
+            from bundleInspector.correlator.runtime_surface import surface_runtime_endpoints
+
+            primary_hosts = {
+                urlparse(u).netloc.lower()
+                for u in self._seed_urls
+                if urlparse(u).netloc
+            }
+            surfaced_n = surface_runtime_endpoints(
+                findings,
+                self._observed_requests,
+                self._observed_websockets,
+                self.config.rules,
+                primary_hosts=primary_hosts,
+            )
+            if surfaced_n:
+                logger.info("runtime_endpoints_surfaced", count=surfaced_n)
+        except Exception as e:
+            logger.warning("runtime_surface_error", error=str(e))
 
         graph = self.correlator.correlate(findings)
 

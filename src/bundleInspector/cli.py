@@ -33,6 +33,7 @@ from bundleInspector.config import (
     LogLevel,
 )
 from bundleInspector.core.orchestrator import BundleInspector
+from bundleInspector.core.asset_analysis import _build_analyzer
 from bundleInspector.core.progress import PipelineStage
 from bundleInspector.core.text_decode import decode_js_bytes
 from bundleInspector.core.resume_policy import (
@@ -51,6 +52,35 @@ from bundleInspector.collector.local import LocalCollector, is_local_path
 
 console = Console()
 logger = structlog.get_logger()
+
+# Severity ordering (ascending) for the --fail-on CI gate.
+_SEVERITY_ORDER = ["info", "low", "medium", "high", "critical"]
+
+
+def _apply_fail_on_gate(report, fail_on: Optional[str]) -> None:
+    """Exit with code 2 if any finding meets or exceeds the --fail-on severity.
+
+    Distinct from exit 1 (tool error / interrupt): exit 2 means the scan ran fine and
+    found something at or above the configured gate. Intended for CI. No-op when unset.
+    The report is already written by the time this runs, so the artifact is preserved.
+    """
+    if not fail_on:
+        return
+    threshold = fail_on.lower()
+    if threshold not in _SEVERITY_ORDER:
+        return
+    min_rank = _SEVERITY_ORDER.index(threshold)
+    matched = [
+        f for f in (report.findings or [])
+        if f.severity.value.lower() in _SEVERITY_ORDER
+        and _SEVERITY_ORDER.index(f.severity.value.lower()) >= min_rank
+    ]
+    if matched:
+        console.print(
+            f"[red]✗ fail-on gate: {len(matched)} finding(s) at severity "
+            f">= {threshold} (exit 2)[/red]"
+        )
+        sys.exit(2)
 
 
 STAGE_LABELS = {
@@ -336,6 +366,12 @@ def main():
     type=click.Path(exists=True),
     help="Load custom regex rules from JSON/YAML",
 )
+@click.option(
+    "--fail-on",
+    "fail_on",
+    type=click.Choice(["info", "low", "medium", "high", "critical"], case_sensitive=False),
+    help="Exit with code 2 if any finding is at or above this severity (CI gate)",
+)
 def scan(
     ctx: click.Context,
     urls: tuple[str],
@@ -363,6 +399,7 @@ def scan(
     resume: bool,
     job_id: Optional[str],
     rules_file: Optional[str],
+    fail_on: Optional[str],
 ):
     """Scan URLs for JavaScript security findings.
 
@@ -455,6 +492,9 @@ def scan(
         # Generate API map
         if api_map:
             _generate_api_map(report, output_path, quiet)
+
+        # CI gate: exit non-zero if findings meet the severity threshold.
+        _apply_fail_on_gate(report, fail_on)
 
     except KeyboardInterrupt:
         console.print("\n[yellow]Scan cancelled[/yellow]")
@@ -987,6 +1027,12 @@ def _format_cli_finding_line(finding) -> str:
     type=click.Path(exists=True),
     help="Load custom regex rules from JSON/YAML",
 )
+@click.option(
+    "--fail-on",
+    "fail_on",
+    type=click.Choice(["info", "low", "medium", "high", "critical"], case_sensitive=False),
+    help="Exit with code 2 if any finding is at or above this severity (CI gate)",
+)
 def analyze(
     ctx: click.Context,
     paths: tuple[str],
@@ -1004,6 +1050,7 @@ def analyze(
     resume: bool,
     job_id: Optional[str],
     rules_file: Optional[str],
+    fail_on: Optional[str],
 ):
     """Analyze local JavaScript files (no network traffic).
 
@@ -1089,6 +1136,9 @@ def analyze(
         if api_map:
             _generate_api_map(report, output_path, quiet)
 
+        # CI gate: exit non-zero if findings meet the severity threshold.
+        _apply_fail_on_gate(report, fail_on)
+
     except KeyboardInterrupt:
         console.print("\n[yellow]Analysis cancelled[/yellow]")
         sys.exit(1)
@@ -1113,20 +1163,8 @@ async def _run_local_analysis(
     import uuid
     from bundleInspector.normalizer.beautify import Beautifier, NormalizationLevel
     from bundleInspector.normalizer.line_mapping import LineMapper
-    from bundleInspector.parser.export_scopes import (
-        build_commonjs_default_object_export_members,
-        build_commonjs_export_metadata,
-        build_commonjs_named_object_export_members,
-        build_commonjs_require_bindings,
-        build_commonjs_re_export_bindings,
-        build_default_object_export_members,
-        build_export_scope_map,
-        build_named_object_export_members,
-        build_re_export_bindings,
-    )
     from bundleInspector.parser.js_parser import JSParser
     from bundleInspector.parser.ir_builder import IRBuilder
-    from bundleInspector.rules.engine import RuleEngine
     from bundleInspector.rules.base import AnalysisContext
     from bundleInspector.correlator.graph import Correlator
     from bundleInspector.classifier.risk_model import RiskClassifier
@@ -1205,628 +1243,6 @@ async def _run_local_analysis(
             await finding_store.store_report(report)
         except Exception as e:
             logger.warning("local_report_store_error", report_id=report.id, error=str(e))
-
-    def _annotate_finding_metadata(ir, findings):
-        commonjs_require_bindings = build_commonjs_require_bindings(ir)
-        commonjs_require_sources = [
-            str(binding.get("source") or "").strip()
-            for binding in commonjs_require_bindings
-            if str(binding.get("source") or "").strip()
-        ]
-        commonjs_re_export_bindings = build_commonjs_re_export_bindings(ir)
-        re_export_bindings = [
-            *build_re_export_bindings(ir),
-            *commonjs_re_export_bindings,
-        ]
-        re_export_sources = [
-            str(binding.get("source") or "").strip()
-            for binding in re_export_bindings
-            if str(binding.get("source") or "").strip()
-        ]
-        imports = list(dict.fromkeys([
-            *[imp.source for imp in ir.imports if imp.source],
-            *commonjs_require_sources,
-            *re_export_sources,
-        ]))
-        dynamic_imports = [imp.source for imp in ir.imports if imp.is_dynamic and imp.source]
-        import_bindings = [
-            *_build_import_bindings(ir),
-            *commonjs_require_bindings,
-        ]
-        function_defs = ir.function_defs
-        scope_parents = _build_scope_parent_map(function_defs)
-        if ir.raw_ast:
-            seen_binding_keys = {
-                _import_binding_key(binding)
-                for binding in import_bindings
-            }
-            for _ in range(4):
-                alias_bindings = _collect_import_alias_bindings(
-                    ir.raw_ast,
-                    import_bindings,
-                    scope_parents,
-                )
-                fresh_bindings = [
-                    binding
-                    for binding in alias_bindings
-                    if _import_binding_key(binding) not in seen_binding_keys
-                ]
-                if not fresh_bindings:
-                    break
-                import_bindings.extend(fresh_bindings)
-                seen_binding_keys.update(
-                    _import_binding_key(binding)
-                    for binding in fresh_bindings
-                )
-        commonjs_exports, commonjs_export_scopes = build_commonjs_export_metadata(ir)
-        default_object_exports = list(dict.fromkeys([
-            *build_default_object_export_members(ir),
-            *build_commonjs_default_object_export_members(ir),
-        ]))
-        named_object_exports = _merge_named_object_exports(
-            build_named_object_export_members(ir),
-            build_commonjs_named_object_export_members(ir),
-        )
-        exports = list(dict.fromkeys([
-            *[exp.name for exp in ir.exports if exp.name],
-            *commonjs_exports,
-        ]))
-        export_scopes = _merge_export_scopes(
-            build_export_scope_map(ir),
-            commonjs_export_scopes,
-        )
-        call_names = [call.full_name or call.name for call in ir.function_calls if (call.full_name or call.name)]
-        scoped_calls = _build_scoped_calls(ir)
-        call_graph = ir.call_graph
-
-        for finding in findings:
-            finding.metadata.setdefault("imports", imports)
-            finding.metadata.setdefault("dynamic_imports", dynamic_imports)
-            finding.metadata.setdefault("import_bindings", import_bindings)
-            finding.metadata.setdefault("re_export_bindings", re_export_bindings)
-            finding.metadata.setdefault("exports", exports)
-            finding.metadata.setdefault("export_scopes", export_scopes)
-            finding.metadata.setdefault("default_object_exports", default_object_exports)
-            finding.metadata.setdefault("named_object_exports", named_object_exports)
-            finding.metadata.setdefault("call_names", call_names[:50])
-            finding.metadata.setdefault("scoped_calls", scoped_calls)
-            finding.metadata.setdefault("call_graph", call_graph)
-            finding.metadata.setdefault("scope_parents", scope_parents)
-            finding.metadata.setdefault(
-                "enclosing_scope",
-                _find_enclosing_scope(finding.evidence.line, function_defs),
-            )
-
-    def _merge_export_scopes(*scope_maps):
-        merged = {}
-        for scope_map in scope_maps:
-            if not isinstance(scope_map, dict):
-                continue
-            for export_name, scopes in scope_map.items():
-                if not isinstance(export_name, str):
-                    continue
-                merged.setdefault(export_name, set()).update(
-                    scope for scope in (scopes or [])
-                    if isinstance(scope, str) and scope
-                )
-        return {
-            export_name: sorted(scopes)
-            for export_name, scopes in merged.items()
-            if scopes
-        }
-
-    def _merge_named_object_exports(*member_maps):
-        merged = {}
-        for member_map in member_maps:
-            if not isinstance(member_map, dict):
-                continue
-            for export_name, members in member_map.items():
-                if not isinstance(export_name, str):
-                    continue
-                merged.setdefault(export_name, set()).update(
-                    member for member in (members or [])
-                    if isinstance(member, str) and member
-                )
-        return {
-            export_name: sorted(members)
-            for export_name, members in merged.items()
-            if members
-        }
-
-    def _build_import_bindings(ir):
-        bindings = []
-        for import_decl in ir.imports:
-            if not import_decl.source:
-                continue
-            for specifier in import_decl.specifiers:
-                binding = _parse_import_specifier(import_decl.source, specifier)
-                if binding:
-                    bindings.append(binding)
-        if ir.raw_ast:
-            bindings.extend(_collect_dynamic_import_bindings(ir.raw_ast))
-        return bindings
-
-    def _parse_import_specifier(source, specifier):
-        value = (specifier or "").strip()
-        if not value:
-            return None
-        if value.startswith("default as "):
-            return {"source": source, "imported": "default", "local": value[len("default as "):], "kind": "default"}
-        if value.startswith("* as "):
-            return {"source": source, "imported": "*", "local": value[len("* as "):], "kind": "namespace"}
-        if " as " in value:
-            imported, local = value.split(" as ", 1)
-            return {"source": source, "imported": imported.strip(), "local": local.strip(), "kind": "named"}
-        return {"source": source, "imported": value, "local": value, "kind": "named"}
-
-    def _collect_dynamic_import_bindings(node, scope="global"):
-        bindings = []
-        if not isinstance(node, dict):
-            return bindings
-
-        node_type = node.get("type", "")
-        if node_type in {"FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"}:
-            function_scope = _derive_dynamic_scope_name(node)
-            for param in node.get("params", []):
-                bindings.extend(_collect_dynamic_import_bindings(param, function_scope))
-            body = node.get("body")
-            if body:
-                bindings.extend(_collect_dynamic_import_bindings(body, function_scope))
-            return bindings
-
-        if node_type == "VariableDeclarator":
-            bindings.extend(
-                _extract_dynamic_import_binding_targets(
-                    node.get("id"),
-                    node.get("init"),
-                    scope,
-                )
-            )
-        elif node_type == "AssignmentExpression" and node.get("operator") == "=":
-            bindings.extend(
-                _extract_dynamic_import_binding_targets(
-                    node.get("left"),
-                    node.get("right"),
-                    scope,
-                )
-            )
-        elif node_type == "CallExpression":
-            bindings.extend(_extract_dynamic_import_then_bindings(node))
-
-        for key, value in node.items():
-            if key in {"loc", "range", "raw"}:
-                continue
-            if isinstance(value, dict):
-                bindings.extend(_collect_dynamic_import_bindings(value, scope))
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        bindings.extend(_collect_dynamic_import_bindings(item, scope))
-
-        return bindings
-
-    def _extract_dynamic_import_then_bindings(node):
-        if not isinstance(node, dict):
-            return []
-        callee = node.get("callee") or {}
-        if callee.get("type") != "MemberExpression":
-            return []
-        property_name = _extract_pattern_name(callee.get("property"))
-        if property_name != "then":
-            return []
-        source_object = callee.get("object")
-        source = _extract_dynamic_import_source(source_object)
-        if not source:
-            return []
-
-        for arg in node.get("arguments", []):
-            if not isinstance(arg, dict):
-                continue
-            if arg.get("type") not in {
-                "FunctionDeclaration",
-                "FunctionExpression",
-                "ArrowFunctionExpression",
-            }:
-                continue
-            params = arg.get("params") or []
-            if not params:
-                return []
-            callback_scope = _derive_dynamic_scope_name(arg)
-            return _extract_dynamic_import_binding_targets(
-                params[0],
-                source_object,
-                callback_scope,
-            )
-        return []
-
-    def _extract_dynamic_import_binding_targets(target, value, scope):
-        source = _extract_dynamic_import_source(value)
-        if not source or not isinstance(target, dict):
-            return []
-
-        if target.get("type") == "Identifier":
-            local = str(target.get("name") or "").strip()
-            if not local:
-                return []
-            return [{
-                "source": source,
-                "imported": "*",
-                "local": local,
-                "kind": "namespace",
-                "scope": scope,
-                "is_dynamic": True,
-            }]
-
-        if target.get("type") != "ObjectPattern":
-            return []
-
-        bindings = []
-        for prop in target.get("properties", []):
-            if not isinstance(prop, dict) or prop.get("type") != "Property":
-                continue
-            imported = _extract_pattern_name(prop.get("key"))
-            local = _extract_pattern_target_name(prop.get("value"))
-            if not imported or not local:
-                continue
-            kind = "default" if imported == "default" else "named"
-            bindings.append({
-                "source": source,
-                "imported": imported,
-                "local": local,
-                "kind": kind,
-                "scope": scope,
-                "is_dynamic": True,
-            })
-        return bindings
-
-    def _extract_dynamic_import_source(node):
-        if not isinstance(node, dict):
-            return ""
-
-        node_type = node.get("type", "")
-        if node_type == "AwaitExpression":
-            return _extract_dynamic_import_source(node.get("argument"))
-        if node_type == "CallExpression" and (node.get("callee") or {}).get("type") == "Import":
-            source_node = (node.get("arguments") or [{}])[0]
-        elif node_type == "ImportExpression":
-            source_node = node.get("source", {})
-        else:
-            return ""
-
-        if source_node.get("type") == "Literal":
-            value = source_node.get("value")
-            return value if isinstance(value, str) else ""
-        if source_node.get("type") == "TemplateLiteral":
-            quasis = source_node.get("quasis", [])
-            if quasis:
-                return str(quasis[0].get("value", {}).get("cooked") or "")
-        return ""
-
-    def _collect_import_alias_bindings(node, existing_bindings, scope_parents, scope="global"):
-        bindings = []
-        if not isinstance(node, dict):
-            return bindings
-
-        node_type = node.get("type", "")
-        if node_type in {"FunctionDeclaration", "FunctionExpression", "ArrowFunctionExpression"}:
-            function_scope = _derive_dynamic_scope_name(node)
-            for param in node.get("params", []):
-                bindings.extend(
-                    _collect_import_alias_bindings(param, existing_bindings, scope_parents, function_scope)
-                )
-            body = node.get("body")
-            if body:
-                bindings.extend(
-                    _collect_import_alias_bindings(body, existing_bindings, scope_parents, function_scope)
-                )
-            return bindings
-
-        if node_type == "VariableDeclarator":
-            bindings.extend(
-                _extract_import_alias_bindings(
-                    node.get("id"),
-                    node.get("init"),
-                    existing_bindings,
-                    scope_parents,
-                    scope,
-                )
-            )
-        elif node_type == "AssignmentExpression" and node.get("operator") == "=":
-            bindings.extend(
-                _extract_import_alias_bindings(
-                    node.get("left"),
-                    node.get("right"),
-                    existing_bindings,
-                    scope_parents,
-                    scope,
-                )
-            )
-
-        for key, value in node.items():
-            if key in {"loc", "range", "raw"}:
-                continue
-            if isinstance(value, dict):
-                bindings.extend(_collect_import_alias_bindings(value, existing_bindings, scope_parents, scope))
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        bindings.extend(_collect_import_alias_bindings(item, existing_bindings, scope_parents, scope))
-
-        return bindings
-
-    def _extract_import_alias_bindings(target, value, existing_bindings, scope_parents, scope):
-        alias_bindings = []
-        direct_alias = _extract_identifier_import_alias_binding(
-            target,
-            value,
-            existing_bindings,
-            scope_parents,
-            scope,
-        )
-        if direct_alias:
-            alias_bindings.append(direct_alias)
-
-        member_alias = _extract_import_member_alias_binding(
-            target,
-            value,
-            existing_bindings,
-            scope_parents,
-            scope,
-        )
-        if member_alias:
-            alias_bindings.append(member_alias)
-
-        alias_bindings.extend(
-            _extract_object_pattern_import_alias_bindings(
-                target,
-                value,
-                existing_bindings,
-                scope_parents,
-                scope,
-            )
-        )
-        return alias_bindings
-
-    def _extract_identifier_import_alias_binding(target, value, existing_bindings, scope_parents, scope):
-        local = _extract_pattern_target_name(target)
-        if not local or not isinstance(value, dict) or value.get("type") != "Identifier":
-            return None
-
-        value_name = str(value.get("name") or "").strip()
-        if not value_name or value_name == local:
-            return None
-
-        for binding in existing_bindings:
-            if not _binding_matches_local(binding, value_name, scope_parents, scope):
-                continue
-            return _clone_import_binding(
-                binding,
-                local=local,
-                scope=scope,
-                is_alias=True,
-            )
-        return None
-
-    def _extract_object_pattern_import_alias_bindings(target, value, existing_bindings, scope_parents, scope):
-        if not isinstance(target, dict) or target.get("type") != "ObjectPattern":
-            return []
-        if not isinstance(value, dict) or value.get("type") != "Identifier":
-            return []
-
-        value_name = str(value.get("name") or "").strip()
-        if not value_name:
-            return []
-
-        bindings = []
-        source_bindings = [
-            binding
-            for binding in existing_bindings
-            if _binding_matches_local(binding, value_name, scope_parents, scope)
-        ]
-        if not source_bindings:
-            return bindings
-
-        for source_binding in source_bindings:
-            binding_kind = str(source_binding.get("kind") or "").strip()
-            if binding_kind not in {"namespace", "default"}:
-                continue
-            for prop in target.get("properties", []):
-                if not isinstance(prop, dict) or prop.get("type") != "Property":
-                    continue
-                imported = _extract_pattern_name(prop.get("key"))
-                local = _extract_pattern_target_name(prop.get("value"))
-                if not imported or not local:
-                    continue
-                kind = "default" if imported == "default" else "named"
-                bindings.append(
-                    _clone_import_binding(
-                        source_binding,
-                        imported=imported,
-                        local=local,
-                        kind=kind,
-                        scope=scope,
-                        is_alias=True,
-                        is_destructured_alias=True,
-                    )
-                )
-
-        return bindings
-
-    def _binding_matches_local(binding, local_name, scope_parents, scope):
-        binding_local = str(binding.get("local") or "").strip()
-        binding_scope = str(binding.get("scope") or "global").strip() or "global"
-        if binding_local != local_name:
-            return False
-        if binding_scope == "global":
-            return True
-        if binding_scope == scope:
-            return True
-        return binding_scope in scope_parents.get(scope, [])
-
-    def _clone_import_binding(binding, *, local, scope, imported=None, kind=None, is_alias=False, is_destructured_alias=False):
-        cloned = dict(binding)
-        cloned["local"] = local
-        cloned["scope"] = scope
-        if imported is not None:
-            cloned["imported"] = imported
-        if kind is not None:
-            cloned["kind"] = kind
-        if is_alias:
-            cloned["is_alias"] = True
-        if is_destructured_alias:
-            cloned["is_destructured_alias"] = True
-        return cloned
-
-    def _import_binding_key(binding):
-        return (
-            binding.get("source"),
-            binding.get("imported"),
-            binding.get("local"),
-            binding.get("kind"),
-            binding.get("scope"),
-            bool(binding.get("is_dynamic")),
-            bool(binding.get("is_reexport")),
-            bool(binding.get("is_reexport_all")),
-            bool(binding.get("is_commonjs")),
-            bool(binding.get("is_commonjs_reexport")),
-            bool(binding.get("is_member_alias")),
-            bool(binding.get("is_alias")),
-            bool(binding.get("is_destructured_alias")),
-        )
-
-    def _extract_import_member_alias_binding(target, value, existing_bindings, scope_parents, scope):
-        local = _extract_pattern_target_name(target)
-        if not local or not isinstance(value, dict) or value.get("type") != "MemberExpression":
-            return None
-
-        object_node = value.get("object")
-        property_name = _extract_pattern_name(value.get("property"))
-        if not property_name or not isinstance(object_node, dict) or object_node.get("type") != "Identifier":
-            return None
-
-        object_name = str(object_node.get("name") or "").strip()
-        if not object_name:
-            return None
-
-        for binding in existing_bindings:
-            binding_local = str(binding.get("local") or "").strip()
-            binding_scope = str(binding.get("scope") or "global").strip() or "global"
-            binding_kind = str(binding.get("kind") or "").strip()
-            if binding_local != object_name:
-                continue
-            if binding_kind != "namespace":
-                continue
-            if binding_scope != "global" and binding_scope != scope and binding_scope not in scope_parents.get(scope, []):
-                continue
-            return _clone_import_binding(
-                binding,
-                imported=property_name,
-                local=local,
-                kind="named",
-                scope=scope,
-                is_alias=True,
-                is_destructured_alias=False,
-            ) | {"is_member_alias": True}
-        return None
-
-    def _extract_pattern_name(node):
-        if not isinstance(node, dict):
-            return ""
-        node_type = node.get("type", "")
-        if node_type == "Identifier":
-            return str(node.get("name") or "").strip()
-        if node_type == "Literal":
-            value = node.get("value")
-            return value.strip() if isinstance(value, str) else ""
-        return ""
-
-    def _extract_pattern_target_name(node):
-        if not isinstance(node, dict):
-            return ""
-        node_type = node.get("type", "")
-        if node_type == "Identifier":
-            return str(node.get("name") or "").strip()
-        if node_type == "AssignmentPattern":
-            return _extract_pattern_target_name(node.get("left"))
-        return ""
-
-    def _derive_dynamic_scope_name(node):
-        node_type = node.get("type", "")
-        prefix_map = {
-            "FunctionDeclaration": "function",
-            "FunctionExpression": "function_expr",
-            "ArrowFunctionExpression": "arrow",
-        }
-        prefix = prefix_map.get(node_type, "function")
-        function_id = (node.get("id") or {}).get("name")
-        if function_id:
-            return f"function:{function_id}"
-        line = ((node.get("loc") or {}).get("start") or {}).get("line", 0)
-        return f"function:{prefix}@{line}" if line else "global"
-
-    def _build_scoped_calls(ir):
-        scoped_calls = {}
-        for call in ir.function_calls:
-            scope = (call.scope or "global").strip() or "global"
-            name = (call.full_name or call.name or "").strip()
-            if not name:
-                continue
-            scoped_calls.setdefault(scope, set()).add(name)
-        return {
-            scope: sorted(call_names)
-            for scope, call_names in scoped_calls.items()
-        }
-
-    def _find_enclosing_scope(line, function_defs):
-        if line <= 0:
-            return "global"
-        matching = [
-            func_def for func_def in function_defs
-            if func_def.line <= line <= max(func_def.end_line, func_def.line)
-        ]
-        if not matching:
-            return "global"
-        matching.sort(key=lambda func_def: (func_def.end_line - func_def.line, func_def.line))
-        return matching[0].scope
-
-    def _build_scope_parent_map(function_defs):
-        normalized_defs = [
-            func_def for func_def in function_defs
-            if getattr(func_def, "scope", "") and getattr(func_def, "line", 0) > 0
-        ]
-        if not normalized_defs:
-            return {}
-
-        parent_map = {}
-        for func_def in normalized_defs:
-            candidates = [
-                candidate for candidate in normalized_defs
-                if candidate.scope != func_def.scope
-                and candidate.line <= func_def.line
-                and candidate.end_line >= func_def.end_line
-            ]
-            if not candidates:
-                continue
-            candidates.sort(
-                key=lambda candidate: (
-                    candidate.end_line - candidate.line,
-                    candidate.line,
-                )
-            )
-            parent_map[func_def.scope] = candidates[0].scope
-
-        scope_parents = {}
-        for scope in parent_map:
-            ancestors = []
-            seen = set()
-            current = parent_map.get(scope)
-            while current and current not in seen:
-                ancestors.append(current)
-                seen.add(current)
-                current = parent_map.get(current)
-            if ancestors:
-                scope_parents[scope] = ancestors
-        return scope_parents
 
     def _local_stage_at_least(stage: str, target: str) -> bool:
         try:
@@ -2078,8 +1494,7 @@ async def _run_local_analysis(
         # Analyze
         _announce_stage("Analyze", f"({len(ir_list)} IR objects)")
         _update(45, "Analyze", f"0/{max(len(ir_list), 1)} assets")
-        engine = RuleEngine(analysis_config.rules)
-        engine.register_defaults()
+        analyzer = _build_analyzer(analysis_config)
 
         content_map = {}
         for asset in assets:
@@ -2097,36 +1512,25 @@ async def _run_local_analysis(
                     continue
                 file_findings = []
                 try:
-                    source_content = content_map.get(ir.file_url, "")
                     context = AnalysisContext(
                         file_url=ir.file_url,
                         file_hash=ir.file_hash,
-                        source_content=source_content,
+                        source_content=content_map.get(ir.file_url, ""),
                         is_first_party=True,
                     )
-                    file_findings = engine.analyze(ir, context)
+                    # Unified analysis path: the SAME AssetAnalyzer the serial/parallel scan
+                    # pipeline uses (analyze -> annotate -> line-map), so there is no
+                    # local-vs-orchestrator drift. Enrichment failures degrade metadata but
+                    # never drop findings (secured inside analyze_prebuilt_ir).
+                    file_findings = analyzer.analyze_prebuilt_ir(
+                        ir, context, line_mapper=line_mappers.get(ir.file_hash)
+                    )
                 except Exception as e:
                     if verbose and not quiet:
                         console.print(f"[yellow]Analysis error: {e}[/yellow]")
                     else:
                         logger.warning("analysis_error", error=str(e))
-                # Secure findings BEFORE enrichment: a failure annotating or
-                # line-mapping must never discard already-extracted findings.
                 findings.extend(file_findings)
-                try:
-                    _annotate_finding_metadata(ir, file_findings)
-                    line_mapper = line_mappers.get(ir.file_hash)
-                    if line_mapper:
-                        for finding in file_findings:
-                            if finding.evidence.line > 0:
-                                original_line, original_column = line_mapper.get_original(
-                                    finding.evidence.line,
-                                    finding.evidence.column,
-                                )
-                                finding.evidence.original_line = original_line
-                                finding.evidence.original_column = original_column
-                except Exception as e:
-                    logger.warning("finding_enrichment_error", url=ir.file_url[:100], error=str(e))
                 analyzed_hashes.add(ir.file_hash)
                 await _store_local_checkpoint(
                     "parse",

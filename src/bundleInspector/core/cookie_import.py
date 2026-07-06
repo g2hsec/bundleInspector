@@ -14,10 +14,112 @@ import json
 import logging
 import re
 import sqlite3
+import sys
 from pathlib import Path
 from typing import Optional
 
 logger = logging.getLogger(__name__)
+
+
+def _dpapi_unprotect(data: bytes) -> Optional[bytes]:
+    """Windows DPAPI CryptUnprotectData via ctypes (no pywin32 dependency).
+
+    Returns the decrypted bytes, or None on any failure / non-Windows.
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        class _Blob(ctypes.Structure):
+            _fields_ = [
+                ("cbData", wintypes.DWORD),
+                ("pbData", ctypes.POINTER(ctypes.c_char)),
+            ]
+
+        buf = ctypes.create_string_buffer(bytes(data), len(data))
+        blob_in = _Blob(len(data), ctypes.cast(buf, ctypes.POINTER(ctypes.c_char)))
+        blob_out = _Blob()
+        ok = ctypes.windll.crypt32.CryptUnprotectData(
+            ctypes.byref(blob_in), None, None, None, None, 0, ctypes.byref(blob_out)
+        )
+        if not ok:
+            return None
+        try:
+            return ctypes.string_at(blob_out.pbData, blob_out.cbData)
+        finally:
+            ctypes.windll.kernel32.LocalFree(blob_out.pbData)
+    except Exception as e:
+        logger.debug(f"DPAPI unprotect failed: {e}")
+        return None
+
+
+def _chromium_local_state_path(db_path: Path) -> Optional[Path]:
+    """Locate the browser's `Local State` file (holds the encrypted master key) by
+    walking up from the cookie DB path (handles both `Default/Cookies` and the newer
+    `Default/Network/Cookies` layouts)."""
+    for parent in list(db_path.parents)[:5]:
+        candidate = parent / "Local State"
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _chromium_master_key(db_path: Path) -> Optional[bytes]:
+    """Recover the AES-256 master key used to encrypt Chromium cookie values on Windows:
+    base64-decode `os_crypt.encrypted_key` from Local State, strip the `DPAPI` prefix, and
+    DPAPI-unprotect the remainder. Returns None if unavailable."""
+    local_state = _chromium_local_state_path(db_path)
+    if not local_state:
+        return None
+    try:
+        import base64
+
+        data = json.loads(local_state.read_text(encoding="utf-8"))
+        key_b64 = (data.get("os_crypt") or {}).get("encrypted_key")
+        if not key_b64:
+            return None
+        blob = base64.b64decode(key_b64)
+        if blob[:5] != b"DPAPI":
+            return None
+        return _dpapi_unprotect(blob[5:])
+    except Exception as e:
+        logger.debug(f"chromium master key unavailable: {e}")
+        return None
+
+
+def _decrypt_chromium_value(encrypted: bytes, key: Optional[bytes]) -> Optional[str]:
+    """Decrypt a single Chromium `encrypted_value` blob.
+
+    - `v10`/`v11`: AES-256-GCM (3-byte tag + 12-byte nonce + ciphertext + 16-byte GCM tag),
+      using the DPAPI-recovered master key. Requires the optional `cryptography` package.
+    - `v20`: app-bound encryption (Chrome 127+) -- not supported; returns None.
+    - otherwise: a legacy whole-blob DPAPI ciphertext.
+    Returns None (never raises) so a single undecryptable cookie can't break the import.
+    """
+    if not encrypted:
+        return None
+    try:
+        prefix = bytes(encrypted[:3])
+        if prefix in (b"v10", b"v11"):
+            if key is None:
+                return None
+            try:
+                from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+            except ImportError:
+                return None
+            nonce = encrypted[3:15]
+            payload = encrypted[15:]
+            plaintext = AESGCM(key).decrypt(nonce, payload, None)
+            return plaintext.decode("utf-8", errors="replace")
+        if prefix == b"v20":
+            return None  # app-bound encryption (Chrome 127+) -- needs the app-bound key
+        dec = _dpapi_unprotect(bytes(encrypted))
+        return dec.decode("utf-8", errors="replace") if dec else None
+    except Exception as e:
+        logger.debug(f"cookie value decrypt failed: {e}")
+        return None
 
 
 def _copy_db_with_sidecars(db_path: Path, tmp_dir: Path) -> Path:
@@ -401,24 +503,37 @@ def _read_chromium_cookies(
                 conn = sqlite3.connect(str(db_copy))
                 cursor = conn.cursor()
 
-                # Try to read unencrypted values
+                # Recover the DPAPI master key once so encrypted values can be decrypted.
+                master_key = _chromium_master_key(db_path)
+
                 if domain:
                     cursor.execute(
-                        "SELECT name, value FROM cookies WHERE host_key LIKE ?",
+                        "SELECT name, value, encrypted_value FROM cookies WHERE host_key LIKE ?",
                         (f"%{domain}%",)
                     )
                 else:
-                    cursor.execute("SELECT name, value FROM cookies")
+                    cursor.execute("SELECT name, value, encrypted_value FROM cookies")
 
-                for name, value in cursor.fetchall():
-                    if name:
-                        cookies[name] = value or ""
+                undecryptable = False
+                for name, value, encrypted_value in cursor.fetchall():
+                    if not name:
+                        continue
+                    if value:
+                        cookies[name] = value
+                        continue
+                    if encrypted_value:
+                        decrypted = _decrypt_chromium_value(encrypted_value, master_key)
+                        if decrypted is not None:
+                            cookies[name] = decrypted
+                        else:
+                            undecryptable = True
 
-                if not cookies:
+                if undecryptable and not cookies:
                     logger.info(
-                        "Chrome cookies are encrypted. "
-                        "Export cookies using EditThisCookie or Cookie-Editor extension, "
-                        "then use --cookies-file with the exported JSON."
+                        "Chrome cookies are encrypted and could not be decrypted "
+                        "(install the optional 'cryptography' package, or the profile uses "
+                        "app-bound encryption). Alternatively export via a cookie extension "
+                        "and use --cookies-file with the exported JSON."
                     )
 
             except sqlite3.Error as e:

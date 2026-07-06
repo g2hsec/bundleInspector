@@ -10,6 +10,8 @@ import re
 from typing import Any, Iterator, Optional
 from urllib.parse import urljoin, urlsplit
 
+import structlog
+
 from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
 from bundleInspector.storage.models import (
     Category,
@@ -20,6 +22,16 @@ from bundleInspector.storage.models import (
 
 _BLOCKED_STRING = "__JSFINDER_BLOCKED__"
 _NULLISH_STATIC = object()
+
+logger = structlog.get_logger(__name__)
+
+# Recursion budget for the string-resolution helpers. Real URL expressions nest only a
+# handful deep; a pathological/obfuscated bundle (e.g. "a"+"b"+... x1000, deeply nested
+# objects) could otherwise blow the Python recursion limit and -- because match() buffers
+# all HTTP results before yielding -- lose EVERY endpoint for the file. The cap is far above
+# any real expression depth, so it never perturbs normal output, but well below the
+# interpreter limit so it degrades to "unresolved" instead of raising RecursionError.
+_MAX_RESOLVE_DEPTH = 250
 
 
 class EndpointDetector(BaseRule):
@@ -121,6 +133,8 @@ class EndpointDetector(BaseRule):
         """Match endpoints in IR."""
         # Per-call memo so the ~14 AST passes below walk the tree once, not ~14x.
         self._node_cache: dict[int, list] = {}
+        # Per-call recursion budget shared by the string-resolution helpers.
+        self._resolve_depth = 0
         function_returns = self._build_function_return_table(
             ir.raw_ast or {},
             {},
@@ -148,18 +162,24 @@ class EndpointDetector(BaseRule):
         # HTTP pass -- buffered so methods can be aggregated per path for method-flip hints.
         http_results = []
         for call in ir.function_calls:
-            for result in self._check_http_call(
-                call,
-                ir,
-                context,
-                constants,
-                bool_constants,
-                function_returns,
-                client_base_urls,
-                xhr_clients,
-                client_headers,
-            ):
-                http_results.append(result)
+            # Safety net: a pathological single call that still exhausts the recursion
+            # budget must not discard the HTTP results already collected from other calls.
+            try:
+                for result in self._check_http_call(
+                    call,
+                    ir,
+                    context,
+                    constants,
+                    bool_constants,
+                    function_returns,
+                    client_base_urls,
+                    xhr_clients,
+                    client_headers,
+                ):
+                    http_results.append(result)
+            except RecursionError:
+                logger.debug("endpoint_http_call_recursion_skipped")
+                continue
         methods_by_path: dict[str, set[str]] = {}
         for result in http_results:
             methods_by_path.setdefault(
@@ -179,41 +199,57 @@ class EndpointDetector(BaseRule):
             self._apply_idor(result)
             yield result
 
-        # Check WebSocket constructors (no HTTP method -> url dedup only).
-        for result in self._check_websocket_constructors(
-            ir.raw_ast or {},
-            context,
-            constants,
-            bool_constants,
-            function_returns,
-        ):
-            if result.extracted_value in seen_urls:
-                continue
-            seen_urls.add(result.extracted_value)
-            self._apply_idor(result)
-            yield result
-
-        # enh6: GraphQL operations + WebSocket message surface (after http/ws so existing
-        # endpoints claim their extracted_value first in the shared dedup set).
-        for result in self._check_graphql_operations(ir.raw_ast or {}, context, constants, bool_constants, function_returns):
-            if result.extracted_value in seen_urls:
-                continue
-            seen_urls.add(result.extracted_value)
-            yield result
-        for result in self._check_ws_messages(ir, ir.raw_ast or {}, context, constants, bool_constants, function_returns):
-            if result.extracted_value in seen_urls:
-                continue
-            seen_urls.add(result.extracted_value)
-            yield result
-
-        # Check string literals for URL patterns (suppressed if an http/ws url already emitted).
-        for literal in ir.string_literals:
-            for result in self._check_url_pattern(literal, context):
+        # Check WebSocket constructors (no HTTP method -> url dedup only). Each pass below is
+        # wrapped in try/except RecursionError so one pathological node cannot abort match()
+        # and skip the remaining passes -- notably the final literal-URL pass, which catches
+        # plain /api/... strings and must always run.
+        try:
+            for result in self._check_websocket_constructors(
+                ir.raw_ast or {},
+                context,
+                constants,
+                bool_constants,
+                function_returns,
+            ):
                 if result.extracted_value in seen_urls:
                     continue
                 seen_urls.add(result.extracted_value)
                 self._apply_idor(result)
                 yield result
+        except RecursionError:
+            logger.debug("endpoint_websocket_recursion_skipped")
+
+        # enh6: GraphQL operations + WebSocket message surface (after http/ws so existing
+        # endpoints claim their extracted_value first in the shared dedup set).
+        try:
+            for result in self._check_graphql_operations(ir.raw_ast or {}, context, constants, bool_constants, function_returns):
+                if result.extracted_value in seen_urls:
+                    continue
+                seen_urls.add(result.extracted_value)
+                yield result
+        except RecursionError:
+            logger.debug("endpoint_graphql_recursion_skipped")
+        try:
+            for result in self._check_ws_messages(ir, ir.raw_ast or {}, context, constants, bool_constants, function_returns):
+                if result.extracted_value in seen_urls:
+                    continue
+                seen_urls.add(result.extracted_value)
+                yield result
+        except RecursionError:
+            logger.debug("endpoint_ws_messages_recursion_skipped")
+
+        # Check string literals for URL patterns (suppressed if an http/ws url already emitted).
+        for literal in ir.string_literals:
+            try:
+                for result in self._check_url_pattern(literal, context):
+                    if result.extracted_value in seen_urls:
+                        continue
+                    seen_urls.add(result.extracted_value)
+                    self._apply_idor(result)
+                    yield result
+            except RecursionError:
+                logger.debug("endpoint_url_pattern_recursion_skipped")
+                continue
 
     def _endpoint_path(self, url: str) -> str:
         """Path portion of an endpoint url (query/fragment stripped)."""
@@ -1246,7 +1282,25 @@ class EndpointDetector(BaseRule):
             return value.upper()
         return "GET"
 
-    def _resolve_string_expr(
+    def _resolve_string_expr(self, *args, **kwargs) -> str:
+        """Depth-guarded entry point for string resolution.
+
+        Shares a single recursion counter (_resolve_depth) with
+        _extract_object_string_values so mutual recursion (object -> resolve -> object)
+        is bounded collectively. On budget exhaustion returns "" -- the same
+        "could-not-resolve" sentinel callers already handle -- instead of raising
+        RecursionError.
+        """
+        depth = getattr(self, "_resolve_depth", 0) + 1
+        if depth > _MAX_RESOLVE_DEPTH:
+            return ""
+        self._resolve_depth = depth
+        try:
+            return self._resolve_string_expr_inner(*args, **kwargs)
+        finally:
+            self._resolve_depth = depth - 1
+
+    def _resolve_string_expr_inner(
         self,
         node: dict[str, Any],
         constants: dict[str, str],
@@ -3180,7 +3234,25 @@ class EndpointDetector(BaseRule):
             if value is not None and value != "":
                 local_bindings[path] = value
 
-    def _resolve_static_value(
+    def _resolve_static_value(self, *args, **kwargs) -> Any:
+        """Depth-guarded entry into the scalar/bool resolution spine (shares the
+        _resolve_depth counter with _resolve_string_expr / _extract_object_string_values).
+
+        The scalar/bool spine (_resolve_scalar_expr <-> _resolve_bool_expr) recurses back
+        through here for Logical/Conditional/Unary operands, so a deeply left-nested
+        `a||b||c||...` (or ternary / `!!!!`) chain -- routine in obfuscated bundles -- is
+        bounded and degrades to None instead of raising RecursionError (which would abort
+        match() and wipe every endpoint for the file)."""
+        depth = getattr(self, "_resolve_depth", 0) + 1
+        if depth > _MAX_RESOLVE_DEPTH:
+            return None
+        self._resolve_depth = depth
+        try:
+            return self._resolve_static_value_inner(*args, **kwargs)
+        finally:
+            self._resolve_depth = depth - 1
+
+    def _resolve_static_value_inner(
         self,
         node: dict[str, Any],
         constants: dict[str, str],
@@ -4002,20 +4074,45 @@ class EndpointDetector(BaseRule):
         return iter(cached)
 
     def _iter_nodes_uncached(self, node: Any) -> Iterator[dict[str, Any]]:
-        """Depth-first traversal yielding every dict node (the original _iter_nodes body)."""
+        """Depth-first traversal yielding every dict node.
+
+        Iterative (explicit stack) rather than recursive so a deeply nested AST -- routine
+        in minified/obfuscated bundles -- cannot raise RecursionError and wipe the file's
+        endpoints. Yield order is identical to the original recursive pre-order DFS:
+        children are pushed reversed so they pop in source order.
+        """
         if not isinstance(node, dict):
             return
 
-        yield node
-        for value in node.values():
-            if isinstance(value, dict):
-                yield from self._iter_nodes_uncached(value)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        yield from self._iter_nodes_uncached(item)
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            yield cur
+            children: list[dict[str, Any]] = []
+            for value in cur.values():
+                if isinstance(value, dict):
+                    children.append(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            children.append(item)
+            stack.extend(reversed(children))
 
-    def _extract_object_string_values(
+    def _extract_object_string_values(self, *args, **kwargs) -> dict[str, str]:
+        """Depth-guarded entry point (shares _resolve_depth with _resolve_string_expr).
+
+        Deeply nested object literals recurse here; on budget exhaustion returns the
+        partial mapping collected so far instead of raising RecursionError."""
+        depth = getattr(self, "_resolve_depth", 0) + 1
+        if depth > _MAX_RESOLVE_DEPTH:
+            return {}
+        self._resolve_depth = depth
+        try:
+            return self._extract_object_string_values_inner(*args, **kwargs)
+        finally:
+            self._resolve_depth = depth - 1
+
+    def _extract_object_string_values_inner(
         self,
         prefix: str,
         node: dict[str, Any],

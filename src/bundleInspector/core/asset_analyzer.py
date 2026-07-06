@@ -130,9 +130,32 @@ class AssetAnalyzer:
             logger.warning("finding_enrichment_error", url=asset.url[:120], error=str(e))
         return findings
 
+    def analyze_prebuilt_ir(
+        self,
+        ir,
+        context: AnalysisContext,
+        line_mapper=None,
+        sourcemap=None,
+    ) -> list[Finding]:
+        """Run rules + annotation + line/source mapping on an ALREADY-parsed IR.
+
+        The local `analyze` command parses in a separate stage and then analyzes the
+        resulting IRs; this is the shared analysis body it delegates to, so local, serial,
+        and parallel paths all use one implementation (no drift). asset is None because
+        local files carry no network load-context. Enrichment failures degrade metadata
+        but never discard findings.
+        """
+        findings = self.rule_engine.analyze(ir, context)
+        try:
+            self._annotate_finding_metadata(None, ir, findings)
+            self._apply_mappings(findings, line_mapper, sourcemap)
+        except Exception as e:
+            logger.warning("finding_enrichment_error", url=context.file_url[:120], error=str(e))
+        return findings
+
     def _annotate_finding_metadata(
         self,
-        asset: JSAsset,
+        asset: Optional[JSAsset],
         ir,
         findings: list[Finding],
     ) -> None:
@@ -226,9 +249,9 @@ class AssetAnalyzer:
                 "enclosing_scope",
                 self._find_enclosing_scope(finding.evidence.line, function_defs),
             )
-            if asset.load_context:
+            if asset is not None and asset.load_context:
                 finding.metadata.setdefault("load_context", asset.load_context)
-            if asset.initiator:
+            if asset is not None and asset.initiator:
                 finding.metadata.setdefault("initiator", asset.initiator)
 
     def _merge_export_scopes(
