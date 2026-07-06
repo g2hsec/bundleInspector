@@ -147,9 +147,21 @@ class HeadlessCollector(BaseCollector):
     async def setup(self) -> None:
         """Initialize browser."""
         self._playwright = await async_playwright().start()
-        self._browser = await self._playwright.chromium.launch(
-            headless=True,
-        )
+        try:
+            self._browser = await self._playwright.chromium.launch(
+                headless=True,
+            )
+        except Exception:
+            # Launch failed (commonly: the browser binary isn't installed). __aenter__ raised,
+            # so __aexit__/teardown() will NOT run -- stop the driver we just started here so
+            # its subprocess + pipes close WITHIN the running loop. Otherwise they leak and
+            # Windows' Proactor loop prints "I/O operation on closed pipe" from transport
+            # __del__ at interpreter shutdown.
+            try:
+                await self._playwright.stop()
+            finally:
+                self._playwright = None
+            raise
 
     async def teardown(self) -> None:
         """Close browser."""

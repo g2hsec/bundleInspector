@@ -683,7 +683,15 @@ class Orchestrator:
                     lambda: headless_cls(self.config.crawler, self.config.auth),
                 )
             except Exception as e:
-                logger.warning("headless_error", error=str(e))
+                msg = str(e)
+                if "Executable doesn't exist" in msg or "playwright install" in msg:
+                    logger.warning(
+                        "headless_browser_not_installed",
+                        hint="run 'playwright install chromium' (see docs if behind a "
+                             "TLS-intercepting proxy), or re-run with --no-headless",
+                    )
+                else:
+                    logger.warning("headless_error", error=msg)
 
         await _run_phase(
             "manifest",

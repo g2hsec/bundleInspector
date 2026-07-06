@@ -5,6 +5,7 @@ BundleInspector CLI interface.
 from __future__ import annotations
 
 import asyncio
+import functools
 import hashlib
 import json
 import logging
@@ -234,6 +235,43 @@ def _force_utf8_console() -> None:
             pass
 
 
+def _silence_proactor_shutdown_noise() -> None:
+    """Windows only: the Proactor event loop GCs subprocess/pipe transports AFTER the loop
+    is closed (e.g. after asyncio.run() returns). Their __del__ then builds an "unclosed
+    transport" repr that calls fileno() on an already-closed pipe, printing harmless
+    'Exception ignored in ... __del__ ... I/O operation on closed pipe' / 'Event loop is
+    closed' noise -- Playwright's Node driver subprocess triggers this. Swallow ONLY those
+    two benign messages in the transport __del__s; re-raise anything else."""
+    if sys.platform != "win32":
+        return
+    try:
+        from asyncio.proactor_events import _ProactorBasePipeTransport
+        from asyncio.base_subprocess import BaseSubprocessTransport
+    except Exception:
+        return
+
+    _benign = ("Event loop is closed", "I/O operation on closed pipe")
+
+    def _wrap(cls) -> None:
+        original = getattr(cls, "__del__", None)
+        if original is None or getattr(original, "_bi_silenced", False):
+            return
+
+        @functools.wraps(original)
+        def _quiet_del(self, *args, **kwargs):
+            try:
+                original(self, *args, **kwargs)
+            except (RuntimeError, ValueError) as exc:
+                if str(exc) not in _benign:
+                    raise
+
+        _quiet_del._bi_silenced = True
+        cls.__del__ = _quiet_del
+
+    _wrap(_ProactorBasePipeTransport)
+    _wrap(BaseSubprocessTransport)
+
+
 @click.group()
 @click.version_option(version=__version__)
 def main():
@@ -243,6 +281,7 @@ def main():
     internal domains, feature flags, and debug endpoints.
     """
     _force_utf8_console()
+    _silence_proactor_shutdown_noise()
 
 
 @main.command()
