@@ -29,6 +29,7 @@ from bundleInspector.core.asset_analyzer import AssetAnalyzer
 from bundleInspector.core.dedup import DedupCache
 from bundleInspector.core.progress import PipelineStage, ProgressTracker
 from bundleInspector.core.rate_limiter import AdaptiveRateLimiter
+from bundleInspector.core.text_decode import decode_js_bytes
 from bundleInspector.core.resume_policy import (
     build_remote_resume_signature,
     build_stage_state_with_resume_signature,
@@ -765,6 +766,10 @@ class Orchestrator:
                             await self._persist_asset(result)
                 except asyncio.CancelledError:
                     raise
+                except (KeyboardInterrupt, SystemExit):
+                    # BaseException below would otherwise swallow Ctrl+C, leaving
+                    # the download loop running instead of aborting.
+                    raise
                 except BaseException as exc:
                     logger.warning("download_task_exception", error=str(exc))
                 finally:
@@ -874,7 +879,7 @@ class Orchestrator:
                     continue
                 # Beautify
                 original_hash = asset.content_hash or self.dedup.compute_hash(asset.content)
-                content = asset.content.decode("utf-8", errors="replace")
+                content = decode_js_bytes(asset.content)
                 if self._should_skip_beautify(asset.content):
                     skip_detail = self._format_normalize_detail(
                         index,
@@ -1098,7 +1103,7 @@ class Orchestrator:
             if asset.content_hash in processed and asset.content_hash in self._parse_results:
                 self.progress.update(1)
                 continue
-            content = asset.content.decode("utf-8", errors="replace")
+            content = decode_js_bytes(asset.content)
             result = self.parser.parse(content)
             await self._store_parse_result(asset, result, assets, processed)
 
@@ -1180,9 +1185,24 @@ class Orchestrator:
                 results = await asyncio.gather(*[
                     loop.run_in_executor(pool, analyze_asset_task, payload)
                     for payload in payloads
-                ])
+                ], return_exceptions=True)
+            # A worker that dies (OOM/segfault -> BrokenProcessPool) must not wipe the
+            # whole batch's findings. Re-run any failed payload serially in-process so
+            # its findings are still recovered; a genuine per-asset failure yields an
+            # empty result and is logged -- never a silent whole-batch loss + crash.
+            recovered = []
+            for payload, res in zip(payloads, results):
+                if isinstance(res, BaseException):
+                    url = payload[1].url[:120]
+                    logger.warning("parallel_worker_failed", url=url, error=str(res))
+                    try:
+                        res = analyze_asset_task(payload)
+                    except Exception as e:
+                        logger.warning("serial_fallback_failed", url=url, error=str(e))
+                        res = (payload[0], False, [f"analyze failed: {e}"], None, [])
+                recovered.append(res)
             for idx, parse_success, parse_errors, ast_hash, asset_findings in sorted(
-                results, key=lambda item: item[0]
+                recovered, key=lambda item: item[0]
             ):
                 asset = to_analyze[idx]
                 asset.parse_success = parse_success
@@ -1241,7 +1261,7 @@ class Orchestrator:
                 self.progress.update(1)
                 continue
 
-            content = asset.content.decode("utf-8", errors="replace")
+            content = decode_js_bytes(asset.content)
 
             # Build IR
             ir = self.ir_builder.build(
@@ -1334,8 +1354,18 @@ class Orchestrator:
         try:
             from bundleInspector.correlator.dormant import annotate_dormant_endpoints
 
+            # First-party origins: a *relative* declared endpoint resolves against the
+            # app's own origin, so it is only "exercised" if that path was observed on a
+            # first-party host -- not on some third-party/CDN host that happened to share
+            # the path (which would wrongly hide a real same-origin dormant endpoint).
+            primary_hosts = {
+                urlparse(u).netloc.lower()
+                for u in self._seed_urls
+                if urlparse(u).netloc
+            }
             dormant_n = annotate_dormant_endpoints(
-                findings, self._observed_requests, self.config.rules
+                findings, self._observed_requests, self.config.rules,
+                primary_hosts=primary_hosts,
             )
             if dormant_n:
                 logger.info(

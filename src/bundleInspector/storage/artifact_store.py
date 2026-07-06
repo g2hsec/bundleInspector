@@ -88,7 +88,7 @@ class ArtifactStore:
 
         file_path = self._ast_path / f"{content_hash}_{ast_hash}.json"
 
-        async with aiofiles.open(file_path, "w") as f:
+        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
             await f.write(ast_json)
 
         return ast_hash
@@ -104,7 +104,7 @@ class ArtifactStore:
         if not file_path.exists():
             return None
 
-        async with aiofiles.open(file_path, "r") as f:
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
             content = await f.read()
             return json.loads(content)
 
@@ -145,7 +145,7 @@ class ArtifactStore:
         # Don't include raw content in metadata
         data = asset.model_dump(mode="json", exclude={"content", "sourcemap_content"})
 
-        async with aiofiles.open(file_path, "w") as f:
+        async with aiofiles.open(file_path, "w", encoding="utf-8") as f:
             await f.write(json.dumps(data, indent=2))
 
     async def get_asset_meta(self, content_hash: str) -> Optional[JSAsset]:
@@ -155,7 +155,7 @@ class ArtifactStore:
         if not file_path.exists():
             return None
 
-        async with aiofiles.open(file_path, "r") as f:
+        async with aiofiles.open(file_path, "r", encoding="utf-8") as f:
             data = json.loads(await f.read())
             return JSAsset.model_validate(data)
 

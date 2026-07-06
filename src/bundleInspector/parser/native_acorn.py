@@ -68,13 +68,17 @@ def parse_source(source: str) -> Optional[dict[str, Any]]:
         with tempfile.NamedTemporaryFile(
             mode="w", suffix=".js", encoding="utf-8", newline="", delete=False
         ) as tmp:
-            tmp.write(source)
+            # Capture the name BEFORE writing: with delete=False, a failing
+            # write (e.g. disk full) would otherwise orphan the temp file
+            # because `finally` cleanup keys off tmp_path.
             tmp_path = tmp.name
+            tmp.write(source)
 
         proc = subprocess.run(
             ["node", str(_SCRIPT), tmp_path],
             capture_output=True,
             text=True,
+            encoding="utf-8",
             timeout=_TIMEOUT_SECONDS,
         )
         if proc.returncode != 0 or not proc.stdout:

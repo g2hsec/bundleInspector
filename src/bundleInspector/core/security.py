@@ -7,6 +7,7 @@ Provides protection against SSRF, path traversal, and other attacks.
 from __future__ import annotations
 
 import ipaddress
+import os
 import re
 import socket
 from pathlib import Path
@@ -266,8 +267,14 @@ def is_path_safe(
             try:
                 base_resolved = base.resolve() if not allow_symlinks else base.absolute()
 
+                # Normalize case/separators so containment holds on Windows, where
+                # paths are case-insensitive and .absolute() does not canonicalize
+                # case (e.g. "c:\proj\app.js" vs base "C:\Proj"). No-op on POSIX.
+                resolved_cmp = Path(os.path.normcase(str(resolved)))
+                base_cmp = Path(os.path.normcase(str(base_resolved)))
+
                 # Use is_relative_to (Python 3.9+)
-                if resolved.is_relative_to(base_resolved):
+                if resolved_cmp.is_relative_to(base_cmp):
                     return True, "OK"
 
             except (ValueError, OSError):

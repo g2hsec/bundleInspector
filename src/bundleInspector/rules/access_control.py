@@ -81,7 +81,13 @@ def _finding_offset(finding, line_starts: list) -> int:
 
 
 def _guard_has_offsets(guard) -> bool:
-    return guard.guarded_end_off is not None and guard.guarded_end_off >= 0
+    # Both bounds must be real. A guard with only an end offset (start == -1
+    # sentinel) would otherwise gate everything from file start (off < -1 is
+    # never true), mis-tagging endpoints that precede the guard.
+    return (
+        guard.guarded_end_off is not None and guard.guarded_end_off >= 0
+        and guard.guarded_start_off is not None and guard.guarded_start_off >= 0
+    )
 
 
 def _guard_contains_offset(guard, off: int) -> bool:

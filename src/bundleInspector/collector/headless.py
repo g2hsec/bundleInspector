@@ -151,10 +151,15 @@ class HeadlessCollector(BaseCollector):
 
     async def teardown(self) -> None:
         """Close browser."""
-        if self._browser:
-            await self._browser.close()
-        if self._playwright:
-            await self._playwright.stop()
+        try:
+            if self._browser:
+                await self._browser.close()
+        finally:
+            # Always stop the Playwright driver even if browser.close() raised
+            # (e.g. the browser already crashed) -- otherwise the driver
+            # subprocess leaks.
+            if self._playwright:
+                await self._playwright.stop()
 
     async def collect(
         self,
@@ -612,7 +617,7 @@ class HeadlessCollector(BaseCollector):
         exc = task.exception()
         if exc is not None:
             setattr(task, "_bundleInspector_progress_logged", True)
-            logger.warning("headless_progress_notification_error", error=str(exc))
+            logger.warning("headless progress notification error: %s", exc)
 
     async def _wait_for_progress_notifications(self) -> None:
         """Drain any in-flight progress callbacks before tearing state down."""
@@ -623,7 +628,7 @@ class HeadlessCollector(BaseCollector):
         for task, result in zip(tasks, results):
             if isinstance(result, Exception) and not getattr(task, "_bundleInspector_progress_logged", False):
                 setattr(task, "_bundleInspector_progress_logged", True)
-                logger.warning("headless_progress_notification_error", error=str(result))
+                logger.warning("headless progress notification error: %s", result)
 
     async def _explore_routes(
         self,

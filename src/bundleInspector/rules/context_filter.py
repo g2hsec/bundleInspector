@@ -97,8 +97,10 @@ class ContextFilter:
     NON_SECRET_VALUE_PATTERNS = [
         # CSS-like hex colors
         r"^#[0-9a-fA-F]{3,8}$",
-        # Semantic version strings
-        r"^\d+\.\d+\.\d+",
+        # Semantic version strings (anchored: unanchored "^\d+\.\d+\.\d+" also
+        # matched — and silently dropped — real secrets that merely START with
+        # digit.digit.digit, e.g. "12.34.5678deadbeefcafe").
+        r"^\d+\.\d+\.\d+(?:\.\d+)?$",
         # ISO date strings
         r"^\d{4}-\d{2}-\d{2}",
         # Email addresses (not secrets themselves)

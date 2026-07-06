@@ -316,7 +316,7 @@ class Config(BaseModel):
         """Load configuration from YAML/JSON file."""
         import json
 
-        content = path.read_text()
+        content = path.read_text(encoding="utf-8")
 
         if path.suffix in (".yaml", ".yml"):
             data = load_yaml(content)

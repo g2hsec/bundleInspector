@@ -20,6 +20,29 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
+def _copy_db_with_sidecars(db_path: Path, tmp_dir: Path) -> Path:
+    """Copy an SQLite DB plus its ``-wal`` / ``-shm`` sidecars into ``tmp_dir`` and
+    return the copied main-DB path.
+
+    Copying (instead of opening the live file) avoids Windows file-lock errors when the
+    browser is running, and copying the sidecars ensures recent WAL-resident rows are
+    visible -- on Windows the browser is usually open and the newest cookies live only
+    in the ``-wal`` file, so copying the main DB alone would silently miss them.
+    """
+    import shutil
+
+    dst = tmp_dir / db_path.name
+    shutil.copy2(db_path, dst)
+    for suffix in ("-wal", "-shm"):
+        side = db_path.with_name(db_path.name + suffix)
+        if side.exists():
+            try:
+                shutil.copy2(side, tmp_dir / side.name)
+            except OSError:
+                pass
+    return dst
+
+
 def import_cookies(source: str, domain: str = "") -> dict[str, str]:
     """
     Import cookies from various sources.
@@ -310,9 +333,16 @@ def _read_firefox_cookies(
     """Read cookies from Firefox SQLite database."""
     cookies = {}
 
+    import shutil
+    import tempfile
+
+    tmp_dir = Path(tempfile.mkdtemp(prefix="bi_ff_cookies_"))
     conn = None
     try:
-        conn = sqlite3.connect(str(db_path))
+        # Copy the DB (+ WAL sidecars) first: Firefox is often running and Windows
+        # file locking would otherwise raise "database is locked" and yield nothing.
+        db_copy = _copy_db_with_sidecars(db_path, tmp_dir)
+        conn = sqlite3.connect(str(db_copy))
         cursor = conn.cursor()
 
         if domain:
@@ -332,9 +362,12 @@ def _read_firefox_cookies(
             f"Could not read Firefox cookies: {e}. "
             f"Make sure Firefox is closed."
         )
+    except OSError as e:
+        logger.warning(f"Could not access Firefox cookie database: {e}")
     finally:
         if conn:
             conn.close()
+        shutil.rmtree(tmp_dir, ignore_errors=True)
 
     return cookies
 
@@ -353,19 +386,19 @@ def _read_chromium_cookies(
     cookies = {}
 
     try:
-        # Copy DB to avoid locking issues
+        # Copy DB (+ WAL sidecars) into a temp dir to avoid Windows lock errors and to
+        # capture recent WAL-resident cookies the running browser hasn't checkpointed.
         import shutil
         import tempfile
 
-        with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as tmp:
-            tmp_path = Path(tmp.name)
+        tmp_dir = Path(tempfile.mkdtemp(prefix="bi_cr_cookies_"))
 
         try:
-            shutil.copy2(db_path, tmp_path)
+            db_copy = _copy_db_with_sidecars(db_path, tmp_dir)
 
             conn = None
             try:
-                conn = sqlite3.connect(str(tmp_path))
+                conn = sqlite3.connect(str(db_copy))
                 cursor = conn.cursor()
 
                 # Try to read unencrypted values
@@ -394,7 +427,7 @@ def _read_chromium_cookies(
                 if conn:
                     conn.close()
         finally:
-            tmp_path.unlink(missing_ok=True)
+            shutil.rmtree(tmp_dir, ignore_errors=True)
 
     except Exception as e:
         logger.warning(f"Could not read Chromium cookies: {e}")

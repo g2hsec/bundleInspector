@@ -92,11 +92,21 @@ class RuleEngine:
         """
         findings = []
         enabled_categories = set()
+        unknown_categories = []
         for c in self.config.enabled_categories:
             try:
                 enabled_categories.add(Category(c))
             except ValueError:
-                pass
+                unknown_categories.append(c)
+        if unknown_categories and not getattr(self, "_warned_unknown_categories", False):
+            # A typo here (e.g. "secrets" vs "secret") would otherwise silently
+            # disable an entire finding category with zero signal to the user.
+            self._warned_unknown_categories = True
+            logger.warning(
+                "unknown_enabled_categories",
+                unknown=unknown_categories,
+                valid=[c.value for c in Category],
+            )
 
         for rule in self.rules:
             # Skip disabled rules
@@ -107,9 +117,29 @@ class RuleEngine:
             if rule.category not in enabled_categories:
                 continue
 
+            # Obtain the result iterator. A failure constructing it (or a
+            # generator raising mid-iteration) is contained to THIS rule.
             try:
-                for result in rule.match(ir, context):
-                    # Filter by confidence
+                matcher = iter(rule.match(ir, context))
+            except Exception as e:
+                logger.warning("rule_error", rule_id=rule.id, error=str(e))
+                continue
+
+            while True:
+                try:
+                    result = next(matcher)
+                except StopIteration:
+                    break
+                except Exception as e:
+                    # A generator can't be resumed after it raises, so stop this
+                    # rule -- but results already collected are preserved.
+                    logger.warning("rule_error", rule_id=rule.id, error=str(e))
+                    break
+
+                # A single malformed result must not discard the rule's other
+                # findings. Previously one bad AST node zeroed the whole
+                # detector for the file (silent detection drop).
+                try:
                     if not self._meets_confidence_threshold(result):
                         continue
 
@@ -123,13 +153,9 @@ class RuleEngine:
                         finding.mask_value(self.config.secret_visible_chars)
 
                     findings.append(finding)
-
-            except Exception as e:
-                logger.warning(
-                    "rule_error",
-                    rule_id=rule.id,
-                    error=str(e),
-                )
+                except Exception as e:
+                    logger.warning("rule_result_error", rule_id=rule.id, error=str(e))
+                    continue
 
         # Apply context-based false positive filtering
         if self._context_filter:

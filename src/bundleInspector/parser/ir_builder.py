@@ -487,9 +487,25 @@ class IRBuilder:
         best = self._enclosing_func(line)
         return best.end_line if best else line + 100
 
-    def _enclosing_func_end_offset(self, line: int) -> int:
-        best = self._enclosing_func(line)
-        return best.end_offset if best and best.end_offset >= 0 else -1
+    def _enclosing_func_end_offset(self, off: int) -> int:
+        """End offset of the smallest function whose [start_offset, end_offset)
+        contains char offset `off`. Offset-based (not line-based) so it works on
+        minified single-line bundles, where every function shares line 1 and the
+        line-based enclosing lookup collapses to "size 0" and picks the wrong
+        function. Returns -1 if none contains `off` or offsets are unavailable."""
+        if off < 0:
+            return -1
+        best_end = -1
+        best_span = None
+        for fd in self._current_ir.function_defs:
+            if fd.start_offset < 0 or fd.end_offset < 0:
+                continue
+            if fd.start_offset <= off < fd.end_offset:
+                span = fd.end_offset - fd.start_offset
+                if best_span is None or span < best_span:
+                    best_span = span
+                    best_end = fd.end_offset
+        return best_end
 
     def _member_path(self, node):
         parts = []
@@ -608,8 +624,8 @@ class IRBuilder:
                                    self._node_offset_range(consequent), t_off)
             if self._consequent_is_exit(consequent) and self._is_negative_test(test):
                 if_start, if_end = self._node_line_range(node)
-                _, if_off_end = self._node_offset_range(node)
-                func_off_end = self._enclosing_func_end_offset(if_start)
+                if_off_start, if_off_end = self._node_offset_range(node)
+                func_off_end = self._enclosing_func_end_offset(if_off_start)
                 operand = test.get("argument") if test.get("type") == "UnaryExpression" else test
                 neg_tokens = self._collect_test_tokens(operand) or tokens
                 self._record_guard(neg_tokens, if_end + 1, self._enclosing_func_end(if_start),
@@ -647,12 +663,13 @@ class IRBuilder:
         loc = node.get("loc", {})
         start = loc.get("start", {})
         end = loc.get("end", {})
-        _, end_offset = self._node_offset_range(node)
+        start_offset, end_offset = self._node_offset_range(node)
         self._current_ir.function_defs.append(FunctionDef(
             name=func_name,
             scope=f"function:{func_name}",
             line=start.get("line", 0),
             end_line=end.get("line", start.get("line", 0)),
+            start_offset=start_offset,
             end_offset=end_offset,
         ))
 

@@ -79,14 +79,21 @@ def _split(value: str) -> tuple[str, str]:
     return host, norm
 
 
-def build_observed_index(observed) -> dict:
+def build_observed_index(observed, primary_hosts=None) -> dict:
     """
     Build a lookup index from raw observations.
 
     ``observed`` is an iterable of either ``url`` strings or ``(method, url)`` tuples
     (method is recorded but path-level matching is used -- a path the app fetched is not
     hidden regardless of verb).
+
+    ``primary_hosts`` (optional) is the set of first-party origin hosts. When given, only
+    requests to those hosts (or host-less/relative observations) contribute to the
+    host-agnostic ``rel_paths`` set, so a relative declared endpoint is not falsely marked
+    exercised just because an unrelated third-party host hit the same path. When omitted,
+    every observed path contributes (backward-compatible, host-agnostic).
     """
+    primary = {h.lower() for h in primary_hosts} if primary_hosts else None
     hosts: set[str] = set()
     rel_paths: set[str] = set()
     host_paths: set[tuple[str, str]] = set()
@@ -98,9 +105,10 @@ def build_observed_index(observed) -> dict:
         if host:
             hosts.add(host)
             host_paths.add((host, path))
-        # Every observed request also contributes a host-agnostic path (same-origin relative
-        # declarations resolve against whatever host actually served them).
-        rel_paths.add(path)
+        # A relative declaration resolves against the app's own origin, so only credit
+        # the host-agnostic path when the request was first-party (or host-less).
+        if primary is None or not host or host in primary:
+            rel_paths.add(path)
     return {"hosts": hosts, "rel_paths": rel_paths, "host_paths": host_paths}
 
 
@@ -120,17 +128,18 @@ def _is_exercised(host: str, path: str, index: dict) -> tuple[bool, bool]:
     return ((host, path) in index["host_paths"], True)
 
 
-def annotate_dormant_endpoints(findings, observed, config=None) -> int:
+def annotate_dormant_endpoints(findings, observed, config=None, primary_hosts=None) -> int:
     """
     Tag endpoint findings that were declared in JS but never called during the crawl.
 
     Returns the number of findings newly tagged as dormant. No-op (returns 0) when the
-    feature is disabled or there is no observation baseline.
+    feature is disabled or there is no observation baseline. ``primary_hosts`` (the app's
+    first-party origins) scopes relative-path matching -- see ``build_observed_index``.
     """
     enabled = getattr(config, "dormant_endpoint_detection_enabled", True) if config is not None else True
     if not enabled or not findings:
         return 0
-    index = build_observed_index(observed)
+    index = build_observed_index(observed, primary_hosts=primary_hosts)
     if not index["rel_paths"] and not index["host_paths"]:
         return 0  # no crawl baseline -> cannot distinguish hidden from un-crawled
 

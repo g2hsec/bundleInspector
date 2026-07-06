@@ -376,6 +376,7 @@ class FunctionDef(BaseModel):
     scope: str = ""
     line: int = 0
     end_line: int = 0
+    start_offset: int = -1     # absolute char offset of the function's start (for enh1 early-return guards)
     end_offset: int = -1       # absolute char offset of the function's end (for enh1 early-return guards)
 
 

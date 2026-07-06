@@ -34,6 +34,7 @@ from bundleInspector.config import (
 )
 from bundleInspector.core.orchestrator import BundleInspector
 from bundleInspector.core.progress import PipelineStage
+from bundleInspector.core.text_decode import decode_js_bytes
 from bundleInspector.core.resume_policy import (
     build_local_resume_signature,
     build_stage_state_with_resume_signature,
@@ -188,6 +189,21 @@ def _print_runtime_context(
     console.print()
 
 
+def _force_utf8_console() -> None:
+    """Make stdout/stderr use UTF-8 so non-ASCII findings/logs never crash on a
+    legacy console codec (e.g. cp949 on Korean Windows). Without this the tool
+    would depend on the user exporting PYTHONIOENCODING. Safe no-op when a stream
+    doesn't support reconfiguration."""
+    for stream in (sys.stdout, sys.stderr):
+        reconfigure = getattr(stream, "reconfigure", None)
+        if reconfigure is None:
+            continue
+        try:
+            reconfigure(encoding="utf-8", errors="replace")
+        except (ValueError, OSError):
+            pass
+
+
 @click.group()
 @click.version_option(version=__version__)
 def main():
@@ -196,7 +212,7 @@ def main():
     Analyze JavaScript files to find hidden APIs, secrets,
     internal domains, feature flags, and debug endpoints.
     """
-    pass
+    _force_utf8_console()
 
 
 @main.command()
@@ -1983,7 +1999,7 @@ async def _run_local_analysis(
                 try:
                     if analysis_config.parser.beautify:
                         original_hash = asset.content_hash or hashlib.sha256(asset.content).hexdigest()
-                        content_str = asset.content.decode('utf-8', errors='replace')
+                        content_str = decode_js_bytes(asset.content)
                         if (
                             analysis_config.parser.beautify_max_bytes > 0
                             and len(asset.content) > analysis_config.parser.beautify_max_bytes
@@ -2035,7 +2051,7 @@ async def _run_local_analysis(
                     _update(25 + (i + 1) / len(assets) * 20, "Parse", f"{i + 1}/{len(assets)} assets")
                     continue
                 try:
-                    content_str = asset.content.decode('utf-8', errors='replace')
+                    content_str = decode_js_bytes(asset.content)
                     parse_result = parser.parse(content_str)
                     if parse_result.success and parse_result.ast:
                         ir = ir_builder.build(parse_result.ast, asset.url, asset.content_hash)
@@ -2067,7 +2083,7 @@ async def _run_local_analysis(
 
         content_map = {}
         for asset in assets:
-            content_map[asset.url] = asset.content.decode('utf-8', errors='replace')
+            content_map[asset.url] = decode_js_bytes(asset.content)
 
         if checkpoint and _local_stage_at_least(checkpoint.stage, "analyze"):
             findings = checkpoint.findings
@@ -2079,6 +2095,7 @@ async def _run_local_analysis(
                 if ir.file_hash in analyzed_hashes:
                     _update(45 + (i + 1) / max(len(ir_list), 1) * 40, "Analyze", f"{i + 1}/{max(len(ir_list), 1)} assets")
                     continue
+                file_findings = []
                 try:
                     source_content = content_map.get(ir.file_url, "")
                     context = AnalysisContext(
@@ -2088,6 +2105,15 @@ async def _run_local_analysis(
                         is_first_party=True,
                     )
                     file_findings = engine.analyze(ir, context)
+                except Exception as e:
+                    if verbose and not quiet:
+                        console.print(f"[yellow]Analysis error: {e}[/yellow]")
+                    else:
+                        logger.warning("analysis_error", error=str(e))
+                # Secure findings BEFORE enrichment: a failure annotating or
+                # line-mapping must never discard already-extracted findings.
+                findings.extend(file_findings)
+                try:
                     _annotate_finding_metadata(ir, file_findings)
                     line_mapper = line_mappers.get(ir.file_hash)
                     if line_mapper:
@@ -2099,12 +2125,8 @@ async def _run_local_analysis(
                                 )
                                 finding.evidence.original_line = original_line
                                 finding.evidence.original_column = original_column
-                    findings.extend(file_findings)
                 except Exception as e:
-                    if verbose and not quiet:
-                        console.print(f"[yellow]Analysis error: {e}[/yellow]")
-                    else:
-                        logger.warning("analysis_error", error=str(e))
+                    logger.warning("finding_enrichment_error", url=ir.file_url[:100], error=str(e))
                 analyzed_hashes.add(ir.file_hash)
                 await _store_local_checkpoint(
                     "parse",

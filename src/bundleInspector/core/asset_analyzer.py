@@ -14,6 +14,9 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+import structlog
+
+from bundleInspector.core.text_decode import decode_js_bytes
 from bundleInspector.normalizer.sourcemap import SourceMapResolver
 from bundleInspector.parser.export_scopes import (
     build_commonjs_default_object_export_members,
@@ -28,6 +31,8 @@ from bundleInspector.parser.export_scopes import (
 )
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.storage.models import Finding, JSAsset
+
+logger = structlog.get_logger(__name__)
 
 
 class AssetAnalyzer:
@@ -98,7 +103,7 @@ class AssetAnalyzer:
         exact serial engine + annotation logic, so findings are byte-identical. Sets
         asset.parse_success / parse_errors / ast_hash (read back by the caller).
         """
-        content = asset.content.decode("utf-8", errors="replace")
+        content = decode_js_bytes(asset.content)
         result = self.parser.parse(content)
         asset.parse_success = result.success
         asset.parse_errors = result.errors
@@ -115,8 +120,14 @@ class AssetAnalyzer:
             is_first_party=asset.is_first_party,
         )
         findings = self.rule_engine.analyze(ir, context)
-        self._annotate_finding_metadata(asset, ir, findings)
-        self._apply_mappings(findings, line_mapper, sourcemap)
+        # Secure findings BEFORE enrichment: a failure annotating metadata or
+        # applying line maps must degrade metadata, never discard the findings
+        # already extracted for this asset (previously it dropped all of them).
+        try:
+            self._annotate_finding_metadata(asset, ir, findings)
+            self._apply_mappings(findings, line_mapper, sourcemap)
+        except Exception as e:
+            logger.warning("finding_enrichment_error", url=asset.url[:120], error=str(e))
         return findings
 
     def _annotate_finding_metadata(
