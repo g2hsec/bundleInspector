@@ -56,6 +56,11 @@ class ScopeConfig(BaseModel):
     # Third-party handling
     third_party_policy: ThirdPartyPolicy = ThirdPartyPolicy.TAG_ONLY
 
+    # SSRF opt-in: allow scanning targets that resolve to private/internal IP ranges
+    # (RFC1918/CGNAT/ULA) for AUTHORIZED internal/dev-server testing. Default off keeps full
+    # SSRF protection. Loopback / cloud-metadata / multicast / reserved stay blocked regardless.
+    allow_private_ips: bool = False
+
     # CDN patterns (common JS CDNs)
     cdn_patterns: list[str] = Field(default_factory=lambda: [
         "cdn.jsdelivr.net", "*.cdn.jsdelivr.net",

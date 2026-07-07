@@ -624,7 +624,9 @@ class Orchestrator:
             if isinstance(phase_name, str) and isinstance(state, dict)
         }
 
-        is_safe, reason = await asyncio.to_thread(is_url_safe, url, True)
+        is_safe, reason = await asyncio.to_thread(
+            is_url_safe, url, True, self.config.scope.allow_private_ips
+        )
         if not is_safe:
             logger.warning("seed_url_blocked", url=url[:100], reason=reason)
             return refs
@@ -821,7 +823,9 @@ class Orchestrator:
         """Download a single JS file with SSRF protection."""
         # SSRF Protection: Validate URL before making request
         # Run in thread to avoid blocking event loop with DNS resolution
-        is_safe, reason = await asyncio.to_thread(is_url_safe, ref.url, True)
+        is_safe, reason = await asyncio.to_thread(
+            is_url_safe, ref.url, True, self.config.scope.allow_private_ips
+        )
         if not is_safe:
             logger.warning(
                 "ssrf_blocked",

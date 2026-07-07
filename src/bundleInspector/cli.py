@@ -411,6 +411,13 @@ def main():
     type=click.Choice(["info", "low", "medium", "high", "critical"], case_sensitive=False),
     help="Exit with code 2 if any finding is at or above this severity (CI gate)",
 )
+@click.option(
+    "--allow-private-ips",
+    is_flag=True,
+    default=False,
+    help="Allow scanning targets that resolve to private/internal IPs (RFC1918/CGNAT/ULA) "
+         "for AUTHORIZED internal testing. Loopback/cloud-metadata stay blocked. Default: off.",
+)
 def scan(
     ctx: click.Context,
     urls: tuple[str],
@@ -439,6 +446,7 @@ def scan(
     job_id: Optional[str],
     rules_file: Optional[str],
     fail_on: Optional[str],
+    allow_private_ips: bool,
 ):
     """Scan URLs for JavaScript security findings.
 
@@ -483,6 +491,7 @@ def scan(
         resume=resume,
         job_id=job_id,
         rules_file=rules_file,
+        allow_private_ips=allow_private_ips,
     )
 
     quiet = config.quiet
@@ -726,6 +735,7 @@ def _build_config(
     resume: bool = False,
     job_id: Optional[str] = None,
     rules_file: Optional[str] = None,
+    allow_private_ips: bool = False,
 ) -> Config:
     """Build configuration from CLI options."""
     config = base_config.model_copy(deep=True) if base_config else Config()
@@ -770,6 +780,8 @@ def _build_config(
 
     if _param_supplied(ctx, "scope"):
         config.scope.allowed_domains = list(scope_domains)
+    if allow_private_ips:  # opt-in flag; only ever turns the allowance ON
+        config.scope.allow_private_ips = True
     if _param_supplied(ctx, "cookie") or extra_cookies:
         config.auth.cookies = cookie_dict
     if _param_supplied(ctx, "header") or extra_headers:

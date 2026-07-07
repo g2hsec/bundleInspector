@@ -62,6 +62,18 @@ BLOCKED_NETWORKS = [
     ipaddress.ip_network('ff00::/8'),         # Multicast
 ]
 
+# Subset of BLOCKED_NETWORKS that are ordinary private/internal ranges (RFC1918, CGNAT,
+# IPv6 ULA). These -- and ONLY these -- are permitted when allow_private_ips is set (for
+# authorized internal/dev-server scanning). Loopback, link-local (incl. cloud metadata
+# 169.254.169.254), multicast, reserved, and TEST-NET ranges stay blocked regardless.
+PRIVATE_NETWORKS = frozenset({
+    ipaddress.ip_network('10.0.0.0/8'),       # Private A
+    ipaddress.ip_network('172.16.0.0/12'),    # Private B
+    ipaddress.ip_network('192.168.0.0/16'),   # Private C
+    ipaddress.ip_network('100.64.0.0/10'),    # Carrier-grade NAT
+    ipaddress.ip_network('fc00::/7'),         # IPv6 unique-local
+})
+
 # Dangerous URL schemes
 BLOCKED_SCHEMES = frozenset({
     'javascript', 'data', 'vbscript', 'file',
@@ -72,12 +84,14 @@ BLOCKED_SCHEMES = frozenset({
 ALLOWED_SCHEMES = frozenset({'http', 'https'})
 
 
-def is_ip_blocked(ip_str: str) -> bool:
+def is_ip_blocked(ip_str: str, allow_private_ips: bool = False) -> bool:
     """
     Check if an IP address is in a blocked network.
 
     Args:
         ip_str: IP address string
+        allow_private_ips: If True, permit RFC1918/CGNAT/ULA private ranges (for authorized
+            internal scanning); loopback / link-local (metadata) / multicast / reserved stay blocked.
 
     Returns:
         True if blocked, False if allowed
@@ -88,18 +102,24 @@ def is_ip_blocked(ip_str: str) -> bool:
             ip = ip.ipv4_mapped
         for network in BLOCKED_NETWORKS:
             if ip in network:
+                # Networks are disjoint, so a private-range match cannot also be a
+                # loopback/metadata match -- skipping it here safely allows only private IPs.
+                if allow_private_ips and network in PRIVATE_NETWORKS:
+                    continue
                 return True
         return False
     except ValueError:
         return False
 
 
-def is_host_blocked(hostname: str) -> bool:
+def is_host_blocked(hostname: str, allow_private_ips: bool = False) -> bool:
     """
     Check if a hostname is blocked.
 
     Args:
         hostname: Hostname to check
+        allow_private_ips: If True, permit a direct private-range IP literal. The BLOCKED_HOSTS
+            name list (localhost, cloud-metadata hostnames, ...) stays blocked regardless.
 
     Returns:
         True if blocked, False if allowed
@@ -109,18 +129,18 @@ def is_host_blocked(hostname: str) -> bool:
 
     hostname_lower = hostname.lower().strip('.')
 
-    # Check exact match
+    # Check exact match -- localhost / metadata hostnames stay blocked even with allow_private_ips.
     if hostname_lower in BLOCKED_HOSTS:
         return True
 
     # Check if it's a direct IP address
-    if is_ip_blocked(hostname):
+    if is_ip_blocked(hostname, allow_private_ips):
         return True
 
     return False
 
 
-def resolve_and_validate_host(hostname: str) -> bool:
+def resolve_and_validate_host(hostname: str, allow_private_ips: bool = False) -> bool:
     """
     Resolve hostname and validate the resulting IP is safe.
 
@@ -132,13 +152,13 @@ def resolve_and_validate_host(hostname: str) -> bool:
     Returns:
         True if safe, False if blocked
     """
-    if is_host_blocked(hostname):
+    if is_host_blocked(hostname, allow_private_ips):
         return False
 
     try:
         # Try to parse as IP first
         ip = ipaddress.ip_address(hostname)
-        return not is_ip_blocked(str(ip))
+        return not is_ip_blocked(str(ip), allow_private_ips)
     except ValueError:
         pass
 
@@ -155,7 +175,7 @@ def resolve_and_validate_host(hostname: str) -> bool:
 
         for family, socktype, proto, canonname, sockaddr in results:
             ip_str = sockaddr[0]
-            if is_ip_blocked(ip_str):
+            if is_ip_blocked(ip_str, allow_private_ips):
                 logger.warning(
                     "ssrf_blocked_resolved_ip",
                     hostname=hostname,
@@ -170,13 +190,20 @@ def resolve_and_validate_host(hostname: str) -> bool:
         return False
 
 
-def is_url_safe(url: str, resolve_dns: bool = True) -> tuple[bool, str]:
+def is_url_safe(
+    url: str,
+    resolve_dns: bool = True,
+    allow_private_ips: bool = False,
+) -> tuple[bool, str]:
     """
     Check if a URL is safe to request (SSRF protection).
 
     Args:
         url: URL to validate
         resolve_dns: Whether to resolve and validate DNS
+        allow_private_ips: Opt-in for authorized internal scanning -- permit RFC1918/CGNAT/ULA
+            private ranges while keeping loopback / link-local (cloud metadata) / multicast /
+            reserved and the blocked-hostname list (localhost, ...) blocked.
 
     Returns:
         Tuple of (is_safe, reason)
@@ -202,12 +229,12 @@ def is_url_safe(url: str, resolve_dns: bool = True) -> tuple[bool, str]:
     if not hostname:
         return False, "No hostname in URL"
 
-    if is_host_blocked(hostname):
+    if is_host_blocked(hostname, allow_private_ips):
         return False, f"Blocked host: {hostname}"
 
     # Optionally resolve and validate DNS
     if resolve_dns:
-        if not resolve_and_validate_host(hostname):
+        if not resolve_and_validate_host(hostname, allow_private_ips):
             return False, f"Resolved IP is blocked for: {hostname}"
 
     return True, "OK"
