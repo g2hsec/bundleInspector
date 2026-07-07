@@ -320,7 +320,9 @@ class Config(BaseModel):
         """Load configuration from YAML/JSON file."""
         import json
 
-        content = path.read_text(encoding="utf-8")
+        # utf-8-sig tolerates a UTF-8 BOM (common from Windows editors) which plain utf-8
+        # would leave in place and crash json.loads / the YAML loader.
+        content = path.read_text(encoding="utf-8-sig")
 
         if path.suffix in (".yaml", ".yml"):
             data = load_yaml(content)

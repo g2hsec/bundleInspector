@@ -2418,7 +2418,10 @@ def _normalize_category_value(value: Any) -> Category:
 
 def _load_rule_data(path: Path) -> Any:
     """Load raw custom rule data from disk."""
-    content = path.read_text(encoding="utf-8")
+    # utf-8-sig tolerates a UTF-8 BOM (Windows editors / PowerShell Out-File add one),
+    # which plain utf-8 would leave in place and break json.loads/YAML -> the engine would
+    # then silently drop every custom rule.
+    content = path.read_text(encoding="utf-8-sig")
     if path.suffix.lower() in {".yaml", ".yml"}:
         return load_yaml(content)
 
@@ -2768,7 +2771,28 @@ def _build_constant_table(
     return constants
 
 
-def _resolve_string_expr(
+# Shared recursion budget for the custom-rule string/object resolve spine. Real expressions
+# nest only a few deep; a pathological/obfuscated bundle could otherwise blow the recursion
+# limit, which the engine would catch and use to drop this custom rule's matches for the file.
+_MAX_CUSTOM_RESOLVE_DEPTH = 250
+_custom_resolve_state = {"depth": 0}
+
+
+def _resolve_string_expr(*args, **kwargs) -> Optional[str]:
+    """Depth-guarded entry (shares the module resolve budget with
+    _extract_object_string_values). Degrades to None on pathologically deep nesting instead
+    of raising RecursionError."""
+    depth = _custom_resolve_state["depth"] + 1
+    if depth > _MAX_CUSTOM_RESOLVE_DEPTH:
+        return None
+    _custom_resolve_state["depth"] = depth
+    try:
+        return _resolve_string_expr_impl(*args, **kwargs)
+    finally:
+        _custom_resolve_state["depth"] = depth - 1
+
+
+def _resolve_string_expr_impl(
     node: Any,
     constants: dict[str, str],
     function_returns: Optional[dict[str, dict[str, Any]]] = None,
@@ -2895,7 +2919,20 @@ def _resolve_object_expression_path(
     ).get(path)
 
 
-def _extract_object_string_values(
+def _extract_object_string_values(*args, **kwargs) -> dict[str, str]:
+    """Depth-guarded entry (shares the module resolve budget with _resolve_string_expr).
+    Returns the partial mapping instead of raising RecursionError on deep object nesting."""
+    depth = _custom_resolve_state["depth"] + 1
+    if depth > _MAX_CUSTOM_RESOLVE_DEPTH:
+        return {}
+    _custom_resolve_state["depth"] = depth
+    try:
+        return _extract_object_string_values_impl(*args, **kwargs)
+    finally:
+        _custom_resolve_state["depth"] = depth - 1
+
+
+def _extract_object_string_values_impl(
     prefix: str,
     node: dict[str, Any],
     constants: dict[str, str],
@@ -4515,34 +4552,46 @@ def _build_property_path_map(
 
 
 def _iter_nodes(node: Any) -> Iterator[dict[str, Any]]:
-    """Yield all AST nodes depth-first."""
+    """Yield all AST nodes depth-first (iterative pre-order; RecursionError-safe on a deeply
+    nested AST, byte-identical order to the old recursive version)."""
     if not isinstance(node, dict):
         return
-    yield node
-    for value in node.values():
-        if isinstance(value, dict):
-            yield from _iter_nodes(value)
-        elif isinstance(value, list):
-            for item in value:
-                if isinstance(item, dict):
-                    yield from _iter_nodes(item)
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        yield cur
+        children: list[dict[str, Any]] = []
+        for value in cur.values():
+            if isinstance(value, dict):
+                children.append(value)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        children.append(item)
+        stack.extend(reversed(children))
 
 
 def _iter_nodes_with_path(
     node: Any,
     path: str,
 ) -> Iterator[tuple[dict[str, Any], str]]:
-    """Yield AST nodes depth-first along with a stable path string."""
+    """Yield AST nodes depth-first with a stable path string (iterative pre-order;
+    RecursionError-safe, byte-identical order to the old recursive version)."""
     if not isinstance(node, dict):
         return
-    yield node, path
-    for key, value in node.items():
-        if isinstance(value, dict):
-            yield from _iter_nodes_with_path(value, f"{path}.{key}")
-        elif isinstance(value, list):
-            for index, item in enumerate(value):
-                if isinstance(item, dict):
-                    yield from _iter_nodes_with_path(item, f"{path}.{key}[{index}]")
+    stack = [(node, path)]
+    while stack:
+        cur, cur_path = stack.pop()
+        yield cur, cur_path
+        children: list[tuple[dict[str, Any], str]] = []
+        for key, value in cur.items():
+            if isinstance(value, dict):
+                children.append((value, f"{cur_path}.{key}"))
+            elif isinstance(value, list):
+                for index, item in enumerate(value):
+                    if isinstance(item, dict):
+                        children.append((item, f"{cur_path}.{key}[{index}]"))
+        stack.extend(reversed(children))
 
 
 def _get_node_position(node: dict[str, Any]) -> tuple[int, int]:

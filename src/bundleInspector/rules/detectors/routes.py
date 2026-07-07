@@ -39,16 +39,25 @@ class RouteDetector(BaseRule):
 
     # ---- AST helpers (self-contained copies) ----
     def _iter_nodes(self, node: Any) -> Iterator[dict]:
+        # Iterative pre-order DFS (children pushed reversed so they pop in source order),
+        # byte-identical to the old recursive version but immune to RecursionError on a
+        # deeply nested AST -- otherwise RouteDetector.match would yield ZERO routes for that
+        # file, dropping unlinked admin/internal pages it exists to surface.
         if not isinstance(node, dict):
             return
-        yield node
-        for value in node.values():
-            if isinstance(value, dict):
-                yield from self._iter_nodes(value)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        yield from self._iter_nodes(item)
+        stack = [node]
+        while stack:
+            cur = stack.pop()
+            yield cur
+            children: list[dict] = []
+            for value in cur.values():
+                if isinstance(value, dict):
+                    children.append(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            children.append(item)
+            stack.extend(reversed(children))
 
     def _extract_property_name(self, key) -> str:
         if not isinstance(key, dict):

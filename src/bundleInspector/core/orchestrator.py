@@ -739,7 +739,9 @@ class Orchestrator:
 
         try:
             # Semaphore to limit concurrent downloads (prevents task flooding)
-            download_semaphore = asyncio.Semaphore(self.config.crawler.max_concurrent)
+            # max(1, ...): max_concurrent=0 would make Semaphore(0) block every download
+            # forever (silent whole-scan hang, zero findings).
+            download_semaphore = asyncio.Semaphore(max(1, self.config.crawler.max_concurrent))
 
             async def download_one(ref: JSReference) -> tuple[JSReference, Optional[JSAsset]]:
                 # Acquire semaphore slot to limit concurrency
@@ -1172,7 +1174,10 @@ class Orchestrator:
 
         workers = _parallel_workers()
         to_analyze = [a for a in assets if a.content_hash not in processed]
-        if workers > 1 and len(to_analyze) > 1:
+        # >= 1 (not > 1): in parallel mode _stage_parse deferred parsing, so a lone asset
+        # would fall into the serial loop below and be skipped (parse_success is False,
+        # _parse_results empty) -- silently dropping all of its findings.
+        if workers > 1 and len(to_analyze) >= 1:
             # Fused parallel parse+analyze: each worker parses its asset and runs the full
             # per-asset pipeline, returning only the small findings list (the AST stays inside
             # the worker). Results are reassembled in asset order, so the aggregate findings
@@ -1277,26 +1282,35 @@ class Orchestrator:
 
             content = decode_js_bytes(asset.content)
 
-            # Build IR
-            ir = self.ir_builder.build(
-                parse_result.ast,
-                asset.url,
-                asset.content_hash,
-            )
-
-            # Create analysis context
-            context = AnalysisContext(
-                file_url=asset.url,
-                file_hash=asset.content_hash,
-                source_content=content,
-                is_first_party=asset.is_first_party,
-            )
-
-            # Run rules
-            asset_findings = self.rule_engine.analyze(ir, context)
-            self._annotate_finding_metadata(asset, ir, asset_findings)
-            self._apply_artifact_mappings(asset, asset_findings)
+            asset_findings: list[Finding] = []
+            ir = None
+            try:
+                # Build IR + run rules. A failure here (e.g. a RecursionError from a deep
+                # AST) must not abort the whole scan -- other assets' findings must survive.
+                ir = self.ir_builder.build(
+                    parse_result.ast,
+                    asset.url,
+                    asset.content_hash,
+                )
+                context = AnalysisContext(
+                    file_url=asset.url,
+                    file_hash=asset.content_hash,
+                    source_content=content,
+                    is_first_party=asset.is_first_party,
+                )
+                asset_findings = self.rule_engine.analyze(ir, context)
+            except Exception as e:
+                logger.warning("asset_analyze_error", url=asset.url[:120], error=str(e))
+            # Secure findings BEFORE enrichment (matches the parallel/local paths): an
+            # annotate/line-map failure must degrade metadata, never discard the findings
+            # already produced for this asset.
             findings.extend(asset_findings)
+            if ir is not None and asset_findings:
+                try:
+                    self._annotate_finding_metadata(asset, ir, asset_findings)
+                    self._apply_artifact_mappings(asset, asset_findings)
+                except Exception as e:
+                    logger.warning("finding_enrichment_error", url=asset.url[:120], error=str(e))
 
             processed.add(asset.content_hash)
             await self._store_checkpoint(

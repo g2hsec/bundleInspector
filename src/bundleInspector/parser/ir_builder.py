@@ -30,6 +30,10 @@ class IRBuilder:
 
     MAX_UNIQUE_IDENTIFIERS = 10_000
     MAX_OCCURRENCES_PER_IDENTIFIER = 100
+    # Bound AST traversal depth so a pathologically deep (obfuscated) AST degrades to a
+    # partial IR instead of raising RecursionError -- which would otherwise drop the whole
+    # asset's findings. Far above any real AST depth, safely below the interpreter limit.
+    MAX_VISIT_DEPTH = 300
 
     def __init__(self):
         self._current_ir: Optional[IntermediateRepresentation] = None
@@ -76,29 +80,39 @@ class IRBuilder:
         if not isinstance(node, dict):
             return
 
-        node_type = node.get("type", "")
+        # Instance-counter depth guard (holds across handler-mediated recursion too): a
+        # pathologically deep AST degrades to a partial IR rather than raising RecursionError
+        # and dropping the whole asset's findings.
+        depth = getattr(self, "_visit_depth", 0) + 1
+        if depth > self.MAX_VISIT_DEPTH:
+            return
+        self._visit_depth = depth
+        try:
+            node_type = node.get("type", "")
 
-        # Dispatch to specific handlers
-        # Handlers may return a set of child keys they already visited
-        # to prevent the generic loop from double-visiting them.
-        handled_keys: set[str] = set()
-        handler = getattr(self, f"_visit_{node_type}", None)
-        if handler:
-            result = handler(node)
-            if isinstance(result, set):
-                handled_keys = result
+            # Dispatch to specific handlers
+            # Handlers may return a set of child keys they already visited
+            # to prevent the generic loop from double-visiting them.
+            handled_keys: set[str] = set()
+            handler = getattr(self, f"_visit_{node_type}", None)
+            if handler:
+                result = handler(node)
+                if isinstance(result, set):
+                    handled_keys = result
 
-        # Visit children (skip keys already handled by the specific visitor)
-        for key, value in node.items():
-            if key in ("loc", "range", "raw") or key in handled_keys:
-                continue
+            # Visit children (skip keys already handled by the specific visitor)
+            for key, value in node.items():
+                if key in ("loc", "range", "raw") or key in handled_keys:
+                    continue
 
-            if isinstance(value, dict):
-                self._visit(value)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        self._visit(item)
+                if isinstance(value, dict):
+                    self._visit(value)
+                elif isinstance(value, list):
+                    for item in value:
+                        if isinstance(item, dict):
+                            self._visit(item)
+        finally:
+            self._visit_depth = depth - 1
 
     def _visit_Literal(self, node: dict) -> None:
         """Handle literal values."""

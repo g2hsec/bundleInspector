@@ -1512,7 +1512,12 @@ async def _run_local_analysis(
                         ir = ir_builder.build(parse_result.ast, asset.url, asset.content_hash)
                         ir_list.append(ir)
                         asset.parse_success = True
-                        asset.ast_hash = hashlib.sha256(str(parse_result.ast).encode()).hexdigest()[:16]
+                        # Must match ArtifactStore.store_ast's key (canonical json.dumps),
+                        # otherwise get_ast() on --resume never finds the file and every
+                        # restored IR is dropped -> resumed report has 0 findings.
+                        asset.ast_hash = hashlib.sha256(
+                            json.dumps(parse_result.ast, separators=(",", ":"), sort_keys=True).encode()
+                        ).hexdigest()[:16]
                         await _store_ast(asset, parse_result.ast)
                         await _store_asset(asset)
                     else:
@@ -1713,7 +1718,7 @@ def version():
 
 def _load_report_for_convert(report_file: str):
     """Load a report from JSON or from BundleInspector-generated HTML."""
-    content = Path(report_file).read_text(encoding="utf-8")
+    content = Path(report_file).read_text(encoding="utf-8-sig")  # tolerate a BOM
     return _parse_report_content_for_convert(content)
 
 
@@ -1757,7 +1762,7 @@ def _load_headers_file(path: str) -> dict[str, str]:
     """
     import json as _json
 
-    content = Path(path).read_text(encoding="utf-8")
+    content = Path(path).read_text(encoding="utf-8-sig")  # tolerate a Windows-authored BOM
 
     # Try JSON first
     stripped = content.strip()

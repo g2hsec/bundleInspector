@@ -76,7 +76,7 @@ def _chromium_master_key(db_path: Path) -> Optional[bytes]:
     try:
         import base64
 
-        data = json.loads(local_state.read_text(encoding="utf-8"))
+        data = json.loads(local_state.read_text(encoding="utf-8-sig"))
         key_b64 = (data.get("os_crypt") or {}).get("encrypted_key")
         if not key_b64:
             return None
@@ -176,7 +176,9 @@ def import_cookies_from_file(
     domain: str = "",
 ) -> dict[str, str]:
     """Import cookies from a file (auto-detect format)."""
-    content = path.read_text(encoding="utf-8", errors="replace")
+    # utf-8-sig strips a UTF-8 BOM; a BOM survives .strip() (U+FEFF is not whitespace) and
+    # would defeat the JSON '['/'{' format sniff below, silently dropping every cookie.
+    content = path.read_text(encoding="utf-8-sig", errors="replace")
     stripped = content.strip()
 
     # JSON array format

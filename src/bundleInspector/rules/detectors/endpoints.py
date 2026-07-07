@@ -3298,7 +3298,23 @@ class EndpointDetector(BaseRule):
             return None
         return string_value
 
-    def _resolve_bool_expr(
+    def _resolve_bool_expr(self, *args, **kwargs) -> Optional[bool]:
+        """Depth-guarded entry (shares _resolve_depth with the string/scalar spine).
+
+        Deeply nested boolean chains (`a && b && ... && z`, `!!!!x`) recurse here directly
+        (Unary/Logical operands), so bound them by _MAX_RESOLVE_DEPTH and degrade to None
+        instead of raising RecursionError -- otherwise a deep boolean in a request contract
+        would drop the whole endpoint finding (the string/scalar spine is already guarded)."""
+        depth = getattr(self, "_resolve_depth", 0) + 1
+        if depth > _MAX_RESOLVE_DEPTH:
+            return None
+        self._resolve_depth = depth
+        try:
+            return self._resolve_bool_expr_inner(*args, **kwargs)
+        finally:
+            self._resolve_depth = depth - 1
+
+    def _resolve_bool_expr_inner(
         self,
         node: dict[str, Any],
         constants: dict[str, str],
