@@ -118,6 +118,22 @@ class EndpointDetector(BaseRule):
     _RE_EMAIL = re.compile(r"^[^@\s/]+@[^@\s/]+\.[^@\s/]+$")
     _RE_NUMERIC = re.compile(r"^\d+$")
 
+    # Server-side dynamic endpoint extensions (Java/Spring/Struts .do/.jsp/.action, PHP,
+    # ASP.NET .aspx/.ashx, CGI). These are unambiguous endpoints even as a BARE relative-path
+    # literal, which the generic API_PATTERNS (^/api/, ^/v\d+/) and the leading-slash-only
+    # literal path check miss entirely -- a large false-negative class for Java/JSP web apps.
+    _SERVER_ENDPOINT_EXTS = r"do|jsp|jspx|action|php|phtml|aspx|ashx|asmx|jsf|cgi"
+    # Whole-string bare path literal ending in a server-side extension (absolute or relative).
+    _RE_SERVER_ENDPOINT = re.compile(
+        rf"^/?(?:[\w.~-]+/)*[\w.~-]+\.(?:{_SERVER_ENDPOINT_EXTS})(?:\?.*)?$",
+        re.IGNORECASE,
+    )
+    # Value that ENDS in a server-side extension (allows a ${...}-prefixed template-literal base).
+    _RE_SERVER_ENDPOINT_SUFFIX = re.compile(
+        rf"\.(?:{_SERVER_ENDPOINT_EXTS})(?:\?[^\s]*)?$",
+        re.IGNORECASE,
+    )
+
     def _is_placeholder_value(self, value: Any) -> bool:
         """Return True for placeholder strings used only for partial URL assembly."""
         return isinstance(value, str) and value.startswith("${") and value.endswith("}")
@@ -4368,6 +4384,11 @@ class EndpointDetector(BaseRule):
         if re.match(r"^/[a-zA-Z0-9_/-]+(\.[a-z]+)?(\?.*)?$", value):
             return True
 
+        # Server-side dynamic endpoint (.do/.jsp/.action/.php/...): a bare relative path, or a
+        # template-literal URL whose base is a ${...} expression (e.g. `${context}/x.do`).
+        if self._RE_SERVER_ENDPOINT_SUFFIX.search(value):
+            return True
+
         return False
 
     def _is_static_asset_url(self, value: str) -> bool:
@@ -4482,6 +4503,25 @@ class EndpointDetector(BaseRule):
                 break
 
         if matched:
+            return
+
+        # Server-side dynamic endpoint (.do/.jsp/.action/.php/.aspx/...) as a bare path literal,
+        # absolute or relative. Unambiguous endpoints that the API_PATTERNS above miss.
+        if self._RE_SERVER_ENDPOINT.match(value):
+            yield RuleResult(
+                rule_id=self.id,
+                category=self.category,
+                severity=Severity.INFO,
+                confidence=Confidence.MEDIUM,
+                title=f"API Path: {value[:50]}",
+                description=f"Potential server-side endpoint found: {value}",
+                extracted_value=value,
+                value_type="api_path",
+                line=literal.line,
+                column=literal.column,
+                ast_node_type="Literal",
+                tags=["api_path", "server_endpoint"],
+            )
             return
 
         # Check for full URLs (path is optional ??bare domain, trailing slash, or query-only is valid)

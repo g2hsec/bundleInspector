@@ -617,6 +617,11 @@ class SecretDetector(BaseRule):
         if " " in value:
             return False
 
+        # URL / endpoint path or a CSS/DOM selector -- reported by the endpoint/domain
+        # detectors, and a common entropy false-positive class, not a secret.
+        if self._is_url_or_selector(value):
+            return False
+
         # Check character class diversity
         diversity = self._calculate_char_class_diversity(value)
         if diversity < 2:
@@ -635,6 +640,24 @@ class SecretDetector(BaseRule):
             return len(value) >= 32
 
         return True
+
+    # Server-side endpoint extension (optionally followed by a query) and a query string of
+    # key=value pairs -- URL/endpoint shapes, not secrets. A real opaque token (base64/hex) has
+    # no dot-extension and no "?key=" query, so these never suppress a genuine secret.
+    _RE_ENDPOINT_EXT = re.compile(
+        r"\.(?:do|jsp|jspx|action|php|phtml|aspx|ashx|asmx|jsf|cgi)(?:\?|$)", re.IGNORECASE
+    )
+    _RE_QUERY_STRING = re.compile(r"[?&][A-Za-z_][\w.-]*=")
+
+    def _is_url_or_selector(self, value: str) -> bool:
+        """Return True for URL/endpoint paths and CSS/DOM selectors (not secrets)."""
+        # CSS / DOM selector (class, id, attribute, pseudo-class).
+        if value[:1] in ".#[:":
+            return True
+        # Server-side endpoint path (.do/.jsp/...) or a key=value query string.
+        if self._RE_ENDPOINT_EXT.search(value) or self._RE_QUERY_STRING.search(value):
+            return True
+        return False
 
     def _calculate_char_class_diversity(self, value: str) -> int:
         """
@@ -671,12 +694,22 @@ class SecretDetector(BaseRule):
             r"^[a-z]+(-[a-z0-9]+)+$",
             # Webpack chunk names
             r"^(chunk|vendors|main|runtime)[~\-.]",
-            # Valid dotted DNS hostname (always re-reported by DomainDetector, never a secret)
-            r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}$",
+            # Valid dotted DNS hostname, optional :port (always re-reported by DomainDetector,
+            # never a secret) -- e.g. sso.example.com or sso.example.com:8070
+            r"^(?=.{4,253}$)([a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?\.)+[a-z]{2,63}(?::\d+)?$",
             # Webpack/content-hash asset filename (e.g. app.4f3c2b1a.chunk.js)
             r"^[a-z0-9_.-]+\.[0-9a-f]{6,}\.(?:js|mjs|cjs|css|map|chunk\.js)$",
             # 4+ segment lowercase dotted namespace / i18n key (no hex/secret structure)
             r"^[a-z][a-z0-9]*(\.[a-z][a-z0-9]*){3,}$",
+            # 2+ delimited key=value pairs: window.open feature specs
+            # ("width=430,height=317,scrollbars=no"), query strings ("a=1&b=2&c=3"), inline
+            # style specs -- structured config, not an opaque secret token. An optional leading
+            # delimiter handles concatenation tails (",resizable=no,scrollbars=no,status=no").
+            # A single "key=value" is NOT filtered (that could be "token=<secret>").
+            r"^[,;&]?\s*[A-Za-z_][\w.-]*=[^=&,;]*(?:[,;&]\s*[A-Za-z_][\w.-]*=[^=&,;]*)+$",
+            # 4+ pipe-separated identifier tokens: a minifier reserved-word list
+            # ("null|httpRequest|function|return|if|var|GET|..."), never a secret.
+            r"^[A-Za-z_$][\w$]*(?:\|[A-Za-z_$][\w$]*){3,}$",
         ]
 
         for pattern in non_secret_patterns:
