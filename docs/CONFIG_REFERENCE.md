@@ -29,6 +29,7 @@ CLI wiring in `src/bundleInspector/cli.py`.
 - `denied_paths`: denied path prefixes/patterns
 - `third_party_policy`: `analyze`, `skip`, `tag_only`
 - `cdn_patterns`: known CDN patterns used for first/third-party heuristics
+- `allow_private_ips` (default `false`): SSRF opt-in for **authorized** internal scanning — permit targets resolving to private ranges (RFC1918/CGNAT/ULA). Loopback, cloud-metadata (`169.254.169.254`), multicast/reserved and blocked hostnames (`localhost`, …) stay blocked. CLI: `--allow-private-ips`.
 
 ## Auth
 

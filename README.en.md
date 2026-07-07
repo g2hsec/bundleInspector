@@ -109,7 +109,7 @@ bundleInspector scan https://target.example.com --config examples/scan-profiles/
 | `convert <report>` | Convert a report between JSON ⇄ HTML |
 | `version` | Print the version |
 
-Most-used flags: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`, `--fail-on {severity}`.
+Most-used flags: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`, `--fail-on {severity}`, `--allow-private-ips` (authorized internal targets).
 Full reference → [CLI section of the User Guide »](docs/USER_GUIDE.md#-cli-reference)
 
 ## 🔬 What It Finds

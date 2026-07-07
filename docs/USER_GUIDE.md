@@ -140,6 +140,7 @@ Crawl and analyze one or more live target URLs (at least one URL required).
 | `--job-id ID` | auto-uuid | Persistent job id for cache/resume |
 | `--resume` | off | Reuse the latest stored report/checkpoint for the job id |
 | `--fail-on {info,low,medium,high,critical}` | — | Exit code **2** if any finding is at or above this severity (CI gate) |
+| `--allow-private-ips` | off | Allow a target that resolves to a **private/internal** IP (RFC1918/CGNAT/ULA) for **authorized** internal/dev-server testing. Loopback, cloud-metadata (`169.254.169.254`), multicast & reserved ranges stay blocked. |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | Output verbosity controls |
 
 ### `analyze <paths…>` — local, no network
@@ -326,6 +327,7 @@ BundleInspector will not mutate a target through its own UI driving:
 
 - **Per-domain adaptive rate limiting** — `rate_limit` seconds between requests (default `1.0`), automatic backoff on `429`/`5xx` (×2, capped at 60s), recovery on success; concurrency capped by `max_concurrent`.
 - **SSRF / scope guards** — every seed and every download is validated: localhost & cloud-metadata hosts, private/loopback/link-local/CGNAT IP ranges (incl. `169.254.169.254`), DNS-rebinding checks, and non-`http(s)` schemes are blocked; `ScopePolicy` enforces allow/deny domains.
+  - **Authorized internal scanning** — pass `--allow-private-ips` (or `scope.allow_private_ips: true`) to permit targets that resolve to **private** ranges (RFC1918/CGNAT/ULA) for a dev/staging server on an internal network. This is a deliberate opt-in (default **off**); loopback, cloud-metadata (`169.254.169.254`), multicast and reserved ranges — and the blocked-hostname list (`localhost`, …) — stay blocked either way.
 - **Secret masking** — secret findings are masked (`secret_visible_chars=4`); request-contract extraction redacts credential-shaped values to `<REDACTED_*>` before anything reaches disk.
 - **Other hardening** — 10 MB download cap, 10-redirect cap, CR/LF/NUL validation on auth inputs, path-traversal protection for local analysis.
 

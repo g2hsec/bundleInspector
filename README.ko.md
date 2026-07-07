@@ -109,7 +109,7 @@ bundleInspector scan https://target.example.com --config examples/scan-profiles/
 | `convert <report>` | 리포트를 JSON ⇄ HTML 로 변환 |
 | `version` | 버전 출력 |
 
-자주 쓰는 플래그: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`, `--fail-on {심각도}`.
+자주 쓰는 플래그: `-s/--scope`, `-c/--cookie`, `-H/--header`, `-o/--output`, `-f/--format {json,html,sarif}`, `-w/--wordlist`, `--api-map`, `--no-headless`, `--job-id` / `--resume`, `--fail-on {심각도}`, `--allow-private-ips`(인가된 내부 대상).
 전체 레퍼런스 → [사용설명서 CLI 섹션 »](docs/USER_GUIDE.ko.md#-cli-레퍼런스)
 
 ## 🔬 무엇을 찾나요

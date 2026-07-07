@@ -140,6 +140,7 @@ bundleInspector [scan | analyze | convert | version]
 | `--job-id ID` | 자동 uuid | 캐시/재개용 영속 job id |
 | `--resume` | off | 해당 job id의 최신 저장 리포트/체크포인트 재사용 |
 | `--fail-on {info,low,medium,high,critical}` | — | 이 심각도 이상 발견 시 종료 코드 **2** (CI 게이트) |
+| `--allow-private-ips` | off | **인가된** 내부/개발 서버 테스트용 — 대상이 **사설/내부** IP(RFC1918/CGNAT/ULA)로 resolve돼도 허용. 루프백·클라우드 메타데이터(`169.254.169.254`)·멀티캐스트·예약 대역은 계속 차단. |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | 출력 상세도 제어 |
 
 ### `analyze <paths…>` — 로컬, 네트워크 없음
@@ -326,6 +327,7 @@ BundleInspector는 자신의 UI 조작으로 타겟을 변경하지 않습니다
 
 - **도메인별 적응형 레이트리밋** — 요청 간 `rate_limit`초(기본 `1.0`), `429`/`5xx`에 자동 백오프(×2, 최대 60s), 성공 시 회복. 동시성은 `max_concurrent`로 제한.
 - **SSRF / 스코프 가드** — 모든 시드와 다운로드를 검증: localhost·클라우드 메타데이터 호스트, 사설/루프백/링크로컬/CGNAT IP(`169.254.169.254` 포함), DNS 리바인딩 체크, non-`http(s)` 스킴 차단. `ScopePolicy`가 허용/차단 도메인 강제.
+  - **인가된 내부 스캔** — 내부망의 dev/staging 서버처럼 대상이 **사설**(RFC1918/CGNAT/ULA) 대역으로 resolve되는 경우 `--allow-private-ips`(또는 `scope.allow_private_ips: true`)로 허용. 기본 **off**의 명시적 옵트인이며, 루프백·클라우드 메타데이터(`169.254.169.254`)·멀티캐스트·예약 대역과 차단 호스트명(`localhost` 등)은 플래그와 무관하게 계속 차단됩니다.
 - **시크릿 마스킹** — 시크릿 발견은 마스킹(`secret_visible_chars=4`), 요청 컨트랙트 추출 시 자격증명 형태 값은 디스크에 닿기 전에 `<REDACTED_*>`로 리댁션.
 - **기타 하드닝** — 10 MB 다운로드 상한, 10 리다이렉트 상한, 인증 입력 CR/LF/NUL 검증, 로컬 분석 경로 순회 방지.
 
