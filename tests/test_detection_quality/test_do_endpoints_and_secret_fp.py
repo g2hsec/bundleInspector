@@ -80,7 +80,23 @@ def test_non_secret_shapes_are_not_flagged(value):
     "AKIAIOSFODNN7EXAMPLE1234",                    # AWS-key-shaped
     "xoxbFAKE1234567890abcdefghijABCDEF",          # opaque mixed token
     "ghpFAKE16CharsMixed1234567890abcd",           # opaque token
+    "aX9bY2cZmN4pQ7rT8sV1wU3xT5yS",                # alternating-case random token
+    "npmAbCdEfGhIjKlMnOpQrStUvWxYz012345",         # long opaque token
+    "U2FsdGVkX1abcdefghijklmnop",                  # base64-ish token
 ])
 def test_real_secret_shapes_still_flagged(value):
-    # The FP filters must not suppress genuine opaque high-entropy tokens.
+    # The FP filters (incl. the dictionary-identifier filter) must not suppress genuine
+    # opaque high-entropy tokens -- they tokenize into non-words -> ~0 dictionary coverage.
     assert SecretDetector()._looks_like_secret(value) is True, value
+
+
+@pytest.mark.parametrize("value", [
+    "loginPwBeforePopup", "popOrderCancelConfirm", "restockNotifyPopup",
+    "headerSearchCloseBtn", "COUPON_DOWNLOAD_LIMIT_EXCEEDED", "RESTOCK_ALREADY_REQUEST",
+])
+def test_dictionary_identifiers_are_not_secrets(value):
+    # Multi-word camelCase / SCREAMING_SNAKE identifiers made of common words are code, not
+    # secrets -- the entropy heuristic previously flagged all of these.
+    det = SecretDetector()
+    assert det._is_dictionary_identifier(value) is True
+    assert det._looks_like_secret(value) is False
