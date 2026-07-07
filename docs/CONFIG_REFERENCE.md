@@ -84,7 +84,7 @@ Runtime notes:
 
 ## Rules
 
-- `enabled_categories`: enabled rule categories
+- `enabled_categories`: enabled rule categories (default: `endpoint`, `secret`, `domain`, `flag`, `debug`, `sink`, `upload`)
 - `custom_rules_file`: JSON/YAML custom rule file
 - `min_confidence`: minimum confidence threshold setting
 - `mask_secrets`: whether JSON output masks secret values

@@ -348,8 +348,12 @@ BundleInspector will not mutate a target through its own UI driving:
 | **Domain** | MEDIUM | Internal/staging hosts (`dev`/`staging`/`qa`…, `.internal`/`.local`/`.corp`), Kubernetes (`.svc.cluster.local`), Docker/AWS-internal, private/loopback IPs, and S3/GCS/Azure buckets. |
 | **Flag** | LOW | Feature-flag keywords, SDKs (LaunchDarkly, Optimizely, Split, ConfigCat, Unleash, …), flag-config endpoints, flag-check functions, and admin/debug identifiers. |
 | **Debug** | per-path | Debug/admin paths with graded severity (`/shell`,`/eval` → CRITICAL; `/debug`,`/admin` → HIGH; `/actuator`,`/test` → MEDIUM; `/health`,`/swagger` → LOW), sensitive `console.*` logging, `debugger` statements, `alert()`, and dev-only branches (`NODE_ENV`, `__DEV__`). |
+| **Sink** | per-sink | **DOM-XSS / code-injection sinks fed a DYNAMIC argument** (not a static literal): HTML injection (`innerHTML`/`outerHTML =`, `document.write`, `insertAdjacentHTML`, jQuery `.html()`/`.append()`…), attribute injection (`setAttribute('src'/'href'/'on*', …)`), and code execution (`eval`, `new Function`, string `setTimeout`/`setInterval`) → `eval`/`innerHTML`/`document.write` = HIGH. A client-side **indicator** (the source may or may not be attacker-controlled — confirm with taint review/DAST); it pinpoints every injectable sink for a reviewer. |
+| **Upload** | per-signal | File-upload surface: `new FormData()`/`multipart`, `<input type="file">` built in JS, and **client-side-only file-type allow-lists** (`allowedExt`/`allowedTypes`… → MEDIUM) which are bypassable — verify the server re-validates (unrestricted-upload risk). |
 
 The **Chunk Analyzer** additionally surfaces Webpack/Vite code-split infrastructure and lazy/hidden routes.
+
+> The **Sink** and **Upload** detectors report client-side *indicators*, not proven vulnerabilities: a static bundle scan cannot see the server-side control (authorization, server file re-validation) or prove the source is attacker-controlled. They point you at the exact sinks/surfaces to confirm manually or with DAST — e.g. a `.html()`/`innerHTML=` fed a stored value is the client half of a **stored XSS**, and a client-side `allowedExt` check is the client half of an **unrestricted file upload**.
 
 ### The seven enhancements
 

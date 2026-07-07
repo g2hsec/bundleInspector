@@ -348,8 +348,12 @@ BundleInspector는 자신의 UI 조작으로 타겟을 변경하지 않습니다
 | **Domain** | MEDIUM | 내부/스테이징 호스트(`dev`/`staging`/`qa`…, `.internal`/`.local`/`.corp`), Kubernetes(`.svc.cluster.local`), Docker/AWS-internal, 사설/루프백 IP, S3/GCS/Azure 버킷. |
 | **Flag** | LOW | 피처 플래그 키워드, SDK(LaunchDarkly, Optimizely, Split, ConfigCat, Unleash …), 플래그 설정 엔드포인트, 플래그 체크 함수, admin/debug 식별자. |
 | **Debug** | 경로별 | 디버그/관리 경로 등급별(`/shell`,`/eval` → CRITICAL; `/debug`,`/admin` → HIGH; `/actuator`,`/test` → MEDIUM; `/health`,`/swagger` → LOW), 민감 `console.*`, `debugger`, `alert()`, dev 전용 분기(`NODE_ENV`, `__DEV__`). |
+| **Sink** | sink별 | **동적 인자가 흘러드는 DOM-XSS/코드인젝션 sink**(정적 리터럴 제외): HTML 주입(`innerHTML`/`outerHTML =`, `document.write`, `insertAdjacentHTML`, jQuery `.html()`/`.append()`…), 속성 주입(`setAttribute('src'/'href'/'on*', …)`), 코드 실행(`eval`, `new Function`, 문자열 `setTimeout`/`setInterval`) → `eval`/`innerHTML`/`document.write` = HIGH. **클라이언트측 지표**(입력의 공격자 제어 여부는 taint/DAST로 확정) — 주입 가능한 sink 지점을 정확히 짚어줌. |
+| **Upload** | 신호별 | 파일 업로드 표면: `new FormData()`/`multipart`, JS로 만든 `<input type="file">`, 그리고 **클라이언트측 전용 확장자 허용목록**(`allowedExt`/`allowedTypes`… → MEDIUM) — 우회 가능하므로 서버 재검증 여부 확인(무제한 업로드 위험). |
 
 **Chunk Analyzer**가 Webpack/Vite 코드 스플릿 인프라와 지연/은닉 라우트를 추가로 드러냅니다.
+
+> **Sink**·**Upload** 탐지기는 *지표*이지 확정 취약점이 아닙니다: 정적 번들 스캔은 서버측 통제(인가, 서버 파일 재검증)나 입력의 공격자 제어 여부를 볼 수 없습니다. 수동/DAST로 확인할 sink·표면을 정확히 안내합니다 — 저장값이 흘러드는 `.html()`/`innerHTML=`는 **저장형 XSS**의 클라이언트 절반, 클라이언트측 `allowedExt` 검사는 **무제한 파일 업로드**의 클라이언트 절반입니다.
 
 ### 7가지 고도화
 
