@@ -63,6 +63,45 @@ def test_eval_high_severity():
     assert fs and fs[0].severity.value == "high"
 
 
+# ------------------------------------------------ HTML attribute injection (stored/DOM XSS)
+
+def _sink_by_type(src: str, value_type: str):
+    return [f for f in _findings(src) if f.category.value == "sink" and f.value_type == value_type]
+
+
+@pytest.mark.parametrize("src,attr,source", [
+    ('var h = `<img src="${item.image_url}">`;',           "src",     "item.image_url"),
+    ('var h = `<a href="${u}">`;',                          "href",    "u"),
+    ('var h = `<b onerror="${x}">`;',                       "onerror", "x"),
+    ("var h = '<img src=\"' + data.path + '\">';",          "src",     "data.path"),
+])
+def test_dangerous_attribute_injection_flagged(src, attr, source):
+    fs = _sink_by_type(src, "dom_attr_injection")
+    assert fs, f"no dom_attr_injection for: {src}"
+    f = fs[0]
+    assert f.severity.value == "high"
+    assert source in f.description  # the source expression is surfaced for the reviewer
+
+
+@pytest.mark.parametrize("src", [
+    'var h = `<div class="${cls}">x</div>`;',   # non-dangerous attribute
+    'var h = `<p>${text}</p>`;',                 # content position, not an attribute value
+    'var h = `<img src="/static/logo.png">`;',   # fully static
+])
+def test_safe_html_not_attribute_injection(src):
+    assert _sink_by_type(src, "dom_attr_injection") == []
+
+
+def test_jquery_attr_src_sink_names_source():
+    # the $img.attr("src", uploaded.path) upload -> <img src> pattern
+    fs = _sink_by_type('$img.attr("src", uploaded.path);', "dom_attr_sink")
+    assert fs and "uploaded.path" in fs[0].description
+
+
+def test_jquery_attr_safe_attribute_not_flagged():
+    assert _sink_by_type('$el.attr("class", dyn);', "dom_attr_sink") == []
+
+
 # ---------------------------------------------------------------- file upload
 
 def test_formdata_is_upload_surface():
