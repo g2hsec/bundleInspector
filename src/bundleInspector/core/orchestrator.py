@@ -378,7 +378,15 @@ class Orchestrator:
             asset = await self._artifact_store.get_asset_meta(content_hash)
             if not asset:
                 continue
-            content = await self._artifact_store.get_js(content_hash)
+            # Restore the NORMALIZED (beautified) content, not the raw download: the stored
+            # AST, line_mappers and sourcemaps were all built against the beautified source,
+            # so analyze must re-run against the same content or evidence positions and
+            # context-filter indexing go wrong (mis-scored / dropped findings on --resume).
+            content = None
+            if asset.normalized_hash and asset.normalized_hash != content_hash:
+                content = await self._artifact_store.get_js(asset.normalized_hash)
+            if content is None:
+                content = await self._artifact_store.get_js(content_hash)
             if content is not None:
                 asset.content = content
             if asset.sourcemap_hash:

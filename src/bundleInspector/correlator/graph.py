@@ -210,7 +210,7 @@ class Correlator:
         findings: list[Finding],
     ) -> dict[str, list[Finding]]:
         """Group endpoint findings by base URL."""
-        from urllib.parse import urlparse
+        from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
         groups: dict[str, list[Finding]] = defaultdict(list)
 
@@ -2410,10 +2410,12 @@ class Correlator:
         max_depth: int = 5,
     ) -> dict[str, list[list[str]]]:
         """Collect reachable intra-module call-graph scopes from an exported entry scope."""
-        return self._cache_result(
-            ("transitive_scope_paths", id(call_graph), entry_scope, max_depth),
-            lambda: self._collect_transitive_scope_paths_uncached(call_graph, entry_scope, max_depth),
-        )
+        # NOT cached by id(call_graph): call_graph is a transient dict freed after use, and
+        # CPython reuses the freed address for the next module's call_graph, so an id-keyed
+        # cache would return scope paths computed for an UNRELATED module -> wrong inter-module
+        # edges and non-deterministic risk scores. Each (call_graph, entry_scope) is computed
+        # once per graph, so dropping the cache costs nothing.
+        return self._collect_transitive_scope_paths_uncached(call_graph, entry_scope, max_depth)
 
     def _collect_transitive_scope_paths_uncached(
         self,
@@ -2454,7 +2456,7 @@ class Correlator:
 
     def _build_file_aliases_uncached(self, file_url: str) -> set[str]:
         """Build import-match aliases for a finding file URL."""
-        from urllib.parse import urlparse
+        from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
         parsed = urlparse(file_url)
         raw_path = parsed.path or file_url

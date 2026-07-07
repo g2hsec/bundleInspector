@@ -7,7 +7,7 @@ from __future__ import annotations
 import re
 from fnmatch import fnmatch
 from typing import Optional
-from urllib.parse import urlparse
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 from bundleInspector.config import ScopeConfig, ThirdPartyPolicy
 
@@ -299,7 +299,8 @@ def normalize_url(
     Raises:
         URLValidationError: If strict=True and URL is invalid/blocked
     """
-    from urllib.parse import urljoin, urlparse, urlunparse
+    from urllib.parse import urljoin, urlunparse
+    from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
     # Security: Block dangerous URL schemes
     url_lower = url.lower().strip()

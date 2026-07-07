@@ -412,7 +412,7 @@ class IRBuilder:
         self._current_scope = old_scope
         return {"value", "params"}
 
-    def _get_callee_name(self, callee: dict) -> str:
+    def _get_callee_name(self, callee: dict, _depth: int = 0) -> str:
         """Get full callee name from call expression."""
         callee_type = callee.get("type", "")
 
@@ -420,7 +420,9 @@ class IRBuilder:
             return callee.get("name", "")
 
         elif callee_type == "MemberExpression":
-            obj = self._get_callee_name(callee.get("object", {}))
+            if _depth > self.MAX_VISIT_DEPTH:  # deep member chain -> degrade, don't RecursionError
+                return "[deep]"
+            obj = self._get_callee_name(callee.get("object", {}), _depth + 1)
             prop = callee.get("property", {})
 
             if callee.get("computed"):
@@ -545,8 +547,10 @@ class IRBuilder:
             if tok and tok not in seen:
                 seen.add(tok); tokens.append(tok)
 
-        def walk(node):
-            if not isinstance(node, dict):
+        def walk(node, _depth=0):
+            # Depth-guarded like _visit: a deeply nested guard test (e.g. a ~1500-deep
+            # member/logical chain) must degrade, not raise RecursionError and drop the asset.
+            if not isinstance(node, dict) or _depth > self.MAX_VISIT_DEPTH:
                 return
             t = node.get("type")
             if t in ("FunctionExpression", "ArrowFunctionExpression", "FunctionDeclaration"):
@@ -564,25 +568,25 @@ class IRBuilder:
                     add(path)
                 obj = node.get("object")
                 if isinstance(obj, dict):
-                    walk(obj)
+                    walk(obj, _depth + 1)
                 if node.get("computed"):
-                    walk(prop)
+                    walk(prop, _depth + 1)
                 return
             if t == "CallExpression":
-                walk(node.get("callee") or {})
+                walk(node.get("callee") or {}, _depth + 1)
                 for arg in node.get("arguments", []):
                     if isinstance(arg, dict) and arg.get("type") == "Literal" and isinstance(arg.get("value"), str):
                         add(arg.get("value"))
                     else:
-                        walk(arg)
+                        walk(arg, _depth + 1)
                 return
             for v in node.values():
                 if isinstance(v, dict):
-                    walk(v)
+                    walk(v, _depth + 1)
                 elif isinstance(v, list):
                     for it in v:
                         if isinstance(it, dict):
-                            walk(it)
+                            walk(it, _depth + 1)
 
         walk(test)
         return tokens

@@ -190,7 +190,7 @@ class SecretDetector(BaseRule):
         (r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+", "slack_webhook", Severity.HIGH),
 
         # Discord
-        (r"[MN][A-Za-z\d]{23,}\.[\w-]{6}\.[\w-]{27}", "discord_bot_token", Severity.CRITICAL),
+        (r"[MN][A-Za-z\d]{23,40}\.[\w-]{6}\.[\w-]{27}", "discord_bot_token", Severity.CRITICAL),
         (r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[a-zA-Z0-9_-]+", "discord_webhook", Severity.HIGH),
 
         # Telegram
@@ -301,7 +301,7 @@ class SecretDetector(BaseRule):
         (r"ssh-ed25519 AAAA[0-9A-Za-z+/]+[=]{0,3}", "ssh_public_key", Severity.LOW),
 
         # Database URLs (additional)
-        (r"(?:mongodb|postgres|mysql|redis|amqp|rabbitmq)://[^'\"\s]+:[^'\"\s]+@[^'\"\s]+", "database_url", Severity.CRITICAL),
+        (r"(?:mongodb|postgres|mysql|redis|amqp|rabbitmq)://[^'\"\s]{1,256}:[^'\"\s]{1,256}@[^'\"\s]{1,512}", "database_url", Severity.CRITICAL),
     ]
 
     # Generic assignment-context patterns (scanned against source content, not string literals)

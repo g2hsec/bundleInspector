@@ -10,10 +10,10 @@ from __future__ import annotations
 import json
 from datetime import datetime
 from typing import Any
-from urllib.parse import urlparse
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 from bundleInspector import __version__
-from bundleInspector.reporter.base import BaseReporter
+from bundleInspector.reporter.base import BaseReporter, mask_secret_findings
 from bundleInspector.storage.models import (
     Category,
     Report,
@@ -44,8 +44,14 @@ class SARIFReporter(BaseReporter):
     TOOL_FULL_NAME = "BundleInspector JavaScript Security Analyzer"
     TOOL_INFO_URI = "https://github.com/g2hsec/bundleInspector"
 
+    def __init__(self, mask_secrets: bool = True, secret_visible_chars: int = 4):
+        self.mask_secrets = mask_secrets
+        self.secret_visible_chars = secret_visible_chars
+
     def generate(self, report: Report) -> str:
         """Generate SARIF report."""
+        if self.mask_secrets:
+            mask_secret_findings(report, self.secret_visible_chars)
         sarif = {
             "$schema": self.SARIF_SCHEMA,
             "version": self.SARIF_VERSION,

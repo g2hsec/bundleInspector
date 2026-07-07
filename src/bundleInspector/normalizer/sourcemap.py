@@ -150,7 +150,9 @@ class SourceMapResolver:
             content = response.text
             return self._parse_sourcemap_json(content, is_inline=False, url=url)
 
-        except httpx.HTTPError:
+        except Exception:
+            # ANY failure fetching/decoding an external sourcemap must return None, never
+            # abort the scan (a non-200 body, a decode error, a malformed map, etc.).
             return None
 
     def _parse_sourcemap_json(
@@ -159,21 +161,30 @@ class SourceMapResolver:
         is_inline: bool,
         url: Optional[str] = None,
     ) -> Optional[SourceMapInfo]:
-        """Parse source map JSON."""
+        """Parse source map JSON.
+
+        Robust against JSON that is valid but not an object (`null`/`[]`/number/string),
+        deeply-nested JSON (RecursionError from json.loads), and `null` sources/sourcesContent
+        -- each of which would otherwise raise and abort the entire scan.
+        """
         try:
             data = json.loads(content)
-
-            return SourceMapInfo(
-                url=url,
-                content=content,
-                is_inline=is_inline,
-                sources=data.get("sources", []),
-                sources_content=data.get("sourcesContent", []),
-                mappings=data.get("mappings", ""),
-            )
-
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, ValueError, RecursionError):
             return None
+        if not isinstance(data, dict):
+            return None
+
+        sources = data.get("sources")
+        sources_content = data.get("sourcesContent")
+        mappings = data.get("mappings")
+        return SourceMapInfo(
+            url=url,
+            content=content,
+            is_inline=is_inline,
+            sources=sources if isinstance(sources, list) else [],
+            sources_content=sources_content if isinstance(sources_content, list) else [],
+            mappings=mappings if isinstance(mappings, str) else "",
+        )
 
     def get_original_sources(
         self,
@@ -188,15 +199,16 @@ class SourceMapResolver:
         Returns:
             Dict mapping source names to content
         """
-        sources = {}
-
-        for i, source_name in enumerate(sourcemap.sources):
-            if i < len(sourcemap.sources_content):
-                content = sourcemap.sources_content[i]
+        result = {}
+        src_names = sourcemap.sources or []          # tolerate None ("sources": null)
+        src_contents = sourcemap.sources_content or []
+        for i, source_name in enumerate(src_names):
+            if i < len(src_contents):
+                content = src_contents[i]
                 if content:
-                    sources[source_name] = content
+                    result[source_name] = content
 
-        return sources
+        return result
 
     def decode_mappings(
         self,
@@ -323,11 +335,15 @@ class SourceMapResolver:
                 if gen_column <= generated_column:
                     best_segment = (source_index, original_line, original_column)
 
-        if best_segment and best_segment[0] < len(sourcemap.sources):
+        sources = sourcemap.sources or []
+        # Guard non-negative cumulative indices: a malformed relative VLQ map can drive the
+        # source index or original line negative, which would wrap to the wrong source /
+        # produce a non-positive line, or (sources=None) raise TypeError.
+        if best_segment and 0 <= best_segment[0] < len(sources) and best_segment[1] >= 0:
             return OriginalPosition(
-                source=sourcemap.sources[best_segment[0]],
+                source=sources[best_segment[0]],
                 line=best_segment[1] + 1,  # Convert to 1-indexed
-                column=best_segment[2],
+                column=max(0, best_segment[2]),
                 name=None,
             )
 

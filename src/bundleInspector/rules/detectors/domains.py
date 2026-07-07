@@ -71,7 +71,10 @@ class DomainDetector(BaseRule):
     # Cloud storage patterns
     CLOUD_STORAGE_PATTERNS = [
         # AWS S3
-        (r"(?:https?://)?([a-z0-9.-]+)\.s3\.(?:[a-z0-9-]+\.)?amazonaws\.com", "s3_bucket"),
+        # Bounded quantifiers ({1,253}/{1,63}) keep this linear: the unbounded `[a-z0-9.-]+`
+        # before `.s3.` overlapped the following literal and backtracked O(n^2) on long dotted
+        # literals. A real hostname is <=253 chars, so the match set is unchanged.
+        (r"(?:https?://)?([a-z0-9.-]{1,253})\.s3\.(?:[a-z0-9-]{1,63}\.)?amazonaws\.com", "s3_bucket"),
         (r"(?:https?://)?s3\.(?:[a-z0-9-]+\.)?amazonaws\.com/([a-z0-9.-]+)", "s3_bucket"),
         (r"s3://([a-z0-9.-]+)", "s3_bucket"),
 

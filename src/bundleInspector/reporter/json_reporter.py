@@ -103,6 +103,14 @@ class JSONReporter(BaseReporter):
         masked_value = finding.get("masked_value") or self._mask_value(raw_value)
         finding["extracted_value"] = masked_value
 
+        # Redact the raw secret from the evidence snippet -- it is the source line that
+        # literally contains the secret, and it was NOT masked before, leaking the secret in
+        # clear text in every report format even with mask_secrets on.
+        if raw_value:
+            evidence = finding.get("evidence")
+            if isinstance(evidence, dict) and isinstance(evidence.get("snippet"), str):
+                evidence["snippet"] = evidence["snippet"].replace(raw_value, masked_value)
+
         metadata = finding.get("metadata")
         if not isinstance(metadata, dict):
             return
@@ -148,8 +156,13 @@ class JSONReporter(BaseReporter):
                 self._mask_nested_value(item, raw_value, masked_value, field_overrides)
                 for item in value
             ]
-        if isinstance(value, str) and raw_value and value == raw_value:
-            return masked_value
+        if isinstance(value, str) and raw_value:
+            if value == raw_value:
+                return masked_value
+            # Also redact the secret as a SUBSTRING (e.g. metadata original_snippet /
+            # normalized_evidence.snippet embed the raw source line) so it never leaks.
+            if raw_value in value:
+                return value.replace(raw_value, masked_value)
         return value
 
     def _mask_value(self, value: str) -> str:

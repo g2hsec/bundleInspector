@@ -9,7 +9,8 @@ import re
 from copy import deepcopy
 from pathlib import Path
 from typing import Any, Iterator, Literal, Optional
-from urllib.parse import urlsplit, urlunsplit
+from urllib.parse import urlunsplit
+from bundleInspector.core.url_utils import safe_urlsplit as urlsplit
 
 from pydantic import BaseModel, Field, model_validator
 

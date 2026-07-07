@@ -879,9 +879,15 @@ def _build_reporter(config: Config):
     """Build a reporter from the effective output configuration."""
     report_format = config.output.format.value
     if report_format == "html":
-        return HTMLReporter()
+        return HTMLReporter(
+            mask_secrets=config.rules.mask_secrets,
+            secret_visible_chars=config.rules.secret_visible_chars,
+        )
     if report_format == "sarif":
-        return SARIFReporter()
+        return SARIFReporter(
+            mask_secrets=config.rules.mask_secrets,
+            secret_visible_chars=config.rules.secret_visible_chars,
+        )
     return JSONReporter(
         include_raw=config.output.include_raw_content,
         mask_secrets=config.rules.mask_secrets,
@@ -1336,7 +1342,14 @@ async def _run_local_analysis(
             asset = await artifact_store.get_asset_meta(content_hash)
             if not asset:
                 continue
-            content = await artifact_store.get_js(content_hash)
+            # Restore the NORMALIZED (beautified) content, matching the stored AST/line maps;
+            # restoring the raw download would run analyze against mismatched source (wrong
+            # evidence positions / dropped findings on --resume).
+            content = None
+            if asset.normalized_hash and asset.normalized_hash != content_hash:
+                content = await artifact_store.get_js(asset.normalized_hash)
+            if content is None:
+                content = await artifact_store.get_js(content_hash)
             if content is not None:
                 asset.content = content
             restored_assets.append(asset)

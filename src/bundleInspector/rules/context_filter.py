@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from dataclasses import dataclass, field
 from typing import Optional
-from urllib.parse import urlsplit
+from bundleInspector.core.url_utils import safe_urlsplit as urlsplit
 
 from bundleInspector.storage.models import (
     Category,

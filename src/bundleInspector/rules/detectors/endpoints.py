@@ -8,10 +8,11 @@ from __future__ import annotations
 
 import re
 from typing import Any, Iterator, Optional
-from urllib.parse import urljoin, urlsplit
+from urllib.parse import urljoin
 
 import structlog
 
+from bundleInspector.core.url_utils import safe_urlsplit as urlsplit
 from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
 from bundleInspector.storage.models import (
     Category,

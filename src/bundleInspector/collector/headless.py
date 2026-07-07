@@ -10,7 +10,7 @@ import asyncio
 import logging
 from inspect import isawaitable
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import urlparse
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 from bs4 import BeautifulSoup
 

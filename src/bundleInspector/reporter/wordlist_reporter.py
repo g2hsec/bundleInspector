@@ -8,7 +8,8 @@ wordlists compatible with ffuf, dirsearch, feroxbuster, etc.
 from __future__ import annotations
 
 import re
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import parse_qs
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 from bundleInspector.reporter.base import BaseReporter
 from bundleInspector.storage.models import Category, Finding, Report

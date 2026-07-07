@@ -10,7 +10,8 @@ import logging
 import re
 from inspect import isawaitable
 from typing import Any, AsyncIterator, Awaitable, Callable
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 import httpx
 from bs4 import BeautifulSoup
@@ -200,9 +201,12 @@ class StaticCollector(BaseCollector):
             rel = link.get("rel", [])
             if isinstance(rel, str):
                 rel = [rel]
+            # HTML link `rel` / `as` tokens are case-insensitive; lowercase so capitalized
+            # variants (rel="Preload", as="Script") are not missed.
+            rel = [str(r).lower() for r in rel]
 
             href = link.get("href")
-            as_value = link.get("as", "")
+            as_value = str(link.get("as", "") or "").lower()
 
             if not href:
                 continue
@@ -603,5 +607,8 @@ class MultiPageStaticCollector(BaseCollector):
                 if not any(parsed_link.path.endswith(ext) for ext in resource_exts):
                     links.append(full_url)
 
-        return list(set(links))
+        # dict.fromkeys dedups while PRESERVING document order; list(set(...)) randomized it,
+        # so which pages the caller's "first N" cap kept (and thus which JS was discovered)
+        # differed every run.
+        return list(dict.fromkeys(links))
 

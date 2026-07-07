@@ -10,7 +10,8 @@ import json
 import logging
 import re
 from typing import Any, AsyncIterator
-from urllib.parse import urljoin, urlparse
+from urllib.parse import urljoin
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 import httpx
 
@@ -180,7 +181,8 @@ class ManifestCollector(BaseCollector):
         """Parse JSON manifest file."""
         try:
             data = json.loads(content)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, RecursionError):
+            # A deeply-nested manifest served by the target must not abort the crawl.
             return
 
         # Extract all string values that look like JS paths
@@ -199,33 +201,39 @@ class ManifestCollector(BaseCollector):
                 )
 
     def _extract_js_paths_from_json(self, data: Any, paths: list[str] | None = None) -> list[str]:
-        """Recursively extract JS paths from JSON data."""
+        """Iteratively extract JS paths from JSON data.
+
+        Explicit stack rather than recursion so a deeply-nested manifest (trivial for a broken
+        build tool or an attacker to emit) cannot raise RecursionError and abort the crawl.
+        Visits the same node set as the old recursive version.
+        """
         if paths is None:
             paths = []
 
-        if isinstance(data, str):
-            if is_js_url(data) or data.endswith(".js"):
-                paths.append(data)
-        elif isinstance(data, dict):
-            for key, value in data.items():
-                # Common manifest keys
-                if key in ("src", "file", "url", "path", "js", "main", "module"):
-                    if isinstance(value, str):
-                        paths.append(value)
-                        continue
-                    elif isinstance(value, list):
-                        for item in value:
-                            if isinstance(item, str):
-                                paths.append(item)
-                            else:
-                                self._extract_js_paths_from_json(item, paths)
-                        continue
-
-                self._extract_js_paths_from_json(value, paths)
-
-        elif isinstance(data, list):
-            for item in data:
-                self._extract_js_paths_from_json(item, paths)
+        stack: list[Any] = [data]
+        while stack:
+            node = stack.pop()
+            if isinstance(node, str):
+                if is_js_url(node) or node.endswith(".js"):
+                    paths.append(node)
+            elif isinstance(node, dict):
+                for key, value in node.items():
+                    # Common manifest keys
+                    if key in ("src", "file", "url", "path", "js", "main", "module"):
+                        if isinstance(value, str):
+                            paths.append(value)
+                            continue
+                        elif isinstance(value, list):
+                            for item in value:
+                                if isinstance(item, str):
+                                    paths.append(item)
+                                else:
+                                    stack.append(item)
+                            continue
+                    stack.append(value)
+            elif isinstance(node, list):
+                for item in node:
+                    stack.append(item)
 
         return paths
 

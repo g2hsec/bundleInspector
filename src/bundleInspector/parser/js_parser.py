@@ -174,6 +174,11 @@ class JSParser:
                 )
             except esprima.Error:
                 continue
+            except Exception:
+                # RecursionError (deep AST -> _esprima_to_dict) or any other unexpected
+                # failure must fall through to the next parser / the regex fallback, never
+                # abort the parse stage and the whole scan.
+                continue
         return None
 
     def _normalize_modern_syntax_for_esprima(self, source: str) -> str:

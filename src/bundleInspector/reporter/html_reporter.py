@@ -9,7 +9,7 @@ import re
 
 from jinja2 import Environment
 
-from bundleInspector.reporter.base import BaseReporter
+from bundleInspector.reporter.base import BaseReporter, mask_secret_findings
 from bundleInspector.storage.models import Report, RiskTier, Severity
 
 
@@ -325,9 +325,17 @@ class HTMLReporter(BaseReporter):
     name = "html"
     extension = ".html"
 
+    def __init__(self, mask_secrets: bool = True, secret_visible_chars: int = 4):
+        self.mask_secrets = mask_secrets
+        self.secret_visible_chars = secret_visible_chars
+
     def generate(self, report: Report) -> str:
         """Generate HTML report."""
         report.compute_summary()
+        # Redact secrets BEFORE rendering the template (objects) and dumping the embedded
+        # JSON -- HTML previously never masked, leaking secrets in clear text.
+        if self.mask_secrets:
+            mask_secret_findings(report, self.secret_visible_chars)
 
         # Sort findings by severity
         severity_order = {
@@ -346,12 +354,11 @@ class HTMLReporter(BaseReporter):
         for asset in report_data.get("assets", []):
             asset.pop("content", None)
             asset.pop("sourcemap_content", None)
-        report_json = re.sub(
-            r"</script>",
-            "<\\/script>",
-            json.dumps(report_data, ensure_ascii=False),
-            flags=re.IGNORECASE,
-        )
+        # Escape every "<" as its JSON unicode escape so NO HTML tag (incl. `</script`
+        # followed by space/slash, `<!--`, `<script`) can break out of the embedded
+        # <script type="application/json"> block. `<` is valid JSON and renders back to
+        # "<" when parsed. re.sub(r"</script>") alone missed the space/slash-terminated forms.
+        report_json = json.dumps(report_data, ensure_ascii=False).replace("<", "\\u003c")
 
         env = Environment(autoescape=True)
         template = env.from_string(HTML_TEMPLATE)

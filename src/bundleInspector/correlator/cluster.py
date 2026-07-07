@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from collections import defaultdict
 from typing import Any
-from urllib.parse import urlparse
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 from bundleInspector.storage.models import Category, Cluster, Finding
 
