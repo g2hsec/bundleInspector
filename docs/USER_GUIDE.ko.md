@@ -343,7 +343,7 @@ BundleInspector는 자신의 UI 조작으로 타겟을 변경하지 않습니다
 
 | 카테고리 | 기본 심각도 | 무엇을 찾나 |
 |---|---|---|
-| **Endpoint** | INFO | `fetch`/`axios`/`request`/`ajax` 호출, `obj.get/post/...`, `XMLHttpRequest.open`, `axios.create` baseURL/기본 헤더, `/api/`·`/v\d+/`·`/graphql`·`/rest/`·`/rpc/`·`/ws/`·`/socket`·`/webhook` 리터럴. 템플릿 리터럴·결합·삼항·상수·명명 객체·`new URL()`/`new Request()`까지 정적 해석. |
+| **Endpoint** | INFO | `fetch`/`axios`/`request`/`ajax` 호출, `obj.get/post/...`, `XMLHttpRequest.open`, `axios.create` baseURL/기본 헤더, `/api/`·`/v\d+/`·`/graphql`·`/rest/`·`/rpc/`·`/ws/`·`/socket`·`/webhook` 리터럴, 그리고 **서버사이드 동적 경로**(`.do`/`.jsp`/`.action`/`.php`/`.aspx`/`.ashx`/`.cgi`…) — 절대/상대 리터럴 또는 `${base}/x.do` 템플릿(Java/Spring/Struts, PHP, ASP.NET). 템플릿 리터럴·결합·삼항·상수·명명 객체·`new URL()`/`new Request()`까지 정적 해석. |
 | **Secret** | HIGH | ~100개 사전 컴파일 키 패턴(AWS, Azure, GCP, OpenAI, Anthropic, GitHub, GitLab, Stripe, Slack, Twilio, Firebase, Supabase, DB 접속 문자열, JWT, PEM/SSH 키 …), 대입 컨텍스트 패턴(`api_key`, `access_token` …), 랜덤 블롭용 섀넌 엔트로피 분석(시크릿 어휘 없으면 LOW로 강등). 플레이스홀더/테스트 값 제외. |
 | **Domain** | MEDIUM | 내부/스테이징 호스트(`dev`/`staging`/`qa`…, `.internal`/`.local`/`.corp`), Kubernetes(`.svc.cluster.local`), Docker/AWS-internal, 사설/루프백 IP, S3/GCS/Azure 버킷. |
 | **Flag** | LOW | 피처 플래그 키워드, SDK(LaunchDarkly, Optimizely, Split, ConfigCat, Unleash …), 플래그 설정 엔드포인트, 플래그 체크 함수, admin/debug 식별자. |
