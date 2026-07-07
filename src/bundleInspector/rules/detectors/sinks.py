@@ -14,7 +14,8 @@ needs taint tracking / DAST), but it precisely points a reviewer at every inject
 
 from __future__ import annotations
 
-from typing import Any, Iterator
+import re
+from typing import Any, Iterator, Optional
 
 from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
 from bundleInspector.storage.models import (
@@ -60,6 +61,51 @@ def _literal_str(node: Any) -> str:
     return ""
 
 
+def _expr_source(node: Any, _depth: int = 0) -> str:
+    """Best-effort source text of a (member/identifier/call) expression, e.g. `item.image_url`,
+    `e.target.result`, `data.filePath` -- shown so a reviewer sees WHAT flows into the sink."""
+    if not isinstance(node, dict) or _depth > 8:
+        return "<expr>"
+    t = node.get("type")
+    if t == "Identifier":
+        return node.get("name") or "<id>"
+    if t == "ThisExpression":
+        return "this"
+    if t == "Literal":
+        return repr(node.get("value"))
+    if t == "MemberExpression":
+        obj = _expr_source(node.get("object"), _depth + 1)
+        prop = node.get("property", {})
+        key = prop.get("name") or (prop.get("value") if isinstance(prop.get("value"), str) else None)
+        return f"{obj}.{key}" if key else f"{obj}[…]"
+    if t == "CallExpression":
+        return f"{_expr_source(node.get('callee'), _depth + 1)}(…)"
+    return "<expr>"
+
+
+_SENTINEL = "\x00"
+# A sentinel (interpolated expression) sitting as the VALUE of a dangerous HTML attribute:
+#   <img src="${x}">  ->  ... src="␀ ;  <a href='${u}'  ;  onerror="${x}"
+_DANGER_ATTR_RE = re.compile(
+    r"""(?ix)
+    (?P<attr>on\w+|src|href|xlink:href|srcdoc|formaction|action|poster|background)
+    \s*=\s*["']?[^"'<>\x00]*\x00
+    """,
+)
+# Event handlers / srcdoc / style / formaction execute directly -> higher severity than a
+# src/href value-injection (which needs an attribute break-out first).
+_EXEC_ATTRS = ("on", "srcdoc", "style", "formaction")
+
+
+def _flatten_concat(node: Any, out: list) -> None:
+    """Flatten a string `+` concatenation into ordered operands (left-to-right)."""
+    if isinstance(node, dict) and node.get("type") == "BinaryExpression" and node.get("operator") == "+":
+        _flatten_concat(node.get("left"), out)
+        _flatten_concat(node.get("right"), out)
+    else:
+        out.append(node)
+
+
 class DomSinkDetector(BaseRule):
     """Detect DOM-XSS and code-injection sinks fed a dynamic argument."""
 
@@ -84,7 +130,7 @@ class DomSinkDetector(BaseRule):
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         yield from self._match_calls(ir)
-        yield from self._match_assignments(ir.raw_ast or {})
+        yield from self._match_ast(ir.raw_ast or {})
 
     # ---------------------------------------------------------------- call-based sinks
 
@@ -157,23 +203,36 @@ class DomSinkDetector(BaseRule):
                 if attr in _DANGEROUS_ATTRS and _is_dynamic(args[1]):
                     yield self._result(f"setAttribute({attr})", "dom_attr_sink", Severity.MEDIUM,
                                        Confidence.LOW, call.line, call.column,
-                                       f"setAttribute('{attr}', <dynamic>) -- attribute-injection sink")
+                                       f"setAttribute('{attr}', {_expr_source(args[1])}) -- attribute-injection sink")
+                continue
+
+            # jQuery .attr('src'|..., value) / .prop(...) with a dangerous attribute + dynamic value.
+            # This is the `$img.attr("src", uploaded.path)` upload -> <img src> stored-XSS pattern.
+            if name in ("attr", "prop") and len(args) >= 2:
+                attr = _literal_str(args[0]).lower()
+                if attr in _DANGEROUS_ATTRS and _is_dynamic(args[1]):
+                    yield self._result(f".{name}({attr})", "dom_attr_sink", Severity.MEDIUM,
+                                       Confidence.MEDIUM, call.line, call.column,
+                                       f"jQuery .{name}('{attr}', {_expr_source(args[1])}) -- attribute-injection "
+                                       f"sink (a dynamic value in a '{attr}' attribute)")
                 continue
 
     # ---------------------------------------------------------------- assignment sinks
 
-    def _match_assignments(self, raw_ast: dict) -> Iterator[RuleResult]:
-        """Iterative walk for `x.innerHTML = <dynamic>` / `x.outerHTML = ...` and
-        `new Function(<dynamic>)` (not captured as plain function calls)."""
+    def _match_ast(self, raw_ast: dict) -> Iterator[RuleResult]:
+        """Iterative walk for `x.innerHTML = <dynamic>` / `x.outerHTML = ...`, `new Function(...)`,
+        and HTML strings (template literals / concatenation) that interpolate a dynamic value into
+        a dangerous HTML attribute (`<img src="${x}">`, `onerror="${x}"` -- DOM/stored-XSS)."""
         if not isinstance(raw_ast, dict):
             return
         stack = [raw_ast]
-        MAX_DEPTH = 100000  # backstop against a pathological tree; nodes, not recursion depth
+        MAX_NODES = 300000  # backstop against a pathological tree; nodes, not recursion depth
         seen = 0
+        seen_attr: set = set()
         while stack:
             node = stack.pop()
             seen += 1
-            if seen > MAX_DEPTH or not isinstance(node, dict):
+            if seen > MAX_NODES or not isinstance(node, dict):
                 continue
             node_type = node.get("type")
 
@@ -203,6 +262,20 @@ class DomSinkDetector(BaseRule):
                             loc.get("line", 0), loc.get("column", 0),
                             "new Function(<dynamic>) (code-injection sink)")
 
+            elif node_type == "TemplateLiteral":
+                quasis = node.get("quasis") or []
+                if any("<" in ((q.get("value") or {}).get("raw") or "") for q in quasis):
+                    yield from self._html_attr_injections(
+                        self._template_text(node), node.get("expressions") or [], node, seen_attr)
+
+            elif node_type == "BinaryExpression" and node.get("operator") == "+":
+                parts: list = []
+                _flatten_concat(node, parts)
+                if any("<" in _literal_str(p) for p in parts):
+                    text = "".join(_literal_str(p) if _literal_str(p) else _SENTINEL for p in parts)
+                    exprs = [p for p in parts if not _literal_str(p)]
+                    yield from self._html_attr_injections(text, exprs, node, seen_attr)
+
             # push children
             for key, value in node.items():
                 if key in ("loc", "range", "raw"):
@@ -213,6 +286,40 @@ class DomSinkDetector(BaseRule):
                     for item in value:
                         if isinstance(item, dict):
                             stack.append(item)
+
+    # ---------------------------------------------------------------- HTML attribute injection
+
+    def _template_text(self, node: dict) -> str:
+        """Reconstruct a template literal's raw text with one _SENTINEL per ${expression}."""
+        quasis = node.get("quasis") or []
+        parts: list[str] = []
+        for i, q in enumerate(quasis):
+            parts.append((q.get("value") or {}).get("raw") or "")
+            if i < len(quasis) - 1:
+                parts.append(_SENTINEL)
+        return "".join(parts)
+
+    def _html_attr_injections(self, text: str, exprs: list, node: dict, seen: set) -> Iterator[RuleResult]:
+        """Emit a finding for each dynamic expression interpolated as the value of a dangerous
+        HTML attribute inside an HTML string being built (`<img src="${item.image_url}">`)."""
+        loc = (node.get("loc") or {}).get("start", {})
+        line, col = loc.get("line", 0), loc.get("column", 0)
+        for m in _DANGER_ATTR_RE.finditer(text):
+            sent_idx = text[:m.end()].count(_SENTINEL) - 1
+            if not (0 <= sent_idx < len(exprs)):
+                continue
+            attr = m.group("attr").lower()
+            source = _expr_source(exprs[sent_idx])
+            key = (line, attr, source)
+            if key in seen:
+                continue
+            seen.add(key)
+            yield self._result(
+                f"html {attr}= injection", "dom_attr_injection", Severity.HIGH, Confidence.MEDIUM,
+                line, col,
+                f"Dynamic value `{source}` interpolated into a '{attr}' HTML attribute "
+                f"(e.g. <tag {attr}=\"${{{source}}}\">) built for a DOM sink -- DOM/stored-XSS if "
+                f"`{source}` is user- or upload-controlled")
 
     # ---------------------------------------------------------------- helper
 
