@@ -237,7 +237,7 @@ class RuleConfig(BaseModel):
     """Rule engine configuration."""
     # Enabled categories
     enabled_categories: list[str] = Field(default_factory=lambda: [
-        "endpoint", "secret", "domain", "flag", "debug"
+        "endpoint", "secret", "domain", "flag", "debug", "sink", "upload"
     ])
 
     # Custom rules file

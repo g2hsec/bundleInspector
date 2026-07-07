@@ -412,6 +412,8 @@ class SARIFReporter(BaseReporter):
             Category.DOMAIN: "JSFINDER003",
             Category.FLAG: "JSFINDER004",
             Category.DEBUG: "JSFINDER005",
+            Category.SINK: "JSFINDER006",
+            Category.UPLOAD: "JSFINDER007",
         }
 
         return category_map.get(finding.category, "JSFINDER002")

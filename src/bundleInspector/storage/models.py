@@ -38,6 +38,8 @@ class Category(str, Enum):
     DOMAIN = "domain"
     FLAG = "flag"
     DEBUG = "debug"
+    SINK = "sink"        # DOM-XSS / code-injection sinks (innerHTML, .html(), eval, ...)
+    UPLOAD = "upload"    # file-upload surface (FormData, client-side-only validation)
 
 
 class RiskTier(str, Enum):

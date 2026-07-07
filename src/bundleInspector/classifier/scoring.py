@@ -10,9 +10,11 @@ from bundleInspector.storage.models import Category, Confidence, Finding, Severi
 # Impact weights by category
 CATEGORY_IMPACT = {
     Category.SECRET: 1.0,
+    Category.SINK: 0.85,
     Category.DEBUG: 0.8,
-    Category.ENDPOINT: 0.5,
     Category.DOMAIN: 0.6,
+    Category.UPLOAD: 0.6,
+    Category.ENDPOINT: 0.5,
     Category.FLAG: 0.3,
 }
 

@@ -48,6 +48,8 @@ class RuleEngine:
         from bundleInspector.rules.detectors.debug import DebugDetector
         from bundleInspector.parser.chunk_analyzer import ChunkAnalyzer
         from bundleInspector.rules.detectors.routes import RouteDetector
+        from bundleInspector.rules.detectors.sinks import DomSinkDetector
+        from bundleInspector.rules.detectors.uploads import FileUploadDetector
         from bundleInspector.rules.context_filter import ContextFilter
 
         self.register(EndpointDetector())
@@ -57,6 +59,8 @@ class RuleEngine:
         self.register(DebugDetector())
         self.register(ChunkAnalyzer())
         self.register(RouteDetector())
+        self.register(DomSinkDetector())
+        self.register(FileUploadDetector())
 
         # Initialize context filter for false positive reduction
         self._context_filter = ContextFilter()
