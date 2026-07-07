@@ -297,7 +297,10 @@ def build_commonjs_re_export_bindings(ir: Any) -> list[dict[str, object]]:
                     if isinstance(item, dict):
                         _visit(item)
 
-    _visit(raw_ast)
+    try:
+        _visit(raw_ast)
+    except RecursionError:
+        pass  # deep/obfuscated AST: keep whatever was collected before the too-deep branch
     return bindings
 
 
@@ -350,7 +353,10 @@ def build_commonjs_require_bindings(ir: Any) -> list[dict[str, object]]:
                     if isinstance(item, dict):
                         _visit(item, scope)
 
-    _visit(raw_ast)
+    try:
+        _visit(raw_ast)
+    except RecursionError:
+        pass  # deep/obfuscated AST: keep whatever was collected before the too-deep branch
     return bindings
 
 
@@ -414,7 +420,10 @@ def build_commonjs_export_metadata(ir: Any) -> tuple[list[str], dict[str, list[s
                     if isinstance(item, dict):
                         _visit(item)
 
-    _visit(raw_ast)
+    try:
+        _visit(raw_ast)
+    except RecursionError:
+        pass  # deep/obfuscated AST: keep whatever was collected before the too-deep branch
     return sorted(export_names), {
         export_name: sorted(scopes)
         for export_name, scopes in export_scopes.items()
@@ -461,7 +470,10 @@ def build_commonjs_default_object_export_members(ir: Any) -> list[str]:
                     if isinstance(item, dict):
                         _visit(item)
 
-    _visit(raw_ast)
+    try:
+        _visit(raw_ast)
+    except RecursionError:
+        pass  # deep/obfuscated AST: keep whatever was collected before the too-deep branch
     return sorted(members)
 
 
@@ -519,7 +531,10 @@ def build_commonjs_named_object_export_members(ir: Any) -> dict[str, list[str]]:
                     if isinstance(item, dict):
                         _visit(item)
 
-    _visit(raw_ast)
+    try:
+        _visit(raw_ast)
+    except RecursionError:
+        pass  # deep/obfuscated AST: keep whatever was collected before the too-deep branch
     return {
         export_name: sorted(member_names)
         for export_name, member_names in members.items()

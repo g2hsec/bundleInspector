@@ -297,7 +297,10 @@ class Correlator:
             if not imports:
                 continue
 
-            for import_source in imports:
+            # sorted(): imports is a set; the max_edges cap below makes WHICH edges survive
+            # depend on iteration order, so an unsorted set gave PYTHONHASHSEED-dependent,
+            # run-to-run-different correlation counts -> non-deterministic risk scores/tiers.
+            for import_source in sorted(imports):
                 normalized_import = self._normalize_import_source(import_source)
                 if not normalized_import:
                     continue
@@ -337,7 +340,8 @@ class Correlator:
             if not dynamic_imports:
                 continue
 
-            for import_source in dynamic_imports:
+            # sorted(): deterministic edge selection under the max_edges cap (see _add_import_edges).
+            for import_source in sorted(dynamic_imports):
                 normalized_import = self._normalize_import_source(import_source)
                 if not normalized_import:
                     continue

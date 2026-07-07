@@ -47,7 +47,14 @@ class AnalysisContext:
         start = max(0, line - context_lines - 1)
         end = min(len(lines), line + context_lines)
 
-        snippet_lines = lines[start:end]
+        # Cap per-line length: a minified single-line bundle is ONE multi-MB "line", so an
+        # uncapped snippet is the entire file -- copied into EVERY finding's evidence, that is
+        # O(findings x file-size) memory that OOMs the scan (thousands of findings x MBs).
+        _MAX_SNIPPET_LINE = 500
+        snippet_lines = [
+            ln if len(ln) <= _MAX_SNIPPET_LINE else ln[:_MAX_SNIPPET_LINE] + "..."
+            for ln in lines[start:end]
+        ]
         snippet = "\n".join(snippet_lines)
 
         return snippet, (start + 1, end)

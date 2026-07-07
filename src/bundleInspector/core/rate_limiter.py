@@ -34,13 +34,21 @@ class RateLimiter:
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
     def __post_init__(self):
-        self._semaphore = asyncio.Semaphore(self.max_concurrent)
+        # max(1, ...): a negative max_concurrent (settable via config file) would raise
+        # ValueError here and abort the whole scan at limiter construction.
+        self._semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
 
     def _get_domain(self, url: str) -> str:
-        """Extract domain from URL, normalizing default ports."""
-        parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
-        port = parsed.port
+        """Extract domain from URL, normalizing default ports. Never raises on a malformed
+        URL -- urlparse raises on an unbalanced IPv6 bracket, and .port raises ValueError on
+        an out-of-range port (e.g. :99999); an unhandled raise here runs OUTSIDE download_one's
+        inner try and would silently drop the JS asset from the scan."""
+        try:
+            parsed = urlparse(url)
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except (ValueError, TypeError):
+            return url or ""
         if port and not (
             (parsed.scheme == "http" and port == 80)
             or (parsed.scheme == "https" and port == 443)
@@ -187,10 +195,15 @@ class SlidingWindowRateLimiter:
             raise ValueError("max_requests must be at least 1")
 
     def _get_domain(self, url: str) -> str:
-        """Extract domain from URL, normalizing default ports."""
-        parsed = urlparse(url)
-        hostname = (parsed.hostname or "").lower()
-        port = parsed.port
+        """Extract domain from URL, normalizing default ports. Never raises on a malformed
+        URL (unbalanced bracket / out-of-range port) -- an unhandled raise here drops the
+        JS asset from the scan."""
+        try:
+            parsed = urlparse(url)
+            hostname = (parsed.hostname or "").lower()
+            port = parsed.port
+        except (ValueError, TypeError):
+            return url or ""
         if port and not (
             (parsed.scheme == "http" and port == 80)
             or (parsed.scheme == "https" and port == 443)

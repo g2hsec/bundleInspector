@@ -160,77 +160,98 @@ class AssetAnalyzer:
         findings: list[Finding],
     ) -> None:
         """Attach IR and runtime context metadata used by correlators/reporters."""
-        commonjs_require_bindings = build_commonjs_require_bindings(ir)
-        commonjs_require_sources = [
-            str(binding.get("source") or "").strip()
-            for binding in commonjs_require_bindings
-            if str(binding.get("source") or "").strip()
-        ]
-        commonjs_re_export_bindings = build_commonjs_re_export_bindings(ir)
-        re_export_bindings = [
-            *build_re_export_bindings(ir),
-            *commonjs_re_export_bindings,
-        ]
-        re_export_sources = [
-            str(binding.get("source") or "").strip()
-            for binding in re_export_bindings
-            if str(binding.get("source") or "").strip()
-        ]
-        imports = list(dict.fromkeys([
-            *[imp.source for imp in ir.imports if imp.source],
-            *commonjs_require_sources,
-            *re_export_sources,
-        ]))
-        dynamic_imports = [imp.source for imp in ir.imports if imp.is_dynamic and imp.source]
-        import_bindings = [
-            *self._build_import_bindings(ir),
-            *commonjs_require_bindings,
-        ]
+        # Safe defaults: if ANY of the metadata builders below RecursionError on a deeply
+        # nested/obfuscated raw AST (the export_scopes / scope-map / alias-binding walkers
+        # recurse over the uncapped raw_ast), degrade to whatever was computed so far rather
+        # than aborting ALL metadata for the asset (which would silently lose the
+        # correlation metadata inter-module detection + risk scoring rely on).
+        imports = []
+        dynamic_imports = []
+        import_bindings = []
+        re_export_bindings = []
+        exports = []
+        export_scopes = {}
+        default_object_exports = []
+        named_object_exports = {}
+        call_names = []
+        scoped_calls = {}
+        scope_parents = {}
         function_defs = ir.function_defs
-        scope_parents = self._build_scope_parent_map(function_defs)
-        if ir.raw_ast:
-            seen_binding_keys = {
-                self._import_binding_key(binding)
-                for binding in import_bindings
-            }
-            for _ in range(4):
-                alias_bindings = self._collect_import_alias_bindings(
-                    ir.raw_ast,
-                    import_bindings,
-                    scope_parents,
-                )
-                fresh_bindings = [
-                    binding
-                    for binding in alias_bindings
-                    if self._import_binding_key(binding) not in seen_binding_keys
-                ]
-                if not fresh_bindings:
-                    break
-                import_bindings.extend(fresh_bindings)
-                seen_binding_keys.update(
-                    self._import_binding_key(binding)
-                    for binding in fresh_bindings
-                )
-        commonjs_exports, commonjs_export_scopes = build_commonjs_export_metadata(ir)
-        default_object_exports = list(dict.fromkeys([
-            *build_default_object_export_members(ir),
-            *build_commonjs_default_object_export_members(ir),
-        ]))
-        named_object_exports = self._merge_named_object_exports(
-            build_named_object_export_members(ir),
-            build_commonjs_named_object_export_members(ir),
-        )
-        exports = list(dict.fromkeys([
-            *[exp.name for exp in ir.exports if exp.name],
-            *commonjs_exports,
-        ]))
-        export_scopes = self._merge_export_scopes(
-            build_export_scope_map(ir),
-            commonjs_export_scopes,
-        )
-        call_names = [call.full_name or call.name for call in ir.function_calls if (call.full_name or call.name)]
-        scoped_calls = self._build_scoped_calls(ir)
         call_graph = ir.call_graph
+        try:
+            commonjs_require_bindings = build_commonjs_require_bindings(ir)
+            commonjs_require_sources = [
+                str(binding.get("source") or "").strip()
+                for binding in commonjs_require_bindings
+                if str(binding.get("source") or "").strip()
+            ]
+            commonjs_re_export_bindings = build_commonjs_re_export_bindings(ir)
+            re_export_bindings = [
+                *build_re_export_bindings(ir),
+                *commonjs_re_export_bindings,
+            ]
+            re_export_sources = [
+                str(binding.get("source") or "").strip()
+                for binding in re_export_bindings
+                if str(binding.get("source") or "").strip()
+            ]
+            imports = list(dict.fromkeys([
+                *[imp.source for imp in ir.imports if imp.source],
+                *commonjs_require_sources,
+                *re_export_sources,
+            ]))
+            dynamic_imports = [imp.source for imp in ir.imports if imp.is_dynamic and imp.source]
+            import_bindings = [
+                *self._build_import_bindings(ir),
+                *commonjs_require_bindings,
+            ]
+            function_defs = ir.function_defs
+            scope_parents = self._build_scope_parent_map(function_defs)
+            if ir.raw_ast:
+                seen_binding_keys = {
+                    self._import_binding_key(binding)
+                    for binding in import_bindings
+                }
+                for _ in range(4):
+                    alias_bindings = self._collect_import_alias_bindings(
+                        ir.raw_ast,
+                        import_bindings,
+                        scope_parents,
+                    )
+                    fresh_bindings = [
+                        binding
+                        for binding in alias_bindings
+                        if self._import_binding_key(binding) not in seen_binding_keys
+                    ]
+                    if not fresh_bindings:
+                        break
+                    import_bindings.extend(fresh_bindings)
+                    seen_binding_keys.update(
+                        self._import_binding_key(binding)
+                        for binding in fresh_bindings
+                    )
+            commonjs_exports, commonjs_export_scopes = build_commonjs_export_metadata(ir)
+            default_object_exports = list(dict.fromkeys([
+                *build_default_object_export_members(ir),
+                *build_commonjs_default_object_export_members(ir),
+            ]))
+            named_object_exports = self._merge_named_object_exports(
+                build_named_object_export_members(ir),
+                build_commonjs_named_object_export_members(ir),
+            )
+            exports = list(dict.fromkeys([
+                *[exp.name for exp in ir.exports if exp.name],
+                *commonjs_exports,
+            ]))
+            export_scopes = self._merge_export_scopes(
+                build_export_scope_map(ir),
+                commonjs_export_scopes,
+            )
+            call_names = [call.full_name or call.name for call in ir.function_calls if (call.full_name or call.name)]
+            scoped_calls = self._build_scoped_calls(ir)
+            call_graph = ir.call_graph
+        except RecursionError:
+            logger.debug("annotation_recursion_degraded", url=(getattr(asset, 'url', '') or '')[:120])
 
         for finding in findings:
             finding.metadata.setdefault("imports", imports)
