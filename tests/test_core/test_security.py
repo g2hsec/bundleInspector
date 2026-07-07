@@ -130,6 +130,40 @@ class TestIPBlocking:
         assert is_ip_blocked("not-an-ip") is False
 
 
+class TestAllowPrivateIps:
+    """Opt-in SSRF bypass for authorized internal scanning (--allow-private-ips)."""
+
+    def test_private_ranges_permitted_when_flag_set(self):
+        # RFC1918 / CGNAT / IPv6-ULA are blocked by default but allowed with the opt-in.
+        for ip in ("10.100.166.159", "192.168.1.1", "172.16.0.1", "100.64.0.1", "fc00::1"):
+            assert is_ip_blocked(ip) is True                       # default: blocked
+            assert is_ip_blocked(ip, allow_private_ips=True) is False  # opt-in: allowed
+
+    def test_loopback_and_metadata_stay_blocked_with_flag(self):
+        # The opt-in must NOT open loopback / link-local (cloud metadata) / multicast / reserved.
+        for ip in ("127.0.0.1", "::1", "169.254.169.254", "169.254.0.1",
+                   "0.0.0.0", "224.0.0.1", "240.0.0.1"):
+            assert is_ip_blocked(ip, allow_private_ips=True) is True
+
+    def test_is_url_safe_allows_private_target_with_flag(self):
+        safe, _ = is_url_safe("http://10.100.166.159:18033/app.js",
+                              resolve_dns=False, allow_private_ips=True)
+        assert safe is True
+        # ...but still refuses without the flag,
+        blocked, _ = is_url_safe("http://10.100.166.159:18033/app.js", resolve_dns=False)
+        assert blocked is False
+
+    def test_is_url_safe_still_blocks_metadata_and_localhost_with_flag(self):
+        for url in ("http://169.254.169.254/latest/meta-data/",
+                    "http://127.0.0.1:8080/", "http://localhost/admin"):
+            safe, _ = is_url_safe(url, resolve_dns=False, allow_private_ips=True)
+            assert safe is False
+
+    def test_config_default_off(self):
+        from bundleInspector.config import Config
+        assert Config().scope.allow_private_ips is False
+
+
 class TestHostBlocking:
     """Tests for hostname blocking."""
 

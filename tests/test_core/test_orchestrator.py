@@ -215,7 +215,7 @@ async def test_crawl_uses_multi_page_collectors_when_depth_enabled(monkeypatch):
     ):
         fake.instances.clear()
 
-    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
     monkeypatch.setattr("bundleInspector.core.orchestrator.StaticCollector", FakeStaticCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.MultiPageStaticCollector", FakeMultiPageStaticCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.HeadlessCollector", FakeHeadlessCollector)
@@ -239,7 +239,7 @@ async def test_run_integrates_headless_and_manifest_discovery_into_real_pipeline
     config.ensure_dirs()
     orchestrator = Orchestrator(config)
 
-    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
     monkeypatch.setattr("bundleInspector.core.orchestrator.StaticCollector", IntegrationStaticCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.HeadlessCollector", IntegrationHeadlessCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.ManifestCollector", IntegrationManifestCollector)
@@ -1648,7 +1648,7 @@ async def test_stage_crawl_skips_completed_seed_collector_phases(monkeypatch):
 
     checkpoint_states: list[dict] = []
 
-    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
     monkeypatch.setattr("bundleInspector.core.orchestrator.MultiPageStaticCollector", PhaseStaticCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.HeadlessMultiPageCollector", PhaseHeadlessMultiPageCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.ManifestCollector", PhaseManifestCollector)
@@ -1688,7 +1688,7 @@ async def test_stage_crawl_checkpoints_partially_discovered_refs_inside_phase(mo
 
     checkpoint_payloads: list[tuple[list[str], dict]] = []
 
-    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
     monkeypatch.setattr("bundleInspector.core.orchestrator.StaticCollector", StreamingStaticCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.ManifestCollector", FakeManifestCollector)
 
@@ -1726,7 +1726,7 @@ async def test_stage_crawl_persists_page_level_phase_state_and_restores_it(monke
     checkpoint_states: list[dict] = []
     ResumablePhaseStaticCollector.loaded_states.clear()
 
-    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
     monkeypatch.setattr("bundleInspector.core.orchestrator.MultiPageStaticCollector", ResumablePhaseStaticCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.ManifestCollector", FakeManifestCollector)
 
@@ -1772,7 +1772,7 @@ async def test_stage_crawl_checkpoints_partial_refs_with_mid_page_progress_state
 
     checkpoint_payloads: list[tuple[list[str], dict]] = []
 
-    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
     monkeypatch.setattr("bundleInspector.core.orchestrator.MultiPageStaticCollector", MidPageProgressStaticCollector)
     monkeypatch.setattr("bundleInspector.core.orchestrator.ManifestCollector", FakeManifestCollector)
 
