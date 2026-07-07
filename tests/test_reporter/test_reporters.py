@@ -221,9 +221,12 @@ def test_html_reporter_embeds_machine_readable_json_without_raw_asset_content():
     html = HTMLReporter().generate(report)
     embedded_json = html.split('<script id="bundleInspector-report-data" type="application/json">', 1)[1].split("</script>", 1)[0]
 
-    assert '<\\/script><script>alert(1)<\\/script>' in embedded_json
+    # All "<" escaped to <: no raw </script> or <script> can break out.
+    assert "</script>" not in embedded_json
+    assert "<script>" not in embedded_json
+    assert "\\u003c" in embedded_json
     assert "secret raw content" not in embedded_json
-    data = json.loads(embedded_json.replace("<\\/script>", "</script>"))
+    data = json.loads(embedded_json)  # < is valid JSON, decodes back to "<"
     assert data["findings"][0]["extracted_value"] == '</script><script>alert(1)</script>'
     assert "content" not in data["assets"][0]
 
@@ -253,8 +256,11 @@ def test_html_reporter_escapes_script_end_tag_case_insensitively():
     html = HTMLReporter().generate(report)
     embedded_json = html.split('<script id="bundleInspector-report-data" type="application/json">', 1)[1].split("</script>", 1)[0]
 
+    # Every "<" is escaped to its JSON unicode escape, so no </script variant (any case,
+    # any following char) can break out of the embedded <script> block.
     assert "</SCRIPT>" not in embedded_json
-    assert "<\\/script>" in embedded_json
+    assert "<" not in embedded_json
+    assert "\\u003c/SCRIPT>" in embedded_json
 
 
 def test_html_reporter_shows_original_source_location_and_snippet():
