@@ -487,7 +487,7 @@ asyncio.run(main())
 3. **Normalize** — beautify, 라인 매퍼 생성, 인라인 + 외부 소스맵 해석.
 4. **Parse** — AST 생성(esprima 또는 선택적 acorn).
 5. **Analyze** — 룰 엔진 + 컨텍스트 필터 FP 감소 + enh1 게이팅 주석 + 메타데이터/위치 매핑.
-6. **Correlate** — enh2 휴면 엔드포인트 주석 후 상관 그래프(엣지 + 클러스터) 구축.
+6. **Correlate** — enh2 휴면 엔드포인트 주석 후 상관 그래프(엣지 + 클러스터) 구축. 엣지 유형에 same-file·import/call-chain·runtime·secret↔endpoint 및 **taint**가 있습니다 — 같은 자산 안에서 **파일 업로드 표면(또는 업로드/파일 엔드포인트) → 파일/이미지/업로드로 보이는 값이 흘러드는 DOM `src`/`href` sink**를 자동 연결해 `업로드 → <img src>` 저장형/DOM XSS 체인을 드러냅니다(휴리스틱, MEDIUM 신뢰도 — 연결된 sink는 위험 점수도 상향).
 7. **Classify** — 발견별 위험 등급·점수·영향·가능성 부여.
 8. **Report** — 조립·요약·발견/리포트/체크포인트 영속화.
 

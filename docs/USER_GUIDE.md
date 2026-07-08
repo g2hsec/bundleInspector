@@ -487,7 +487,7 @@ The `scan` pipeline runs eight stages (the `analyze` command runs an equivalent 
 3. **Normalize** — beautify, build line mappers, resolve inline + external source maps.
 4. **Parse** — build the AST (esprima or optional acorn).
 5. **Analyze** — run the rule engine + context-filter FP reduction + enh1 gating annotation + metadata/position mapping.
-6. **Correlate** — enh2 dormant-endpoint annotation, then build the correlation graph (edges + clusters).
+6. **Correlate** — enh2 dormant-endpoint annotation, then build the correlation graph (edges + clusters). Edge types include same-file, import/call-chain, runtime, secret↔endpoint, and **taint** — a light dataflow link that auto-connects a **file-upload surface (or upload/file endpoint) → a DOM `src`/`href` sink fed a file/image/upload-looking value** in the same asset, surfacing the `upload → <img src>` stored/DOM-XSS chain (heuristic, MEDIUM confidence — a correlated sink is also risk-scored higher).
 7. **Classify** — assign risk tier, risk score, impact & likelihood per finding.
 8. **Report** — assemble, summarize, and persist findings/report/checkpoints.
 
