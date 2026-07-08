@@ -201,9 +201,11 @@ class DomSinkDetector(BaseRule):
             if name == "setAttribute" and len(args) >= 2:
                 attr = _literal_str(args[0]).lower()
                 if attr in _DANGEROUS_ATTRS and _is_dynamic(args[1]):
+                    src = _expr_source(args[1])
                     yield self._result(f"setAttribute({attr})", "dom_attr_sink", Severity.MEDIUM,
                                        Confidence.LOW, call.line, call.column,
-                                       f"setAttribute('{attr}', {_expr_source(args[1])}) -- attribute-injection sink")
+                                       f"setAttribute('{attr}', {src}) -- attribute-injection sink",
+                                       metadata={"sink_source": src, "sink_attr": attr})
                 continue
 
             # jQuery .attr('src'|..., value) / .prop(...) with a dangerous attribute + dynamic value.
@@ -211,10 +213,12 @@ class DomSinkDetector(BaseRule):
             if name in ("attr", "prop") and len(args) >= 2:
                 attr = _literal_str(args[0]).lower()
                 if attr in _DANGEROUS_ATTRS and _is_dynamic(args[1]):
+                    src = _expr_source(args[1])
                     yield self._result(f".{name}({attr})", "dom_attr_sink", Severity.MEDIUM,
                                        Confidence.MEDIUM, call.line, call.column,
-                                       f"jQuery .{name}('{attr}', {_expr_source(args[1])}) -- attribute-injection "
-                                       f"sink (a dynamic value in a '{attr}' attribute)")
+                                       f"jQuery .{name}('{attr}', {src}) -- attribute-injection "
+                                       f"sink (a dynamic value in a '{attr}' attribute)",
+                                       metadata={"sink_source": src, "sink_attr": attr})
                 continue
 
     # ---------------------------------------------------------------- assignment sinks
@@ -319,12 +323,14 @@ class DomSinkDetector(BaseRule):
                 line, col,
                 f"Dynamic value `{source}` interpolated into a '{attr}' HTML attribute "
                 f"(e.g. <tag {attr}=\"${{{source}}}\">) built for a DOM sink -- DOM/stored-XSS if "
-                f"`{source}` is user- or upload-controlled")
+                f"`{source}` is user- or upload-controlled",
+                metadata={"sink_source": source, "sink_attr": attr})
 
     # ---------------------------------------------------------------- helper
 
     def _result(self, sink: str, value_type: str, severity: Severity, confidence: Confidence,
-                line: int, column: int, description: str) -> RuleResult:
+                line: int, column: int, description: str,
+                metadata: Optional[dict] = None) -> RuleResult:
         return RuleResult(
             rule_id=self.id,
             category=self.category,
@@ -338,4 +344,5 @@ class DomSinkDetector(BaseRule):
             column=column,
             ast_node_type="",
             tags=["dom_sink", value_type],
+            metadata=metadata or {},
         )

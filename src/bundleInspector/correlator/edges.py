@@ -102,3 +102,22 @@ def create_runtime_edge(
         metadata={"context": context},
     )
 
+
+def create_taint_edge(
+    source_id: str,
+    target_id: str,
+    reasoning: str,
+    sink_source: str = "",
+    sink_attr: str = "",
+) -> Edge:
+    """Create a light-taint edge: a source (file-upload surface / response field) reaching a
+    DOM src/href sink in the same asset -- the upload -> <img src> stored-XSS chain."""
+    return Edge(
+        source_id=source_id,
+        target_id=target_id,
+        edge_type=EdgeType.TAINT,
+        confidence=Confidence.MEDIUM,
+        reasoning=reasoning,
+        metadata={"sink_source": sink_source, "sink_attr": sink_attr, "chain": "upload_to_dom_sink"},
+    )
+

@@ -78,6 +78,7 @@ class EdgeType(str, Enum):
     CONFIG = "config"
     ENV = "env"
     RUNTIME = "runtime"
+    TAINT = "taint"  # light dataflow: a source (upload surface / response field) reaches a DOM sink
 
 
 # =============================================================================

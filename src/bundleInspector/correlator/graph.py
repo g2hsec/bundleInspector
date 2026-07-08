@@ -12,6 +12,7 @@ from bundleInspector.correlator.edges import (
     create_same_file_edge,
     create_config_edge,
     create_runtime_edge,
+    create_taint_edge,
 )
 from bundleInspector.correlator.cluster import ClusterBuilder
 from bundleInspector.storage.models import (
@@ -162,6 +163,9 @@ class Correlator:
 
             # Create secret-endpoint edges
             self._add_secret_endpoint_edges(graph, findings)
+
+            # Light taint: connect an upload surface / response field to a DOM src/href sink
+            self._add_taint_chain_edges(graph, by_file)
 
             # Build clusters
             graph.clusters = self._cluster_builder.build(findings)
@@ -1620,6 +1624,74 @@ class Correlator:
                             },
                         ))
                         count += 1
+
+    # Upload-source and media-sink recognition for the light taint pass.
+    _TAINT_UPLOAD_EP_HINTS = ("upload", "file", "attach", "image", "img", "photo", "avatar")
+    _TAINT_SINK_ATTRS = frozenset({"src", "href", "srcdoc", "poster", "background", "xlink:href"})
+    _TAINT_SOURCE_HINTS = ("image", "img", "photo", "avatar", "thumb", "file", "upload", "attach",
+                           "path", "url", "src", "result", "response", "res", "data", "content")
+
+    def _add_taint_chain_edges(
+        self,
+        graph: CorrelationGraph,
+        by_file: dict[str, list[Finding]],
+    ) -> None:
+        """Light taint correlation: within one asset, connect a file-upload surface (or an
+        upload/file/image endpoint) to a DOM `src`/`href`/`on*` sink whose interpolated value
+        looks like file/image/upload/response data -- automatically surfacing the
+        `upload -> <img src>` stored/DOM-XSS chain a tester would otherwise assemble by hand.
+        Name/context heuristic (not full dataflow) -> MEDIUM confidence. Iterates lists in a
+        fixed order, so edge selection under the cap is deterministic."""
+        max_edges = 50
+        count = 0
+
+        for file_url, file_findings in by_file.items():
+            sources = []
+            for f in file_findings:
+                if f.category == Category.UPLOAD:
+                    sources.append(f)
+                elif f.category == Category.ENDPOINT:
+                    v = (f.extracted_value or "").lower()
+                    if any(h in v for h in self._TAINT_UPLOAD_EP_HINTS):
+                        sources.append(f)
+            if not sources:
+                continue
+
+            for sink in file_findings:
+                if sink.category != Category.SINK:
+                    continue
+                if sink.value_type not in ("dom_attr_injection", "dom_attr_sink"):
+                    continue
+                attr = str(sink.metadata.get("sink_attr", "")).lower()
+                src_expr = str(sink.metadata.get("sink_source", "")).lower()
+                if attr not in self._TAINT_SINK_ATTRS:
+                    continue
+                if not any(h in src_expr for h in self._TAINT_SOURCE_HINTS):
+                    continue
+
+                if count >= max_edges:
+                    return
+                # One representative source per sink (prefer an explicit upload surface over an
+                # upload/file endpoint) so a widget validated in two places is not linked twice.
+                source = next(
+                    (s for s in sources if s.category == Category.UPLOAD), sources[0]
+                )
+                if source.category == Category.UPLOAD:
+                    label = f"file-upload surface ({source.extracted_value})"
+                else:
+                    label = f"upload/file endpoint {source.extracted_value[:40]}"
+                graph.add_edge(create_taint_edge(
+                    source.id,
+                    sink.id,
+                    reasoning=(
+                        f"Potential upload->stored/DOM-XSS chain: {label} + a dynamic "
+                        f"'{sink.metadata.get('sink_attr', '')}' value "
+                        f"({sink.metadata.get('sink_source', '')}) reaching a DOM sink in the "
+                        f"same asset -- verify the value is user/upload-controlled and unencoded"),
+                    sink_source=str(sink.metadata.get("sink_source", "")),
+                    sink_attr=str(sink.metadata.get("sink_attr", "")),
+                ))
+                count += 1
 
     def _collect_imports(self, findings: list[Finding]) -> set[str]:
         """Collect unique import sources from finding metadata."""
