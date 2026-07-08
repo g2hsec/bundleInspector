@@ -66,6 +66,29 @@ def test_render_is_plain_text_with_headers():
     assert "CANDIDATE chain" in text
 
 
+def test_vendor_chain_tagged_and_optionally_filtered():
+    # a confirmed flow in a jquery library file must be tagged and demoted, and hidden under
+    # first_party_only -- but an app-file chain stays.
+    app = _f(Category.SINK, "taint_flow", 819, file="shopfront.js", meta={
+        "source_kind": "ajax_response", "source_line": 624, "sink": ".html()",
+        "sink_line": 819, "sink_source": "couponCount", "flow_path": ["s", "v", "sink"]})
+    vend = _f(Category.SINK, "taint_flow", 1980, file="jquery-3.7.1.min.js", meta={
+        "source_kind": "dom_input", "source_line": 1970, "sink": "innerHTML=",
+        "sink_line": 1980, "sink_source": "x", "flow_path": ["s", "v", "sink"]})
+    rpt = Report(findings=[app, vend], correlations=[])
+
+    chains = build_chains(rpt)
+    by_file = {c["file"].rsplit("/", 1)[-1]: c for c in chains}
+    assert by_file["jquery-3.7.1.min.js"]["third_party"] == "jquery"
+    assert by_file["shopfront.js"]["third_party"] is None
+    assert "[3p:jquery" in render_chains(chains)          # labelled
+    assert chains[-1]["file"].endswith("jquery-3.7.1.min.js")  # vendor sorted last
+
+    fp_only = build_chains(rpt, first_party_only=True)
+    assert all(not c["third_party"] for c in fp_only)     # vendor hidden
+    assert any(c["file"].endswith("shopfront.js") for c in fp_only)  # app kept
+
+
 def test_no_crash_on_empty_and_malformed():
     assert render_chains(build_chains(Report(findings=[], correlations=[]))) == ""
     # taint_flow with no metadata, correlation with dangling ids -> no exception

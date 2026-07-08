@@ -142,6 +142,7 @@ Crawl and analyze one or more live target URLs (at least one URL required).
 | `--fail-on {info,low,medium,high,critical}` | — | Exit code **2** if any finding is at or above this severity (CI gate) |
 | `--allow-private-ips` | off | Allow a target that resolves to a **private/internal** IP (RFC1918/CGNAT/ULA) for **authorized** internal/dev-server testing. Loopback, cloud-metadata (`169.254.169.254`), multicast & reserved ranges stay blocked. |
 | `--chains` | off | After the findings, print unified **ATTACK CHAINS** — the sink indicator + the CONFIRMED dataflow (`taint_flow`) + the upload↔sink correlation grouped per sink, so the whole `source → flow → sink` path (plus linked upload surface and same-file endpoints for replay) reads as one chain. Confirmed vs name-heuristic **candidate** chains are labelled. |
+| `--first-party-only` | off | **Noise reduction (non-destructive).** Findings in third-party library files (`jquery`, `swiper`, `bootstrap`, `jsencrypt`, `/vendor/`…) are always **tagged** `[3p:<lib>]`, **sorted to the bottom**, and **kept in the saved report**. This flag additionally **hides** them from the *console* view for cleaner triage — nothing is dropped from the report, and detection is unchanged. |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | Output verbosity controls |
 
 ### `analyze <paths…>` — local, no network

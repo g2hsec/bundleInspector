@@ -142,6 +142,7 @@ bundleInspector [scan | analyze | convert | version]
 | `--fail-on {info,low,medium,high,critical}` | — | 이 심각도 이상 발견 시 종료 코드 **2** (CI 게이트) |
 | `--allow-private-ips` | off | **인가된** 내부/개발 서버 테스트용 — 대상이 **사설/내부** IP(RFC1918/CGNAT/ULA)로 resolve돼도 허용. 루프백·클라우드 메타데이터(`169.254.169.254`)·멀티캐스트·예약 대역은 계속 차단. |
 | `--chains` | off | 발견 목록 뒤에 통합 **ATTACK CHAINS**를 출력 — sink 지표 + 확정 데이터플로우(`taint_flow`) + 업로드↔sink 상관관계를 sink별로 묶어 `source → flow → sink` 전체 경로(연결된 업로드 표면·재요청용 동일-파일 엔드포인트 포함)를 한 체인으로 보여줌. 확정 vs 휴리스틱 **후보(candidate)** 체인을 구분 표기. |
+| `--first-party-only` | off | **노이즈 감소(비파괴적).** 서드파티 라이브러리 파일(`jquery`, `swiper`, `bootstrap`, `jsencrypt`, `/vendor/`…)의 발견은 항상 `[3p:<lib>]`로 **태깅**되고 **맨 아래로 정렬**되며 **저장 리포트에는 그대로 유지**됨. 이 플래그는 추가로 그것들을 *콘솔* 뷰에서 **숨김**(리포트에선 안 지워지고 탐지도 불변). |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | 출력 상세도 제어 |
 
 ### `analyze <paths…>` — 로컬, 네트워크 없음
