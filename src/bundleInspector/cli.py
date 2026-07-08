@@ -418,6 +418,13 @@ def main():
     help="Allow scanning targets that resolve to private/internal IPs (RFC1918/CGNAT/ULA) "
          "for AUTHORIZED internal testing. Loopback/cloud-metadata stay blocked. Default: off.",
 )
+@click.option(
+    "--chains",
+    is_flag=True,
+    default=False,
+    help="After the findings, print unified DOM/stored-XSS ATTACK CHAINS "
+         "(sink indicator + confirmed dataflow + upload correlation grouped per sink).",
+)
 def scan(
     ctx: click.Context,
     urls: tuple[str],
@@ -447,6 +454,7 @@ def scan(
     rules_file: Optional[str],
     fail_on: Optional[str],
     allow_private_ips: bool,
+    chains: bool,
 ):
     """Scan URLs for JavaScript security findings.
 
@@ -530,7 +538,7 @@ def scan(
         output_path.write_text(content, encoding="utf-8")
 
         if not quiet:
-            _print_summary(report)
+            _print_summary(report, show_chains=chains)
             console.print(f"\n[green]Report saved to: {output_path}[/green]")
 
         # Generate wordlist
@@ -925,7 +933,7 @@ def _resolve_output_path(
     return Path(filename)
 
 
-def _print_summary(report):
+def _print_summary(report, show_chains: bool = False):
     """Print scan summary."""
     console.print()
 
@@ -982,6 +990,17 @@ def _print_summary(report):
                 console.print(f"  ... and {remaining} more findings")
                 break
             console.print(f"  {_format_cli_finding_line(finding)}")
+
+    if show_chains:
+        try:
+            from bundleInspector.reporter.chain_view import build_chains, render_chains
+            chains = build_chains(report)
+            if chains:
+                console.print(render_chains(chains), markup=False)
+            else:
+                console.print("\n[dim]No DOM/stored-XSS attack chains (sink+flow+upload) found.[/dim]")
+        except Exception as e:  # a presentation-layer error must never fail the scan
+            logger.warning("chain_view_error", error=str(e))
 
 
 def _format_cli_finding_line(finding) -> str:
@@ -1090,6 +1109,13 @@ def _format_cli_finding_line(finding) -> str:
     type=click.Choice(["info", "low", "medium", "high", "critical"], case_sensitive=False),
     help="Exit with code 2 if any finding is at or above this severity (CI gate)",
 )
+@click.option(
+    "--chains",
+    is_flag=True,
+    default=False,
+    help="After the findings, print unified DOM/stored-XSS ATTACK CHAINS "
+         "(sink indicator + confirmed dataflow + upload correlation grouped per sink).",
+)
 def analyze(
     ctx: click.Context,
     paths: tuple[str],
@@ -1108,6 +1134,7 @@ def analyze(
     job_id: Optional[str],
     rules_file: Optional[str],
     fail_on: Optional[str],
+    chains: bool,
 ):
     """Analyze local JavaScript files (no network traffic).
 
@@ -1182,7 +1209,7 @@ def analyze(
         output_path.write_text(content, encoding="utf-8")
 
         if not quiet:
-            _print_summary(report)
+            _print_summary(report, show_chains=chains)
             console.print(f"\n[green]Report saved to: {output_path}[/green]")
 
         # Generate wordlist
