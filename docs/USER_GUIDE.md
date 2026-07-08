@@ -258,7 +258,7 @@ output:
 
 | Field | Default | Purpose |
 |---|---|---|
-| `enabled_categories` | `[endpoint, secret, domain, flag, debug]` | Active rule categories |
+| `enabled_categories` | `[endpoint, secret, domain, flag, debug, sink, upload]` | Active rule categories |
 | `min_confidence` | `low` | `low` \| `medium` \| `high` |
 | `mask_secrets` | `true` | Mask secret values in output |
 | `secret_visible_chars` | `4` | Unmasked chars kept |

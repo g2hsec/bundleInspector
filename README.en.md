@@ -23,7 +23,7 @@ for pentesters, bug-bounty hunters, and AppSec teams.
 ## ✨ Highlights
 
 - **Two modes** — `scan` a live site (crawl → render → download → analyze) or `analyze` local bundles with **zero network traffic**.
-- **Deep static extraction** — hidden REST / GraphQL / WebSocket endpoints, ~100 secret types, internal & staging domains, feature flags, and debug endpoints — resolved through template literals, string concatenation, ternaries, and constants.
+- **Deep static extraction** — hidden REST / GraphQL / WebSocket endpoints (incl. server-side `.do`/`.jsp`/`.php`/`.aspx` paths), ~100 secret types, internal & staging domains, feature flags, debug endpoints, **DOM-XSS / code-injection sinks** (`innerHTML`/`.html()`/`eval`/`document.write` fed a dynamic value) with a **confirmed-dataflow taint engine** (source→sink XSS chains), and **file-upload surfaces** (incl. bypassable client-side validation) — resolved through template literals, string concatenation, ternaries, and constants.
 - **Offensive recon built in** — seven enhancements: client-side access-control gating, **dormant/hidden endpoints**, replayable curl/fetch PoCs, IDOR + HTTP method-flip hints, full SPA route maps, GraphQL/WebSocket surface, and **runtime-observed endpoints** (called at runtime but missed statically).
 - **Safe by default** — state-changing requests (`POST`/`PUT`/`DELETE`) the crawler induces are **blocked and confirmed, not sent**; per-domain rate limiting with adaptive backoff; SSRF & scope guards; secret masking.
 - **Fast** — file-level multiprocessing, an optional native (acorn) parser, content-hash dedup, and resumable checkpoints.

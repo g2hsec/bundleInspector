@@ -258,7 +258,7 @@ output:
 
 | 필드 | 기본값 | 용도 |
 |---|---|---|
-| `enabled_categories` | `[endpoint, secret, domain, flag, debug]` | 활성 룰 카테고리 |
+| `enabled_categories` | `[endpoint, secret, domain, flag, debug, sink, upload]` | 활성 룰 카테고리 |
 | `min_confidence` | `low` | `low` \| `medium` \| `high` |
 | `mask_secrets` | `true` | 출력에서 시크릿 값 마스킹 |
 | `secret_visible_chars` | `4` | 마스킹 시 노출 문자 수 |

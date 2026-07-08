@@ -110,7 +110,7 @@ Shipped declarative support currently covers:
 - `id`: unique rule id
 - `title`: finding title
 - `description`: optional finding description
-- `category`: one of `endpoint`, `secret`, `domain`, `flag`, `debug`
+- `category`: one of `endpoint`, `secret`, `domain`, `flag`, `debug`, `sink`, `upload`
 - `severity`: `info`, `low`, `medium`, `high`, `critical`
 - `confidence`: `low`, `medium`, `high`
 - `value_type`: stored on the finding
