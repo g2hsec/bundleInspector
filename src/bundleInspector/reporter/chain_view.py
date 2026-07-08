@@ -34,8 +34,18 @@ def _cat(f: Any) -> str:
     return getattr(c, "value", "") if c is not None else ""
 
 
-def build_chains(report: Any) -> list[dict]:
-    """Group a Report's findings/correlations into attack chains (confirmed first)."""
+def _vendor_of(url: str) -> Any:
+    try:
+        from bundleInspector.core.vendor import classify_vendor_file
+        return classify_vendor_file(url)
+    except Exception:
+        return None
+
+
+def build_chains(report: Any, first_party_only: bool = False) -> list[dict]:
+    """Group a Report's findings/correlations into attack chains (confirmed first).
+    Each chain is tagged with `third_party` (the library name, or None); when first_party_only
+    is set, chains in third-party library files are omitted (they are noise, not app vulns)."""
     findings = list(getattr(report, "findings", []) or [])
     correlations = list(getattr(report, "correlations", []) or [])
     by_id = {getattr(f, "id", None): f for f in findings}
@@ -66,6 +76,7 @@ def build_chains(report: Any) -> list[dict]:
         chains.append({
             "kind": "confirmed",
             "file": fu,
+            "third_party": _vendor_of(fu),
             "severity": getattr(getattr(f, "severity", None), "value", "medium"),
             "confidence": getattr(getattr(f, "confidence", None), "value", "medium"),
             "source_kind": md.get("source_kind", ""),
@@ -99,6 +110,7 @@ def build_chains(report: Any) -> list[dict]:
         chains.append({
             "kind": "candidate",
             "file": fu,
+            "third_party": _vendor_of(fu),
             "severity": getattr(getattr(sink_f, "severity", None), "value", "medium"),
             "confidence": "medium",
             "sink": getattr(sink_f, "value_type", ""),
@@ -109,7 +121,11 @@ def build_chains(report: Any) -> list[dict]:
             "reasoning": getattr(c, "reasoning", ""),
         })
 
+    if first_party_only:
+        chains = [c for c in chains if not c.get("third_party")]
+    # confirmed first; within that, first-party before third-party library files; then severity.
     chains.sort(key=lambda ch: (0 if ch["kind"] == "confirmed" else 1,
+                                1 if ch.get("third_party") else 0,
                                 _SEV_RANK.get(ch["severity"], 5), ch["file"], ch["sink_line"]))
     return chains
 
@@ -124,9 +140,10 @@ def render_chains(chains: list[dict]) -> str:
                       f"  ATTACK CHAINS  ({confirmed} confirmed, {candidate} candidate)", "=" * 74]
     for i, c in enumerate(chains, 1):
         fn = (c["file"].rsplit("/", 1)[-1] or c["file"])[:60]
+        vendor = f"   [3p:{c['third_party']} -- likely library noise/FP]" if c.get("third_party") else ""
         out.append("")
         if c["kind"] == "confirmed":
-            out.append(f"[{i}] CONFIRMED dataflow XSS chain            {c['severity'].upper()}/{c['confidence']}")
+            out.append(f"[{i}] CONFIRMED dataflow XSS chain            {c['severity'].upper()}/{c['confidence']}{vendor}")
             out.append(f"    file    : {fn}")
             out.append(f"    SOURCE  : {c['source_kind']}  @L{c['source_line']}")
             attr = f" ['{c['sink_attr']}' attr]" if c["sink_attr"] else ""
@@ -142,7 +159,7 @@ def render_chains(chains: list[dict]) -> str:
                 extra = "" if len(c["endpoints"]) <= 4 else f" (+{len(c['endpoints']) - 4} more)"
                 out.append(f"    context : same-file endpoints for replay: {eps}{extra}")
         else:
-            out.append(f"[{i}] CANDIDATE chain (name-heuristic, UNCONFIRMED)   {c['severity'].upper()}")
+            out.append(f"[{i}] CANDIDATE chain (name-heuristic, UNCONFIRMED)   {c['severity'].upper()}{vendor}")
             out.append(f"    file    : {fn}")
             out.append(f"    upload `{c['upload']}` @L{c['upload_line']}  <->  sink {c['sink']} @L{c['sink_line']}"
                        f"  (value: {c['sink_source']})")

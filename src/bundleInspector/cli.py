@@ -425,6 +425,15 @@ def main():
     help="After the findings, print unified DOM/stored-XSS ATTACK CHAINS "
          "(sink indicator + confirmed dataflow + upload correlation grouped per sink).",
 )
+@click.option(
+    "--first-party-only",
+    "first_party_only",
+    is_flag=True,
+    default=False,
+    help="Hide findings in third-party library files (jquery, swiper, bootstrap, ...) from the "
+         "CONSOLE view for a cleaner triage. The saved report still contains everything, tagged "
+         "with `third_party_file`. Vendor findings are always labelled [3p:<lib>]; this only hides them.",
+)
 def scan(
     ctx: click.Context,
     urls: tuple[str],
@@ -455,6 +464,7 @@ def scan(
     fail_on: Optional[str],
     allow_private_ips: bool,
     chains: bool,
+    first_party_only: bool,
 ):
     """Scan URLs for JavaScript security findings.
 
@@ -534,11 +544,12 @@ def scan(
             default_basename="bundleInspector_report",
         )
 
+        _tag_vendor_files(report)
         content = reporter.generate(report)
         output_path.write_text(content, encoding="utf-8")
 
         if not quiet:
-            _print_summary(report, show_chains=chains)
+            _print_summary(report, show_chains=chains, first_party_only=first_party_only)
             console.print(f"\n[green]Report saved to: {output_path}[/green]")
 
         # Generate wordlist
@@ -933,7 +944,24 @@ def _resolve_output_path(
     return Path(filename)
 
 
-def _print_summary(report, show_chains: bool = False):
+def _tag_vendor_files(report) -> int:
+    """Tag findings in third-party library files (jquery/swiper/...) with
+    metadata['third_party_file']. Non-destructive: labels only; nothing is dropped."""
+    try:
+        from bundleInspector.core.vendor import classify_vendor_file
+    except Exception:
+        return 0
+    count = 0
+    for f in getattr(report, "findings", []) or []:
+        url = f.evidence.file_url if getattr(f, "evidence", None) else ""
+        lib = classify_vendor_file(url)
+        if lib:
+            f.metadata["third_party_file"] = lib
+            count += 1
+    return count
+
+
+def _print_summary(report, show_chains: bool = False, first_party_only: bool = False):
     """Print scan summary."""
     console.print()
 
@@ -975,10 +1003,16 @@ def _print_summary(report, show_chains: bool = False):
 
     if report.findings:
         console.print()
+        display_findings = list(report.findings)
+        hidden_vendor = 0
+        if first_party_only:
+            kept = [f for f in display_findings if not (f.metadata or {}).get("third_party_file")]
+            hidden_vendor = len(display_findings) - len(kept)
+            display_findings = kept
+        # First-party findings first, then by risk score (vendor-file findings sink to the bottom).
         sorted_findings = sorted(
-            report.findings,
-            key=lambda f: f.risk_score or 0,
-            reverse=True,
+            display_findings,
+            key=lambda f: (1 if (f.metadata or {}).get("third_party_file") else 0, -(f.risk_score or 0)),
         )
 
         console.print("[bold]Findings:[/bold]")
@@ -990,11 +1024,14 @@ def _print_summary(report, show_chains: bool = False):
                 console.print(f"  ... and {remaining} more findings")
                 break
             console.print(f"  {_format_cli_finding_line(finding)}")
+        if hidden_vendor:
+            console.print(f"  [dim](+{hidden_vendor} findings in third-party library files hidden by "
+                          f"--first-party-only; the saved report keeps them, tagged)[/dim]")
 
     if show_chains:
         try:
             from bundleInspector.reporter.chain_view import build_chains, render_chains
-            chains = build_chains(report)
+            chains = build_chains(report, first_party_only=first_party_only)
             if chains:
                 console.print(render_chains(chains), markup=False)
             else:
@@ -1017,6 +1054,12 @@ def _format_cli_finding_line(finding) -> str:
     if value:
         summary += f" :: {value}"
     summary += f" @ {location}:{line}"
+
+    # Non-destructive noise cue: findings in third-party library files are likely framework-
+    # internal (possible noise/FP), so they are labelled and sorted to the bottom, never dropped.
+    vendor = (finding.metadata or {}).get("third_party_file") if isinstance(finding.metadata, dict) else None
+    if vendor:
+        summary += f"  [dim][3p:{vendor} — likely library noise/FP, verify][/dim]"
 
     matched_text = ""
     if isinstance(finding.metadata, dict):
@@ -1116,6 +1159,15 @@ def _format_cli_finding_line(finding) -> str:
     help="After the findings, print unified DOM/stored-XSS ATTACK CHAINS "
          "(sink indicator + confirmed dataflow + upload correlation grouped per sink).",
 )
+@click.option(
+    "--first-party-only",
+    "first_party_only",
+    is_flag=True,
+    default=False,
+    help="Hide findings in third-party library files (jquery, swiper, bootstrap, ...) from the "
+         "CONSOLE view for a cleaner triage. The saved report still contains everything, tagged "
+         "with `third_party_file`. Vendor findings are always labelled [3p:<lib>]; this only hides them.",
+)
 def analyze(
     ctx: click.Context,
     paths: tuple[str],
@@ -1135,6 +1187,7 @@ def analyze(
     rules_file: Optional[str],
     fail_on: Optional[str],
     chains: bool,
+    first_party_only: bool,
 ):
     """Analyze local JavaScript files (no network traffic).
 
@@ -1205,11 +1258,12 @@ def analyze(
             default_basename="bundleInspector_local_report",
         )
 
+        _tag_vendor_files(report)
         content = reporter.generate(report)
         output_path.write_text(content, encoding="utf-8")
 
         if not quiet:
-            _print_summary(report, show_chains=chains)
+            _print_summary(report, show_chains=chains, first_party_only=first_party_only)
             console.print(f"\n[green]Report saved to: {output_path}[/green]")
 
         # Generate wordlist
