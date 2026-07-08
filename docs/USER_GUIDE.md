@@ -141,6 +141,7 @@ Crawl and analyze one or more live target URLs (at least one URL required).
 | `--resume` | off | Reuse the latest stored report/checkpoint for the job id |
 | `--fail-on {info,low,medium,high,critical}` | — | Exit code **2** if any finding is at or above this severity (CI gate) |
 | `--allow-private-ips` | off | Allow a target that resolves to a **private/internal** IP (RFC1918/CGNAT/ULA) for **authorized** internal/dev-server testing. Loopback, cloud-metadata (`169.254.169.254`), multicast & reserved ranges stay blocked. |
+| `--chains` | off | After the findings, print unified **ATTACK CHAINS** — the sink indicator + the CONFIRMED dataflow (`taint_flow`) + the upload↔sink correlation grouped per sink, so the whole `source → flow → sink` path (plus linked upload surface and same-file endpoints for replay) reads as one chain. Confirmed vs name-heuristic **candidate** chains are labelled. |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | Output verbosity controls |
 
 ### `analyze <paths…>` — local, no network

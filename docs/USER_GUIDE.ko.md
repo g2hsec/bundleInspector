@@ -141,6 +141,7 @@ bundleInspector [scan | analyze | convert | version]
 | `--resume` | off | 해당 job id의 최신 저장 리포트/체크포인트 재사용 |
 | `--fail-on {info,low,medium,high,critical}` | — | 이 심각도 이상 발견 시 종료 코드 **2** (CI 게이트) |
 | `--allow-private-ips` | off | **인가된** 내부/개발 서버 테스트용 — 대상이 **사설/내부** IP(RFC1918/CGNAT/ULA)로 resolve돼도 허용. 루프백·클라우드 메타데이터(`169.254.169.254`)·멀티캐스트·예약 대역은 계속 차단. |
+| `--chains` | off | 발견 목록 뒤에 통합 **ATTACK CHAINS**를 출력 — sink 지표 + 확정 데이터플로우(`taint_flow`) + 업로드↔sink 상관관계를 sink별로 묶어 `source → flow → sink` 전체 경로(연결된 업로드 표면·재요청용 동일-파일 엔드포인트 포함)를 한 체인으로 보여줌. 확정 vs 휴리스틱 **후보(candidate)** 체인을 구분 표기. |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | 출력 상세도 제어 |
 
 ### `analyze <paths…>` — 로컬, 네트워크 없음
