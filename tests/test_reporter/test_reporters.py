@@ -326,6 +326,22 @@ def test_html_reporter_demotes_and_labels_noise_findings():
     assert html.index("Real sink") < html.index("Vendor secret")
 
 
+def test_html_reporter_shows_download_surface_badge_and_risk():
+    """A file-download endpoint gets a DOWNLOAD badge, the specific risk, and the dangerous param."""
+    from bundleInspector.core.download_surface import annotate_download_surfaces
+    ep = Finding(
+        rule_id="endpoint-detector", category=Category.ENDPOINT, severity=Severity.LOW,
+        confidence=Confidence.MEDIUM, title="API Endpoint: /getFile.do",
+        evidence=Evidence(file_url="https://x/app.js", file_hash="h", line=1),
+        extracted_value="/getFile.do?fileNm=report.pdf", value_type="api_path", metadata={},
+    )
+    r = Report(findings=[ep])
+    assert annotate_download_surfaces(r) == 1
+    html = HTMLReporter().generate(r)
+    assert "badge download" in html and "DOWNLOAD: path-traversal" in html
+    assert "download-note" in html and "fileNm" in html
+
+
 def test_html_severity_split_is_consistent_with_the_noise_demotion():
     """The severity distribution must MATCH the (noise-hidden) findings view: a demoted vendor
     CRITICAL must count as demoted, not first-party -- otherwise the summary reports a CRITICAL the

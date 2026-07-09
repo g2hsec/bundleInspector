@@ -111,6 +111,13 @@ HTML_TEMPLATE = """
         .badge.confirmed { background: #2ecc71; color: #062; margin-right: 5px; }
         .badge.thirdparty { background: #555; color: #ddd; margin-right: 5px; }
         .badge.fp { background: #7a5; color: #041; margin-right: 5px; }
+        .badge.download { background: #b15fd6; color: #fff; margin-right: 5px; }
+        .download-note {
+            background: rgba(177,95,214,0.12); border-left: 3px solid #b15fd6;
+            padding: 6px 10px; border-radius: 4px; margin: 4px 0 10px; font-size: 0.9em;
+        }
+        .download-note code { color: #e3b9f5; font-family: 'Consolas', monospace; }
+        .lbl.dl { background: #b15fd6; color: #fff; }
         /* likely-false-positive / vendor findings: dimmed + dashed, demoted (never dropped) */
         .finding.noise { opacity: 0.55; border-style: dashed; }
         .finding.noise:hover { opacity: 1; }
@@ -333,6 +340,7 @@ HTML_TEMPLATE = """
                     <span class="finding-title">{{ finding.title }}</span>
                     <div>
                         {% if v.confirmed %}<span class="badge confirmed">CONFIRMED</span>{% endif %}
+                        {% if v.download %}<span class="badge download" title="file-download surface">&#11015; DOWNLOAD: {{ v.download.primary_risk | replace('_','-') }}</span>{% endif %}
                         {% if v.likely_fp %}<span class="badge fp" title="{{ v.fp_reason }}">LIKELY FP</span>{% endif %}
                         {% if v.third_party %}<span class="badge thirdparty" title="third-party library file">3p:{{ v.third_party }}</span>{% endif %}
                         <span class="badge {{ finding.severity.value }}">{{ finding.severity.value | upper }}</span>
@@ -343,6 +351,17 @@ HTML_TEMPLATE = """
                 {% if v.likely_fp %}<div class="fp-note">Likely false positive &mdash; {{ v.fp_reason }}. Demoted, not dropped.</div>{% endif %}
 
                 <div class="why"><span class="lbl">WHY</span>{{ v.explain.why }}</div>
+
+                {% if v.download %}
+                <div class="download-note">
+                    <span class="lbl dl">DOWNLOAD SURFACE</span>
+                    <strong>{{ v.download.primary_risk | replace('_','-') }}</strong>
+                    {% if v.download.params %}&nbsp;&middot;&nbsp; param(s):
+                        {% for role, names in v.download.params.items() %}{% for n in names %}<code>{{ n }}</code> {% endfor %}{% endfor %}
+                    {% endif %}
+                    <div style="margin-top:4px;opacity:.85">{{ v.download.note }}</div>
+                </div>
+                {% endif %}
 
                 {% if v.danger_value and not v.flow %}
                 <div class="danger-value"><span class="lbl danger">DANGEROUS VALUE</span><code>{{ v.danger_value }}</code> &nbsp;<span style="opacity:.7">&larr; this is the value that reaches the sink; XSS if it is attacker-influenced</span></div>
@@ -506,6 +525,8 @@ class HTMLReporter(BaseReporter):
                 "third_party": (f.metadata or {}).get("third_party_file") or "",
                 # the specific server/user value that reaches the sink -- WHERE it is vulnerable
                 "danger_value": (f.metadata or {}).get("sink_source") or "",
+                # file-download surface descriptor (risk / params / note), if any
+                "download": (f.metadata or {}).get("download_surface") or None,
             }
             for f in findings_sorted
         ]

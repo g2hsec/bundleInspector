@@ -38,6 +38,7 @@ from bundleInspector.config import (
 from bundleInspector.core.orchestrator import BundleInspector
 from bundleInspector.core.asset_analysis import _build_analyzer
 from bundleInspector.core.fp_annotate import annotate_false_positives
+from bundleInspector.core.download_surface import annotate_download_surfaces, download_surfaces, risk_label
 from bundleInspector.core.progress import PipelineStage
 from bundleInspector.core.text_decode import decode_js_bytes
 from bundleInspector.core.resume_policy import (
@@ -549,6 +550,7 @@ def scan(
 
         _tag_vendor_files(report)
         annotate_false_positives(report)
+        annotate_download_surfaces(report)
         content = reporter.generate(report)
         output_path.write_text(content, encoding="utf-8")
 
@@ -1071,6 +1073,38 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
         elif noise_n and not first_party_only:
             console.print(f"  [dim]{noise_n} vendor/likely-FP finding(s) demoted to the bottom — --first-party-only to hide[/dim]")
 
+    # --- Download surfaces: file-serving endpoints + their specific test (traversal/IDOR/SSRF) ---
+    try:
+        surfaces = [(f, d) for f, d in download_surfaces(report)
+                    if not (first_party_only and _is_noise(f))]
+    except Exception:
+        surfaces = []
+    if surfaces:
+        console.print()
+        console.print(f"[bold magenta]Download Surfaces[/bold magenta]  "
+                      f"[dim]— {len(surfaces)} file-serving endpoint(s) to test "
+                      f"(path-traversal / file-IDOR / SSRF)[/dim]")
+        dtable = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold",
+                       expand=False, pad_edge=False, padding=(0, 1))
+        dtable.add_column("Risk", no_wrap=True)
+        dtable.add_column("Endpoint", no_wrap=True, overflow="ellipsis", max_width=42, style="cyan")
+        dtable.add_column("Param(s)", no_wrap=True, overflow="ellipsis", max_width=26)
+        dtable.add_column("What to test", overflow="ellipsis", max_width=40, style="dim")
+        _HINT = {"path_traversal": "../../etc/passwd, ..%2f, absolute path",
+                 "ssrf": "internal host / 169.254.169.254",
+                 "file_idor": "enumerate / swap the file id",
+                 "forced_browsing": "reach it without login",
+                 "authz_review": "verify server-side authz"}
+        for f, d in surfaces[:15]:
+            clr = _SEV_COLOR.get(d.get("risk_severity", "low"), "white")
+            risk = f"[{clr}]{risk_label(d['primary_risk'])}[/{clr}]"
+            ep = escape((f.extracted_value or "?"))
+            params = escape(", ".join(p for ps in d.get("params", {}).values() for p in ps) or "—")
+            dtable.add_row(risk, ep, params, _HINT.get(d["primary_risk"], ""))
+        console.print(dtable)
+        if len(surfaces) > 15:
+            console.print(f"  [dim]… and {len(surfaces) - 15} more download surface(s)[/dim]")
+
     if show_chains:
         try:
             from bundleInspector.reporter.chain_view import build_chains, render_chains
@@ -1109,6 +1143,9 @@ def _finding_row(finding) -> tuple[str, str, str, str]:
         cell = f"{title}  [dim]· {value if len(value) <= 32 else value[:31] + '…'}[/dim]"
 
     md = finding.metadata if isinstance(finding.metadata, dict) else {}
+    dl = md.get("download_surface")
+    if isinstance(dl, dict):                        # file-download surface -- high-value
+        cell += f"  [magenta]▾ download: {escape(risk_label(dl.get('primary_risk', '')))}[/magenta]"
     if md.get("confirmed"):
         cell = f"[green]✓[/green] {cell}"           # confirmed dataflow -- the crown jewels
     elif md.get("third_party_file"):
@@ -1342,6 +1379,7 @@ def analyze(
 
         _tag_vendor_files(report)
         annotate_false_positives(report)
+        annotate_download_surfaces(report)
         content = reporter.generate(report)
         output_path.write_text(content, encoding="utf-8")
 
@@ -1890,6 +1928,7 @@ def convert(report_file: str, format: str, output: Optional[str]):
     # vendor/likely-FP demotion as a fresh scan (non-destructive; nothing is dropped).
     _tag_vendor_files(report)
     annotate_false_positives(report)
+    annotate_download_surfaces(report)
 
     # Generate output
     if format == "html":

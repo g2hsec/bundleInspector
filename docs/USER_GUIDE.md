@@ -383,6 +383,34 @@ The **Chunk Analyzer** additionally surfaces Webpack/Vite code-split infrastruct
 | **enh6** | GraphQL + WebSocket surface | Extracts GraphQL operations (query/mutation/subscription + fields) from `gql` tagged templates and query props, and the WebSocket **message surface** from `.send()`/`.emit()` on WS/Socket.IO clients. |
 | **enh7** | Runtime-observed endpoints | The complement of enh2: HTTP/WebSocket endpoints the running app **actually called** during the crawl but static analysis never found (typically dynamically-assembled URLs). Surfaced as `runtime-observed` endpoint findings. Scan-only, first-party scoped, de-duplicated against static findings. |
 
+### Download surfaces
+
+File-serving endpoints (serve/stream a file to the client) are a high-value surface — path
+traversal, file IDOR, SSRF, and forced browsing. A dedicated classifier tags discovered endpoints
+that are **file** downloads and names the **specific parameter** and **risk** to test.
+
+**Precision first (no keyword-only guessing).** A bare `download`/`export` token is *not* enough — in
+Korean e-commerce "쿠폰 다운로드" (`couponDownL.do`) is a coupon claim, not a file. Classification
+requires a file-specific signal: a file-download keyword (`fileDown`/`getFile`/`atchFileDown`/
+`excelDown`/`download.php`…), a **strong file parameter**, or an office/archive/export extension.
+Keyword matching is word-boundary anchored (so `uploadFile`/`profileView`/`targetImage` are *not*
+misread), and upload endpoints are excluded.
+
+**Korean enterprise conventions (deep).** eGovFrame / Nexacro / XE·Rhymix / gnuboard parameter names:
+
+| Parameter | Meaning | Risk |
+|---|---|---|
+| `atchFileId`, `fileSn`, `fileMngId`, `nttFileId`, `bsnsFileSn`, `file_srl` | attachment id / seq | **file-IDOR** |
+| `fileNm`, `orgnlFileNm`, `streFileNm` (`Nm`=名) | file name | **path-traversal** |
+| `fileStreCours` (`Cours`=경로), `filePath`, `savePath` | store path | **path-traversal** |
+| `imageUrl`, `fileUrl`, `remoteUrl` | remote fetch | **SSRF** |
+| `objectKey`, `s3Key` | cloud storage key | file-IDOR |
+
+Shown as a **`▾ download: <risk>`** tag on the endpoint plus a dedicated **Download Surfaces** table
+(console) / **`⬇ DOWNLOAD` badge + risk panel** (HTML) with the exact parameter and what to test
+(`../../etc/passwd`, id enumeration, `169.254.169.254`, …). Non-destructive: tag only, detection
+unchanged.
+
 ### Risk tiers
 
 Every finding is scored and tiered:

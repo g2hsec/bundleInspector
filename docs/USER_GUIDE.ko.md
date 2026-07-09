@@ -382,6 +382,32 @@ BundleInspector는 자신의 UI 조작으로 타겟을 변경하지 않습니다
 | **enh6** | GraphQL + WebSocket 표면 | `gql` 태그드 템플릿·쿼리 프로퍼티에서 GraphQL 오퍼레이션(query/mutation/subscription + 필드) 추출, WS/Socket.IO 클라이언트의 `.send()`/`.emit()`에서 WebSocket **메시지 표면** 추출. |
 | **enh7** | 런타임 관측 엔드포인트 | enh2의 짝: 크롤 중 앱이 **실제 호출**했지만 정적 분석이 못 찾은 HTTP/WebSocket 엔드포인트(주로 동적 조립 URL)를 `runtime-observed` 발견으로 노출. 스캔 전용, first-party 스코프, 정적 발견과 중복 제거. |
 
+### 다운로드 표면 (Download surfaces)
+
+파일을 클라이언트로 서빙하는 엔드포인트는 고가치 표면입니다 — path traversal, 파일 IDOR, SSRF,
+forced browsing. 전용 분류기가 **파일** 다운로드 엔드포인트를 태깅하고 **어떤 파라미터**가 **어떤 위험**인지
+지목합니다.
+
+**정밀도 우선(키워드만으로 추측 안 함).** 단순 `download`/`export` 토큰만으로는 부족합니다 — 한국 이커머스에서
+"쿠폰 다운로드"(`couponDownL.do`)는 파일이 아닌 쿠폰 발급입니다. 분류에는 **파일-특이 신호**가 필요:
+파일-다운로드 키워드(`fileDown`/`getFile`/`atchFileDown`/`excelDown`/`download.php`…), **강한 파일 파라미터**,
+또는 office/archive/export 확장자. 키워드는 **단어 경계**로 매칭(→ `uploadFile`/`profileView`/`targetImage`
+오탐 없음), 업로드 엔드포인트는 제외됩니다.
+
+**한국 엔터프라이즈 관례(깊이).** eGovFrame / Nexacro / XE·Rhymix / 그누보드 파라미터명:
+
+| 파라미터 | 의미 | 위험 |
+|---|---|---|
+| `atchFileId`, `fileSn`, `fileMngId`, `nttFileId`, `bsnsFileSn`, `file_srl` | 첨부파일ID/순번 | **file-IDOR** |
+| `fileNm`, `orgnlFileNm`, `streFileNm` (`Nm`=名) | 파일명 | **path-traversal** |
+| `fileStreCours` (`Cours`=경로), `filePath`, `savePath` | 저장경로 | **path-traversal** |
+| `imageUrl`, `fileUrl`, `remoteUrl` | 원격 fetch | **SSRF** |
+| `objectKey`, `s3Key` | 클라우드 스토리지 키 | file-IDOR |
+
+엔드포인트에 **`▾ download: <위험>`** 태그 + 전용 **Download Surfaces 표**(콘솔) / **`⬇ DOWNLOAD` 배지 + 위험
+패널**(HTML)로, 정확한 파라미터와 테스트 방법(`../../etc/passwd`, id 열거, `169.254.169.254` …)을 표기.
+비파괴 — 태깅만, 탐지 불변.
+
 ### 위험 등급
 
 모든 발견은 점수화·등급화됩니다:
