@@ -142,7 +142,7 @@ Crawl and analyze one or more live target URLs (at least one URL required).
 | `--fail-on {info,low,medium,high,critical}` | — | Exit code **2** if any finding is at or above this severity (CI gate) |
 | `--allow-private-ips` | off | Allow a target that resolves to a **private/internal** IP (RFC1918/CGNAT/ULA) for **authorized** internal/dev-server testing. Loopback, cloud-metadata (`169.254.169.254`), multicast & reserved ranges stay blocked. |
 | `--chains` | off | After the findings, print unified **ATTACK CHAINS** — the sink indicator + the CONFIRMED dataflow (`taint_flow`) + the upload↔sink correlation grouped per sink, so the whole `source → flow → sink` path (plus linked upload surface and same-file endpoints for replay) reads as one chain. Confirmed vs name-heuristic **candidate** chains are labelled. |
-| `--first-party-only` | off | **Noise reduction (non-destructive).** Findings in third-party library files (`jquery`, `swiper`, `bootstrap`, `jsencrypt`, `/vendor/`…) are always **tagged** `[3p:<lib>]`, **sorted to the bottom**, and **kept in the saved report**. This flag additionally **hides** them from the *console* view for cleaner triage — nothing is dropped from the report, and detection is unchanged. |
+| `--first-party-only` | off | **Noise reduction (non-destructive).** Vendor-file findings (`[3p:<lib>]`) **and** likely-false-positives (see [Noise reduction & triage](#noise-reduction--triage)) are always **labelled** and **sorted to the bottom**; this flag additionally **hides** them from the *console* for cleaner triage. Nothing is dropped from the saved report, and detection is unchanged. |
 | `-v, --verbose` / `--debug` / `-q, --quiet` / `--no-banner` | — | Output verbosity controls |
 
 ### `analyze <paths…>` — local, no network
@@ -393,6 +393,30 @@ Every finding is scored and tiered:
 | **P1** | High |
 | **P2** | Medium — investigate |
 | **P3** | Low / informational |
+
+---
+
+## Noise reduction & triage
+
+Static scanners over-report on third-party libraries and pattern-only matches. BundleInspector
+reduces that noise **non-destructively** — likely false positives are **labelled and demoted, never
+dropped**, so detection recall is unchanged (the detection-invariance gate stays byte-identical).
+
+A presentation-layer pass tags a finding `likely_fp` (with a reason) when:
+
+| Rule | What it demotes | Why it's a false positive | Safety |
+|---|---|---|---|
+| **A** | A "secret" inside a **third-party library file** (`jquery`/`swiper`/`jsencrypt`/…) | Library regex/CSS/base64-alphabet strings, not an app credential | Only `category == secret` in a vendor file |
+| **B** | An insertion sink (`.append`/`.prepend`/…) that appends a **`$`-prefixed jQuery/DOM object** (`$el.append($img)`) | Appending a built node is not HTML injection | Demoted **only if every** insertion in the snippet is an object append — a template/string/`$(…)`/HTML append anywhere keeps it |
+| **C** | A `-----BEGIN … PRIVATE KEY-----` **marker with no base64 key body** nearby | PEM parsing/label code, not a leaked key | A real key (base64 body in the snippet) is never demoted |
+
+A **CONFIRMED** taint flow (proven `source → sink` dataflow) is **never** demoted.
+
+**Where you see it**
+- **Console** — likely-FP / vendor findings sort to the bottom, are tagged (`[3p:…]` / `[likely FP: …]`), and a count line points to `--first-party-only` to hide them.
+- **HTML report** — noise findings are dimmed with a `LIKELY FP` / `3p:` badge and sink to the bottom; a **“🚫 Hide vendor / likely-FP noise”** toggle hides them; real findings render first. Each sink also shows a **DANGEROUS VALUE** line naming the exact value that reaches the sink (the server/user field to check).
+
+> Example: on a real 145-finding scan, 102 were demoted as vendor/likely-FP noise while **all** confirmed XSS flows and dangerous-field injections were retained and ranked first.
 
 ---
 

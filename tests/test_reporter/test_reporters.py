@@ -300,6 +300,61 @@ def test_html_reporter_shows_original_source_location_and_snippet():
     assert 'const endpoint = &#34;/api/users&#34;;' in html
 
 
+def test_html_reporter_demotes_and_labels_noise_findings():
+    """Likely-FP / vendor findings are demoted (sorted last), dimmed, badged, and hideable via the
+    noise toggle -- never dropped. A real finding sorts before a noise one."""
+    real = Finding(
+        rule_id="sink-detector", category=Category.SINK, severity=Severity.HIGH,
+        confidence=Confidence.MEDIUM, title="Real sink",
+        evidence=Evidence(file_url="https://x/app.js", file_hash="h", line=10),
+        extracted_value=".html()", value_type="dom_html_sink",
+    )
+    noise = Finding(
+        rule_id="secret-detector", category=Category.SECRET, severity=Severity.MEDIUM,
+        confidence=Confidence.LOW, title="Vendor secret",
+        evidence=Evidence(file_url="https://x/jquery.min.js", file_hash="h", line=2),
+        extracted_value="regexnoise", value_type="potential_secret",
+        metadata={"third_party_file": "jquery", "likely_fp": True,
+                  "fp_reason": "third-party library file (jquery)"},
+    )
+    html = HTMLReporter().generate(Report(findings=[noise, real]))  # noise passed first...
+    assert 'data-noise="1"' in html and "LIKELY FP" in html
+    assert "toggleNoise" in html and "Hide vendor" in html
+    assert "Demoted, not dropped" in html
+    # ...but the real finding must render BEFORE the noise finding (noise sinks to the bottom)
+    assert html.index("Real sink") < html.index("Vendor secret")
+
+
+def test_html_reporter_never_demotes_confirmed_flow_even_in_vendor_file():
+    """INVARIANT: a CONFIRMED source->sink taint flow must never be treated as noise, even when it
+    lives in a vendor-classified file (third_party_file set)."""
+    confirmed = Finding(
+        rule_id="taint", category=Category.SINK, severity=Severity.HIGH,
+        confidence=Confidence.HIGH, title="Confirmed flow in vendor bundle",
+        evidence=Evidence(file_url="https://x/assets/jquery.min.js", file_hash="h", line=9),
+        extracted_value=".html()", value_type="taint_flow",
+        metadata={"confirmed": True, "third_party_file": "jquery",
+                  "sink_source": "location.hash", "sink": ".html()"},
+    )
+    html = HTMLReporter().generate(Report(findings=[confirmed]))
+    # rendered as a normal finding, not demoted: data-noise=0 and no LIKELY FP badge
+    assert 'data-noise="0"' in html
+    assert "LIKELY FP" not in html
+
+
+def test_html_reporter_surfaces_the_dangerous_field():
+    """A sink finding names the actual value that reaches the sink (WHERE it is vulnerable)."""
+    finding = Finding(
+        rule_id="sink-detector", category=Category.SINK, severity=Severity.HIGH,
+        confidence=Confidence.MEDIUM, title="html attr injection",
+        evidence=Evidence(file_url="https://x/app.js", file_hash="h", line=1),
+        extracted_value="html src= injection", value_type="dom_attr_injection",
+        metadata={"sink_source": "item.image_url", "sink_attr": "src"},
+    )
+    html = HTMLReporter().generate(Report(findings=[finding]))
+    assert "DANGEROUS VALUE" in html and "item.image_url" in html
+
+
 def test_html_reporter_does_not_leak_raw_secret_via_matched_text():
     """The raw secret must not survive anywhere in the HTML -- including metadata.matched_text,
     which is embedded verbatim in the report JSON. mask_secret_findings sweeps the whole tree."""

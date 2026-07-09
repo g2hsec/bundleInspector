@@ -35,6 +35,7 @@ from bundleInspector.config import (
 )
 from bundleInspector.core.orchestrator import BundleInspector
 from bundleInspector.core.asset_analysis import _build_analyzer
+from bundleInspector.core.fp_annotate import annotate_false_positives
 from bundleInspector.core.progress import PipelineStage
 from bundleInspector.core.text_decode import decode_js_bytes
 from bundleInspector.core.resume_policy import (
@@ -545,6 +546,7 @@ def scan(
         )
 
         _tag_vendor_files(report)
+        annotate_false_positives(report)
         content = reporter.generate(report)
         output_path.write_text(content, encoding="utf-8")
 
@@ -1018,29 +1020,39 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
     if report.findings:
         console.print()
         display_findings = list(report.findings)
-        hidden_vendor = 0
+
+        def _is_noise(f) -> bool:
+            md = f.metadata or {}
+            if md.get("confirmed"):
+                return False  # a proven source->sink flow is never noise, even in a vendor file
+            return bool(md.get("third_party_file") or md.get("likely_fp"))
+
+        hidden_noise = 0
         if first_party_only:
-            kept = [f for f in display_findings if not (f.metadata or {}).get("third_party_file")]
-            hidden_vendor = len(display_findings) - len(kept)
+            kept = [f for f in display_findings if not _is_noise(f)]
+            hidden_noise = len(display_findings) - len(kept)
             display_findings = kept
-        # First-party findings first, then by risk score (vendor-file findings sink to the bottom).
+        # Real app findings first; likely-noise (vendor files / likely-FP) sinks to the bottom.
         sorted_findings = sorted(
             display_findings,
-            key=lambda f: (1 if (f.metadata or {}).get("third_party_file") else 0, -(f.risk_score or 0)),
+            key=lambda f: (1 if _is_noise(f) else 0, -(f.risk_score or 0)),
         )
-
         console.print("[bold]Findings:[/bold]")
-        max_display = None if len(sorted_findings) <= 20 else 20
+        limit = 20 if len(sorted_findings) > 20 else len(sorted_findings)
+        # count noise WITHIN the shown slice only -- noise sorts last, so a truncated list may show
+        # none of it; "N of the shown" must match what the reader actually sees.
+        shown_noise = sum(1 for f in sorted_findings[:limit] if _is_noise(f))
 
-        for idx, finding in enumerate(sorted_findings):
-            if max_display is not None and idx >= max_display:
-                remaining = len(sorted_findings) - max_display
-                console.print(f"  ... and {remaining} more findings")
-                break
+        for finding in sorted_findings[:limit]:
             console.print(f"  {_format_cli_finding_line(finding)}")
-        if hidden_vendor:
-            console.print(f"  [dim](+{hidden_vendor} findings in third-party library files hidden by "
-                          f"--first-party-only; the saved report keeps them, tagged)[/dim]")
+        if len(sorted_findings) > limit:
+            console.print(f"  ... and {len(sorted_findings) - limit} more findings")
+        if hidden_noise:
+            console.print(f"  [dim](+{hidden_noise} vendor / likely-FP findings hidden by "
+                          f"--first-party-only; the saved report keeps them, labelled)[/dim]")
+        elif shown_noise:
+            console.print(f"  [dim]({shown_noise} of the shown findings are likely noise/FP -- re-run "
+                          f"with --first-party-only to hide)[/dim]")
 
     if show_chains:
         try:
@@ -1071,9 +1083,13 @@ def _format_cli_finding_line(finding) -> str:
 
     # Non-destructive noise cue: findings in third-party library files are likely framework-
     # internal (possible noise/FP), so they are labelled and sorted to the bottom, never dropped.
-    vendor = (finding.metadata or {}).get("third_party_file") if isinstance(finding.metadata, dict) else None
+    md = finding.metadata if isinstance(finding.metadata, dict) else {}
+    vendor = md.get("third_party_file")
     if vendor:
         summary += f"  [dim][3p:{vendor} — likely library noise/FP, verify][/dim]"
+    elif md.get("likely_fp"):
+        # first-party likely-FP (e.g. PEM marker w/o body, jQuery-object append): label the reason
+        summary += f"  [dim][likely FP: {md.get('fp_reason', 'low signal')}][/dim]"
 
     matched_text = ""
     if isinstance(finding.metadata, dict):
@@ -1273,6 +1289,7 @@ def analyze(
         )
 
         _tag_vendor_files(report)
+        annotate_false_positives(report)
         content = reporter.generate(report)
         output_path.write_text(content, encoding="utf-8")
 
@@ -1816,6 +1833,11 @@ def convert(report_file: str, format: str, output: Optional[str]):
         bundleInspector convert report.json --format html -o report.html
     """
     report = _load_report_for_convert(report_file)
+
+    # Re-apply the presentation-layer noise annotation so a converted report gets the same
+    # vendor/likely-FP demotion as a fresh scan (non-destructive; nothing is dropped).
+    _tag_vendor_files(report)
+    annotate_false_positives(report)
 
     # Generate output
     if format == "html":

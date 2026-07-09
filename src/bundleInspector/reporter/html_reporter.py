@@ -110,6 +110,23 @@ HTML_TEMPLATE = """
         .badge.tier { background: var(--accent); margin-left: 5px; }
         .badge.confirmed { background: #2ecc71; color: #062; margin-right: 5px; }
         .badge.thirdparty { background: #555; color: #ddd; margin-right: 5px; }
+        .badge.fp { background: #7a5; color: #041; margin-right: 5px; }
+        /* likely-false-positive / vendor findings: dimmed + dashed, demoted (never dropped) */
+        .finding.noise { opacity: 0.55; border-style: dashed; }
+        .finding.noise:hover { opacity: 1; }
+        .fp-note {
+            font-size: 0.82em; color: #cdb; background: rgba(120,150,80,0.12);
+            border-left: 3px solid #7a5; padding: 5px 10px; border-radius: 4px; margin: 4px 0 8px;
+        }
+        .noise-toggle { margin-left: auto; }
+        .noise-toggle.active { background: #7a5; color: #041; }
+        /* the specific value that reaches the sink -- "where is it vulnerable" */
+        .danger-value {
+            background: rgba(255,68,68,0.10); border-left: 3px solid var(--critical);
+            padding: 6px 10px; border-radius: 4px; margin: 4px 0 10px; font-size: 0.9em;
+        }
+        .danger-value code { color: #ffb3b3; font-family: 'Consolas', monospace; }
+        .lbl.danger { background: var(--critical); color: #fff; }
         /* Why / Impact / Fix -- the "why is this a risk" panel */
         .why {
             background: rgba(233,69,96,0.12);
@@ -283,27 +300,36 @@ HTML_TEMPLATE = """
         <div class="section">
             <h2>Findings</h2>
             <div class="filter-bar">
-                <button class="filter-btn active" onclick="filterFindings(event, 'all')">All</button>
-                <button class="filter-btn" onclick="filterFindings(event, 'critical')">Critical</button>
-                <button class="filter-btn" onclick="filterFindings(event, 'high')">High</button>
-                <button class="filter-btn" onclick="filterFindings(event, 'medium')">Medium</button>
-                <button class="filter-btn" onclick="filterFindings(event, 'low')">Low</button>
+                <button class="filter-btn active" onclick="setSeverity(event, 'all')">All</button>
+                <button class="filter-btn" onclick="setSeverity(event, 'critical')">Critical</button>
+                <button class="filter-btn" onclick="setSeverity(event, 'high')">High</button>
+                <button class="filter-btn" onclick="setSeverity(event, 'medium')">Medium</button>
+                <button class="filter-btn" onclick="setSeverity(event, 'low')">Low</button>
+                <button class="filter-btn noise-toggle" onclick="toggleNoise(this)"
+                    title="Hide third-party library findings and likely false positives">&#128683; Hide vendor / likely-FP noise</button>
             </div>
 
             {% for v in findings_view %}
             {% set finding = v.f %}
-            <div class="finding {{ finding.severity.value }}" data-severity="{{ finding.severity.value }}">
+            <div class="finding {{ finding.severity.value }}{% if v.noise %} noise{% endif %}" data-severity="{{ finding.severity.value }}" data-noise="{{ '1' if v.noise else '0' }}">
                 <div class="finding-header">
                     <span class="finding-title">{{ finding.title }}</span>
                     <div>
                         {% if v.confirmed %}<span class="badge confirmed">CONFIRMED</span>{% endif %}
-                        {% if finding.metadata.get('third_party_file') or finding.metadata.get('third_party') %}<span class="badge thirdparty">3rd-party</span>{% endif %}
+                        {% if v.likely_fp %}<span class="badge fp" title="{{ v.fp_reason }}">LIKELY FP</span>{% endif %}
+                        {% if v.third_party %}<span class="badge thirdparty" title="third-party library file">3p:{{ v.third_party }}</span>{% endif %}
                         <span class="badge {{ finding.severity.value }}">{{ finding.severity.value | upper }}</span>
                         {% if finding.risk_tier %}<span class="badge tier">{{ finding.risk_tier.value }}</span>{% endif %}
                     </div>
                 </div>
 
+                {% if v.likely_fp %}<div class="fp-note">Likely false positive &mdash; {{ v.fp_reason }}. Demoted, not dropped.</div>{% endif %}
+
                 <div class="why"><span class="lbl">WHY</span>{{ v.explain.why }}</div>
+
+                {% if v.danger_value and not v.flow %}
+                <div class="danger-value"><span class="lbl danger">DANGEROUS VALUE</span><code>{{ v.danger_value }}</code> &nbsp;<span style="opacity:.7">&larr; this is the value that reaches the sink; XSS if it is attacker-influenced</span></div>
+                {% endif %}
 
                 {% if v.flow %}
                 <div class="flow">
@@ -371,19 +397,30 @@ HTML_TEMPLATE = """
     </div>
 
     <script>
-        function filterFindings(e, severity) {
-            document.querySelectorAll('.filter-btn').forEach(btn => {
-                btn.classList.remove('active');
+        // Severity and noise are two independent filters; a finding shows only if it passes both.
+        var curSeverity = 'all', hideNoise = false;
+        function applyFilters() {
+            document.querySelectorAll('.finding[data-severity]').forEach(function (f) {
+                var okSev = (curSeverity === 'all' || f.dataset.severity === curSeverity);
+                var okNoise = (!hideNoise || f.dataset.noise !== '1');
+                f.style.display = (okSev && okNoise) ? 'block' : 'none';
+            });
+        }
+        function setSeverity(e, severity) {
+            curSeverity = severity;
+            document.querySelectorAll('.filter-btn').forEach(function (b) {
+                if (!b.classList.contains('noise-toggle')) b.classList.remove('active');
             });
             e.target.classList.add('active');
-
-            document.querySelectorAll('.finding[data-severity]').forEach(finding => {
-                if (severity === 'all' || finding.dataset.severity === severity) {
-                    finding.style.display = 'block';
-                } else {
-                    finding.style.display = 'none';
-                }
-            });
+            applyFilters();
+        }
+        function toggleNoise(btn) {
+            hideNoise = !hideNoise;
+            btn.classList.toggle('active', hideNoise);
+            btn.innerHTML = hideNoise
+                ? '✅ Noise hidden (vendor / likely-FP)'
+                : '🚫 Hide vendor / likely-FP noise';
+            applyFilters();
         }
     </script>
     <script id="bundleInspector-report-data" type="application/json">{{ report_json | safe }}</script>
@@ -418,14 +455,23 @@ class HTMLReporter(BaseReporter):
             Severity.LOW: 3,
             Severity.INFO: 4,
         }
+        def _noise(f) -> bool:
+            md = f.metadata or {}
+            if md.get("confirmed"):
+                return False  # a proven source->sink flow is never noise, even in a vendor file
+            return bool(md.get("likely_fp") or md.get("third_party_file"))
+
+        # Real app findings first; likely-noise (vendor files / likely-FP) sinks to the bottom,
+        # then by severity + risk.
         findings_sorted = sorted(
             report.findings,
-            key=lambda f: (severity_order.get(f.severity, 5), -f.risk_score)
+            key=lambda f: (1 if _noise(f) else 0, severity_order.get(f.severity, 5), -f.risk_score)
         )
 
         # Enrich each finding with a plain-language why/impact/fix, a structured source->sink flow
-        # (taint only), and a line-numbered/highlighted snippet -- so the report reads as "why is
-        # this a risk + how does the code tie to it", not a bare pattern dump.
+        # (taint only), a line-numbered/highlighted snippet, and the noise/dangerous-field cues --
+        # so the report reads as "why is this a risk + how does the code tie to it + is it noise",
+        # not a bare pattern dump.
         findings_view = [
             {
                 "f": f,
@@ -433,6 +479,12 @@ class HTMLReporter(BaseReporter):
                 "flow": flow_steps(f),
                 "snippet_html": highlight_snippet(f),
                 "confirmed": bool((f.metadata or {}).get("confirmed")),
+                "noise": _noise(f),
+                "likely_fp": bool((f.metadata or {}).get("likely_fp")),
+                "fp_reason": (f.metadata or {}).get("fp_reason") or "",
+                "third_party": (f.metadata or {}).get("third_party_file") or "",
+                # the specific server/user value that reaches the sink -- WHERE it is vulnerable
+                "danger_value": (f.metadata or {}).get("sink_source") or "",
             }
             for f in findings_sorted
         ]
