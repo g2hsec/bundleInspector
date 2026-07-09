@@ -36,6 +36,19 @@ _LIB_NAMES = (
 )
 _LIB_PARTS = {name: frozenset(re.split(r"[.\-_]", name)) for name in _LIB_NAMES}
 
+# Build/version/format tokens that carry no identity -- stripped before deciding whether a
+# SINGLE-token library name is the *sole* meaningful token of a filename.
+_NOISE_TOKENS = frozenset({
+    "js", "mjs", "cjs", "min", "map", "bundle", "slim", "esm", "umd", "iife", "amd", "common",
+    "prod", "production", "dev", "development", "debug", "pack", "packed", "dist", "src", "core",
+})
+_VERSION_TOKEN = re.compile(r"^v?\d[\d.]*$")
+
+
+def _meaningful_tokens(tokens: frozenset) -> frozenset:
+    """Filename tokens excluding build/version/format noise -- the identity-bearing tokens."""
+    return frozenset(t for t in tokens if t not in _NOISE_TOKENS and not _VERSION_TOKEN.match(t))
+
 _VENDOR_PATH = re.compile(
     r"/(?:vendor|vendors|lib|libs|node_modules|bower_components|plugins?|"
     r"third[_-]?party|externals?|dist/vendor|assets/vendor)/",
@@ -54,10 +67,20 @@ def classify_vendor_file(url: str, content: Optional[str] = None) -> Optional[st
     if not base:
         return None
     tokens = frozenset(t for t in re.split(r"[.\-_]", base) if t)
+    meaningful = _meaningful_tokens(tokens)
 
-    # 1) exact-token library-name match in the basename (precise: no substring false hits)
+    # 1) library-name match in the basename (precise: no substring false hits).
+    #    - MULTI-token names (react-dom, owl.carousel, socket.io) keep the exact-subset match.
+    #    - SINGLE-token names (chart, moment, ace, three, wow, ...) are common English words, so a
+    #      mere subset match hits first-party files like `revenue-chart.js` / `user-prototype.js`
+    #      and would hide a real finding there. Require the library token to be the SOLE meaningful
+    #      (non-build/version) token instead. Multi-token names are checked first so the most
+    #      specific label wins (jquery-migrate over jquery).
     for name, parts in _LIB_PARTS.items():
-        if parts <= tokens:
+        if len(parts) >= 2 and parts <= tokens:
+            return name
+    for name, parts in _LIB_PARTS.items():
+        if len(parts) == 1 and meaningful == parts:
             return name
 
     # 2) served from a conventional vendor/library directory

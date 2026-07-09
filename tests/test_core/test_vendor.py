@@ -10,11 +10,12 @@ from bundleInspector.core.vendor import classify_vendor_file
 
 @pytest.mark.parametrize("url,expect", [
     ("https://x/static/mall/js/jquery-3.7.1.min.js", "jquery"),
-    ("https://x/js/jquery-migrate-3.5.2.min.js", "jquery"),
+    # multi-token names win over the single-token prefix, so the label is the most specific lib
+    ("https://x/js/jquery-migrate-3.5.2.min.js", "jquery-migrate"),
     ("https://x/js/swiper.js", "swiper"),
     ("https://x/js/jsencrypt.min.js", "jsencrypt"),
     ("https://x/js/bootstrap.bundle.min.js", "bootstrap"),
-    ("https://x/js/react-dom.production.min.js", "react"),
+    ("https://x/js/react-dom.production.min.js", "react-dom"),
     ("https://x/js/owl.carousel.min.js", "owl.carousel"),
     ("https://x/vendor/anything.js", "vendor-dir"),
     ("https://x/node_modules/foo/index.js", "vendor-dir"),
@@ -36,6 +37,15 @@ def test_vendor_files_tagged(url, expect):
     "https://x/js/grace.js",            # contains 'ace' but not the token 'ace'
     "https://x/js/purchart.js",         # contains 'chart' but not the token 'chart'
     "https://x/js/swiperConfig.js",     # app config, not the swiper library
+    # single-token library names are common English words: a first-party file that merely
+    # CONTAINS the token (as one of several meaningful tokens) must NOT be classified vendor,
+    # or a real finding/secret in it would be hidden.
+    "https://x/js/revenue-chart.js",    # 'chart' is not the sole meaningful token
+    "https://x/js/org-chart.js",
+    "https://x/js/user-prototype.js",   # 'prototype'
+    "https://x/js/three-column.js",     # 'three'
+    "https://x/js/moment-picker.js",    # 'moment'
+    "https://x/js/ace-editor-config.js",# 'ace'
 ])
 def test_first_party_files_not_tagged(url):
     assert classify_vendor_file(url) is None
