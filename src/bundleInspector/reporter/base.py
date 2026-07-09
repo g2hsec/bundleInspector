@@ -26,13 +26,30 @@ def mask_secret_findings(report: Report, visible_chars: int = 4) -> None:
         finding.masked_value = masked
         if finding.evidence is not None and finding.evidence.snippet:
             finding.evidence.snippet = finding.evidence.snippet.replace(raw, masked)
-        metadata = finding.metadata or {}
-        snippet = metadata.get("original_snippet")
-        if isinstance(snippet, str):
-            metadata["original_snippet"] = snippet.replace(raw, masked)
-        normalized = metadata.get("normalized_evidence")
-        if isinstance(normalized, dict) and isinstance(normalized.get("snippet"), str):
-            normalized["snippet"] = normalized["snippet"].replace(raw, masked)
+        # Sweep the whole metadata tree: the raw secret can hide in matched_text, original_snippet,
+        # normalized_evidence.snippet, extracted_fields.*, etc. -- redact every string so no report
+        # format (incl. the HTML report's embedded JSON) can leak it. Per-field handling missed
+        # matched_text.
+        _redact_raw_in_tree(finding.metadata, raw, masked)
+
+
+def _redact_raw_in_tree(obj: object, raw: str, masked: str) -> None:
+    """Recursively replace every occurrence of `raw` with `masked` in all strings inside a
+    metadata dict/list, in place."""
+    if isinstance(obj, dict):
+        for key, val in obj.items():
+            if isinstance(val, str):
+                if raw in val:
+                    obj[key] = val.replace(raw, masked)
+            elif isinstance(val, (dict, list)):
+                _redact_raw_in_tree(val, raw, masked)
+    elif isinstance(obj, list):
+        for i, val in enumerate(obj):
+            if isinstance(val, str):
+                if raw in val:
+                    obj[i] = val.replace(raw, masked)
+            elif isinstance(val, (dict, list)):
+                _redact_raw_in_tree(val, raw, masked)
 
 
 class BaseReporter(ABC):
