@@ -130,39 +130,61 @@ def build_chains(report: Any, first_party_only: bool = False) -> list[dict]:
     return chains
 
 
+def _short_ep(ep: Any) -> str:
+    """Trim an endpoint to its last path segment (drop `${...}/` prefixes) for a compact list."""
+    s = str(ep).strip()
+    return s.rsplit("/", 1)[-1] if "/" in s else s
+
+
+def _row(label: str, value: str) -> str:
+    """One aligned detail row inside a chain block."""
+    return f"        {label:<9} {value}"
+
+
 def render_chains(chains: list[dict]) -> str:
     """Render chains as plain text (no rich markup -- print with markup=False)."""
     if not chains:
         return ""
     confirmed = sum(1 for c in chains if c["kind"] == "confirmed")
     candidate = len(chains) - confirmed
-    out: list[str] = ["", "=" * 74,
-                      f"  ATTACK CHAINS  ({confirmed} confirmed, {candidate} candidate)", "=" * 74]
+    bar = "═" * 72
+    out: list[str] = [
+        "", bar,
+        f"  ATTACK CHAINS  —  {confirmed} confirmed · {candidate} candidate", bar,
+        "  ● confirmed (proven source→sink dataflow)   "
+        "○ candidate (name-heuristic, verify manually)",
+    ]
     for i, c in enumerate(chains, 1):
         fn = (c["file"].rsplit("/", 1)[-1] or c["file"])[:60]
-        vendor = f"   [3p:{c['third_party']} -- likely library noise/FP]" if c.get("third_party") else ""
+        vendor = f"   [3p:{c['third_party']} · likely library noise]" if c.get("third_party") else ""
         out.append("")
         if c["kind"] == "confirmed":
-            out.append(f"[{i}] CONFIRMED dataflow XSS chain            {c['severity'].upper()}/{c['confidence']}{vendor}")
-            out.append(f"    file    : {fn}")
-            out.append(f"    SOURCE  : {c['source_kind']}  @L{c['source_line']}")
+            out.append(f"  ● [{i}] CONFIRMED  DOM/stored-XSS dataflow"
+                       f"   —   {c['severity'].upper()} / {c['confidence']}{vendor}")
+            out.append(_row("file", fn))
+            out.append(_row("source", f"{c['source_kind']} @L{c['source_line']}"))
             attr = f" ['{c['sink_attr']}' attr]" if c["sink_attr"] else ""
-            out.append(f"    SINK    : {c['sink']}{attr}  @L{c['sink_line']}   (value: {c['sink_source']})")
-            if c["flow_path"]:
-                out.append(f"    FLOW    : {'  ->  '.join(str(s) for s in c['flow_path'])}")
+            out.append(_row("sink", f"{c['sink']}{attr} @L{c['sink_line']}"
+                                    f"   ←  tainted value: {c['sink_source']}"))
+            out.append(_row("flow", f"{c['source_kind']} @L{c['source_line']}  →  "
+                                    f"`{c['sink_source']}`  →  {c['sink']} @L{c['sink_line']}"))
             if c["indicator"]:
-                out.append(f"    indicator: {c['indicator']} flagged at the same sink")
-            for vt, val, ln in c["uploads"]:
-                out.append(f"    +-> linked upload surface: {vt} `{val}` @L{ln}  (upload -> <img src> stored-XSS)")
+                out.append(_row("indicator", f"{c['indicator']} flagged at the same sink"))
+            if c["uploads"]:
+                vt = c["uploads"][0][0]
+                val = c["uploads"][0][1]
+                at = ", ".join(f"@L{ln}" for _, _, ln in c["uploads"])
+                out.append(_row("upload", f"{vt} `{val}` {at}  → stored-XSS via <img src>"))
             if c["endpoints"]:
-                eps = ", ".join(str(e)[:38] for e in c["endpoints"][:4])
-                extra = "" if len(c["endpoints"]) <= 4 else f" (+{len(c['endpoints']) - 4} more)"
-                out.append(f"    context : same-file endpoints for replay: {eps}{extra}")
+                eps = ", ".join(_short_ep(e) for e in c["endpoints"][:3])
+                extra = "" if len(c["endpoints"]) <= 3 else f"  (+{len(c['endpoints']) - 3} more)"
+                out.append(_row("replay", f"{eps}{extra}"))
         else:
-            out.append(f"[{i}] CANDIDATE chain (name-heuristic, UNCONFIRMED)   {c['severity'].upper()}{vendor}")
-            out.append(f"    file    : {fn}")
-            out.append(f"    upload `{c['upload']}` @L{c['upload_line']}  <->  sink {c['sink']} @L{c['sink_line']}"
-                       f"  (value: {c['sink_source']})")
-            out.append(f"    note    : dataflow not proven -- verify manually")
+            out.append(f"  ○ [{i}] CANDIDATE  name-heuristic, UNCONFIRMED"
+                       f"   —   {c['severity'].upper()}{vendor}")
+            out.append(_row("file", fn))
+            out.append(_row("link", f"upload `{c['upload']}` @L{c['upload_line']}  ↔  "
+                                    f"{c['sink']} @L{c['sink_line']}   (value: {c['sink_source']})"))
+            out.append(_row("note", "dataflow not proven — verify manually"))
     out.append("")
     return "\n".join(out)

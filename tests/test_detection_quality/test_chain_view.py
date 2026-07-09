@@ -61,9 +61,10 @@ def test_confirmed_supersedes_candidate_at_same_sink():
 def test_render_is_plain_text_with_headers():
     text = render_chains(build_chains(_report()))
     assert "ATTACK CHAINS" in text
-    assert "CONFIRMED dataflow XSS chain" in text
-    assert "SOURCE" in text and "SINK" in text and "FLOW" in text
-    assert "CANDIDATE chain" in text
+    assert "CONFIRMED" in text and "DOM/stored-XSS" in text
+    assert "source" in text and "sink" in text and "flow" in text
+    assert "CANDIDATE" in text
+    assert "●" in text and "○" in text  # confirmed / candidate legend markers
 
 
 def test_vendor_chain_tagged_and_optionally_filtered():

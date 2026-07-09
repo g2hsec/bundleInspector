@@ -22,6 +22,8 @@ from rich.console import Console
 from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from rich.table import Table
 from rich.panel import Panel
+from rich.markup import escape
+from rich import box
 
 from bundleInspector import __version__
 from bundleInspector.config import (
@@ -967,20 +969,43 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
     """Print scan summary."""
     console.print()
 
-    # Summary table
-    table = Table(title="Scan Summary", show_header=True)
-    table.add_column("Metric", style="cyan")
-    table.add_column("Value", style="green")
+    def _is_noise(f) -> bool:
+        md = f.metadata or {}
+        if md.get("confirmed"):
+            return False  # a proven source->sink flow is never noise, even in a vendor file
+        return bool(md.get("third_party_file") or md.get("likely_fp"))
 
-    table.add_row("JS Files Analyzed", str(report.summary.total_js_files))
-    table.add_row("Total Findings", str(report.summary.total_findings))
-    table.add_row("Duration", f"{report.duration_seconds:.2f}s")
+    all_findings = list(report.findings or [])
+    noise_n = sum(1 for f in all_findings if _is_noise(f))
+    first_party_n = len(all_findings) - noise_n
 
-    console.print(table)
+    # --- Scan Summary panel: target, files, findings split, severity (one compact block) ---
+    sev_counts = report.summary.findings_by_severity or {}
+    sev_cells = [f"[{clr}]{sev_counts.get(k, 0)} {lbl}[/{clr}]"
+                 for k, lbl, clr in (("critical", "CRIT", "red"), ("high", "HIGH", "yellow"),
+                                     ("medium", "MED", "cyan"), ("low", "LOW", "green"),
+                                     ("info", "INFO", "white")) if sev_counts.get(k, 0)]
+    targets = list(getattr(report, "seed_urls", []) or [])
+    target = escape(targets[0] + (f"  (+{len(targets) - 1} more)" if len(targets) > 1 else "")) \
+        if targets else "local files"
 
-    # No JS analyzed is almost always a fixable block/scope/network issue -- surface remedies
-    # prominently instead of leaving the user to guess (the per-event `hint=` in the warnings
-    # above carries the exact reason).
+    grid = Table.grid(padding=(0, 2))
+    grid.add_column(style="bold cyan", justify="right")
+    grid.add_column()
+    grid.add_row("Target", target)
+    grid.add_row("JS files", f"{report.summary.total_js_files} analyzed"
+                             f"    [dim]|[/dim]    Duration {report.duration_seconds:.1f}s")
+    fl = f"[bold]{report.summary.total_findings}[/bold] total"
+    if noise_n:
+        fl += (f"    [dim]|[/dim]    {first_party_n} first-party"
+               f"    [dim]|[/dim]    [dim]{noise_n} demoted (noise)[/dim]")
+    grid.add_row("Findings", fl)
+    if sev_cells:
+        grid.add_row("Severity", "   ".join(sev_cells))
+    console.print(Panel(grid, title="[bold]Scan Summary[/bold]", border_style="blue",
+                        box=box.ROUNDED, expand=False, padding=(0, 1)))
+
+    # No JS analyzed is almost always a fixable block/scope/network issue -- surface remedies.
     if report.summary.total_js_files == 0:
         console.print(
             "\n[yellow]No JS files were analyzed.[/yellow] Common causes & recommended options:\n"
@@ -991,68 +1016,42 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
             "(needs [cyan]playwright install chromium[/cyan])\n"
             "  [dim](see the warnings above -- each carries a `hint=` with the exact reason)[/dim]"
         )
+        return
 
-    # Severity breakdown
-    if report.summary.total_findings > 0:
+    # --- Findings table: risk-ranked, de-duplicated, noise dimmed at the bottom ---
+    if all_findings:
         console.print()
-        sev_table = Table(title="Findings by Severity", show_header=True)
-        sev_table.add_column("Severity", style="cyan")
-        sev_table.add_column("Count", style="green")
-
-        severity_colors = {
-            "critical": "red",
-            "high": "yellow",
-            "medium": "blue",
-            "low": "green",
-            "info": "white",
-        }
-
-        for sev, count in report.summary.findings_by_severity.items():
-            if count > 0:
-                color = severity_colors.get(sev, "white")
-                sev_table.add_row(
-                    f"[{color}]{sev.upper()}[/{color}]",
-                    str(count),
-                )
-
-        console.print(sev_table)
-
-    if report.findings:
-        console.print()
-        display_findings = list(report.findings)
-
-        def _is_noise(f) -> bool:
-            md = f.metadata or {}
-            if md.get("confirmed"):
-                return False  # a proven source->sink flow is never noise, even in a vendor file
-            return bool(md.get("third_party_file") or md.get("likely_fp"))
-
-        hidden_noise = 0
         if first_party_only:
-            kept = [f for f in display_findings if not _is_noise(f)]
-            hidden_noise = len(display_findings) - len(kept)
-            display_findings = kept
-        # Real app findings first; likely-noise (vendor files / likely-FP) sinks to the bottom.
-        sorted_findings = sorted(
-            display_findings,
-            key=lambda f: (1 if _is_noise(f) else 0, -(f.risk_score or 0)),
-        )
-        console.print("[bold]Findings:[/bold]")
-        limit = 20 if len(sorted_findings) > 20 else len(sorted_findings)
-        # count noise WITHIN the shown slice only -- noise sorts last, so a truncated list may show
-        # none of it; "N of the shown" must match what the reader actually sees.
-        shown_noise = sum(1 for f in sorted_findings[:limit] if _is_noise(f))
+            shown = [f for f in all_findings if not _is_noise(f)]
+            hidden_noise = len(all_findings) - len(shown)
+        else:
+            shown = list(all_findings)
+            hidden_noise = 0
+        shown.sort(key=lambda f: (1 if _is_noise(f) else 0, -(f.risk_score or 0)))
 
-        for finding in sorted_findings[:limit]:
-            console.print(f"  {_format_cli_finding_line(finding)}")
-        if len(sorted_findings) > limit:
-            console.print(f"  ... and {len(sorted_findings) - limit} more findings")
+        limit = 20 if len(shown) > 20 else len(shown)
+        scope = "first-party only" if first_party_only else "highest risk first"
+        cap = f"    [dim]showing {limit} of {len(shown)}[/dim]" if len(shown) > limit else ""
+        console.print(f"[bold]Findings[/bold]  [dim]— {scope}[/dim]{cap}")
+
+        ftable = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold",
+                       expand=False, pad_edge=False, padding=(0, 1))
+        ftable.add_column("#", justify="right", style="dim", no_wrap=True)
+        ftable.add_column("Risk", no_wrap=True)
+        ftable.add_column("Type", no_wrap=True, style="dim")
+        ftable.add_column("Finding", no_wrap=True, overflow="ellipsis", max_width=54)
+        ftable.add_column("Location", no_wrap=True, style="cyan")
+        for i, f in enumerate(shown[:limit], 1):
+            risk, typ, cell, loc = _finding_row(f)
+            ftable.add_row(str(i), risk, typ, cell, loc, style="dim" if _is_noise(f) else None)
+        console.print(ftable)
+
+        if len(shown) > limit:
+            console.print(f"  [dim]… and {len(shown) - limit} more (full inventory in the saved report)[/dim]")
         if hidden_noise:
-            console.print(f"  [dim](+{hidden_noise} vendor / likely-FP findings hidden by "
-                          f"--first-party-only; the saved report keeps them, labelled)[/dim]")
-        elif shown_noise:
-            console.print(f"  [dim]({shown_noise} of the shown findings are likely noise/FP -- re-run "
-                          f"with --first-party-only to hide)[/dim]")
+            console.print(f"  [dim](+{hidden_noise} vendor / likely-FP hidden by --first-party-only; kept in the report)[/dim]")
+        elif noise_n and not first_party_only:
+            console.print(f"  [dim]{noise_n} vendor/likely-FP finding(s) demoted to the bottom — --first-party-only to hide[/dim]")
 
     if show_chains:
         try:
@@ -1064,6 +1063,41 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
                 console.print("\n[dim]No DOM/stored-XSS attack chains (sink+flow+upload) found.[/dim]")
         except Exception as e:  # a presentation-layer error must never fail the scan
             logger.warning("chain_view_error", error=str(e))
+
+
+_SEV_COLOR = {"critical": "red", "high": "yellow", "medium": "cyan", "low": "green", "info": "white"}
+_SEV_ABBR = {"critical": "CRIT", "high": "HIGH", "medium": "MED", "low": "LOW", "info": "INFO"}
+
+
+def _finding_row(finding) -> tuple[str, str, str, str]:
+    """Structured, de-duplicated cells for the findings table: (risk, type, finding, location).
+
+    Kills the old `title :: value` redundancy (value is shown only when it adds information beyond
+    the title), marks confirmed flows with a check, and tags vendor / likely-FP noise. All dynamic
+    text is markup-escaped so a finding value can't inject console markup."""
+    tier = finding.risk_tier.value if finding.risk_tier else "P?"
+    sev = finding.severity.value if finding.severity else "info"
+    clr = _SEV_COLOR.get(sev, "white")
+    risk = f"[{clr}]{tier} {_SEV_ABBR.get(sev, sev.upper())}[/{clr}]"
+    typ = finding.category.value.upper() if finding.category else "?"
+    ev = finding.evidence
+    base = ev.file_url.rsplit("/", 1)[-1] if ev and ev.file_url else "?"
+    loc = escape(f"{base}:{ev.line if ev else 0}")
+
+    title = escape((finding.title or "").replace(" -> ", " → "))
+    value = escape((finding.masked_value or finding.extracted_value or "").replace(" -> ", " → "))
+    cell = title
+    if value and value.lower() not in title.lower():   # only append value when it adds info
+        cell = f"{title}  [dim]· {value if len(value) <= 32 else value[:31] + '…'}[/dim]"
+
+    md = finding.metadata if isinstance(finding.metadata, dict) else {}
+    if md.get("confirmed"):
+        cell = f"[green]✓[/green] {cell}"           # confirmed dataflow -- the crown jewels
+    elif md.get("third_party_file"):
+        cell += f"  [dim]‹3p:{escape(str(md['third_party_file']))}›[/dim]"
+    elif md.get("likely_fp"):
+        cell += "  [dim]‹likely-FP›[/dim]"
+    return risk, typ, cell, loc
 
 
 def _format_cli_finding_line(finding) -> str:
