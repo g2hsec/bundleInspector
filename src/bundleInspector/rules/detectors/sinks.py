@@ -320,8 +320,13 @@ class DomSinkDetector(BaseRule):
             seen.add(key)
             # The `${source}` interpolation usually sits many lines below the template's start line;
             # anchor the SNIPPET there so it actually shows the vulnerable value (the finding `line`
-            # stays at the construct start for the detection gate).
-            snippet_line = (line + text[:m.start()].count("\n")) if line else None
+            # stays at the construct start for the detection gate). Prefer the matched expression's
+            # OWN source line -- counting sentinel-collapsed newlines undercounts when an earlier
+            # `${...}` spanned multiple source lines.
+            target_expr = exprs[sent_idx]
+            expr_start = (target_expr.get("loc") or {}).get("start") or {} \
+                if isinstance(target_expr, dict) else {}
+            snippet_line = expr_start.get("line") or ((line + text[:m.start()].count("\n")) if line else None)
             yield self._result(
                 f"html {attr}= injection", "dom_attr_injection", Severity.HIGH, Confidence.MEDIUM,
                 line, col,

@@ -19,6 +19,14 @@ _SINK_INDICATOR_TYPES = {"dom_html_sink", "dom_attr_sink", "dom_attr_injection",
 _SEV_RANK = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
 
 
+def _vuln_class(sink: str) -> str:
+    """The vulnerability class implied by the sink -- a taint_flow is not always DOM-XSS."""
+    s = (sink or "").lower()
+    if any(k in s for k in ("eval", "function", "settimeout", "setinterval", "execscript")):
+        return "code-injection"
+    return "DOM/stored-XSS"
+
+
 def _file(f: Any) -> str:
     ev = getattr(f, "evidence", None)
     return (getattr(ev, "file_url", "") or "") if ev else ""
@@ -101,9 +109,11 @@ def build_chains(report: Any, first_party_only: bool = False) -> list[dict]:
         if src is None or tgt is None:
             continue
         sink_f = tgt if _cat(tgt) == "sink" else (src if _cat(src) == "sink" else None)
-        up_f = src if _cat(src) == "upload" else (tgt if _cat(tgt) == "upload" else None)
         if sink_f is None:
             continue
+        # the non-sink side of the edge -- an UPLOAD finding OR an upload/file ENDPOINT (don't
+        # assume 'upload'; label it by its real category so an endpoint source is not dropped).
+        src_f = src if sink_f is tgt else tgt
         fu, sl = _file(sink_f), _line(sink_f)
         if (fu, sl) in confirmed_sinks:
             continue  # a proven flow already covers this sink
@@ -116,8 +126,9 @@ def build_chains(report: Any, first_party_only: bool = False) -> list[dict]:
             "sink": getattr(sink_f, "value_type", ""),
             "sink_line": sl,
             "sink_source": (getattr(sink_f, "metadata", None) or {}).get("sink_source", ""),
-            "upload": getattr(up_f, "extracted_value", "") if up_f else "",
-            "upload_line": _line(up_f) if up_f else 0,
+            "source_cat": _cat(src_f) or "source",
+            "upload": getattr(src_f, "extracted_value", "") if src_f else "",
+            "upload_line": _line(src_f) if src_f else 0,
             "reasoning": getattr(c, "reasoning", ""),
         })
 
@@ -159,22 +170,26 @@ def render_chains(chains: list[dict]) -> str:
         vendor = f"   [3p:{c['third_party']} · likely library noise]" if c.get("third_party") else ""
         out.append("")
         if c["kind"] == "confirmed":
-            out.append(f"  ● [{i}] CONFIRMED  DOM/stored-XSS dataflow"
+            attr = f" ['{c['sink_attr']}' attr]" if c["sink_attr"] else ""
+            sink_desc = f"{c['sink']}{attr}"
+            out.append(f"  ● [{i}] CONFIRMED  {_vuln_class(c['sink'])} dataflow"
                        f"   —   {c['severity'].upper()} / {c['confidence']}{vendor}")
             out.append(_row("file", fn))
             out.append(_row("source", f"{c['source_kind']} @L{c['source_line']}"))
-            attr = f" ['{c['sink_attr']}' attr]" if c["sink_attr"] else ""
-            out.append(_row("sink", f"{c['sink']}{attr} @L{c['sink_line']}"
+            out.append(_row("sink", f"{sink_desc} @L{c['sink_line']}"
                                     f"   ←  tainted value: {c['sink_source']}"))
             out.append(_row("flow", f"{c['source_kind']} @L{c['source_line']}  →  "
                                     f"`{c['sink_source']}`  →  {c['sink']} @L{c['sink_line']}"))
             if c["indicator"]:
                 out.append(_row("indicator", f"{c['indicator']} flagged at the same sink"))
             if c["uploads"]:
+                # a same-file upload surface (co-occurrence, not part of the proven flow) -- the
+                # vector is whatever this chain's actual sink is, not a hard-coded <img src>.
                 vt = c["uploads"][0][0]
                 val = c["uploads"][0][1]
                 at = ", ".join(f"@L{ln}" for _, _, ln in c["uploads"])
-                out.append(_row("upload", f"{vt} `{val}` {at}  → stored-XSS via <img src>"))
+                out.append(_row("upload", f"{vt} `{val}` {at}  → stored-XSS if it reaches the "
+                                          f"{sink_desc} sink above"))
             if c["endpoints"]:
                 eps = ", ".join(_short_ep(e) for e in c["endpoints"][:3])
                 extra = "" if len(c["endpoints"]) <= 3 else f"  (+{len(c['endpoints']) - 3} more)"
@@ -183,8 +198,9 @@ def render_chains(chains: list[dict]) -> str:
             out.append(f"  ○ [{i}] CANDIDATE  name-heuristic, UNCONFIRMED"
                        f"   —   {c['severity'].upper()}{vendor}")
             out.append(_row("file", fn))
-            out.append(_row("link", f"upload `{c['upload']}` @L{c['upload_line']}  ↔  "
-                                    f"{c['sink']} @L{c['sink_line']}   (value: {c['sink_source']})"))
+            out.append(_row("link", f"{c.get('source_cat', 'source')} `{c['upload']}` "
+                                    f"@L{c['upload_line']}  ↔  {c['sink']} @L{c['sink_line']}"
+                                    f"   (value: {c['sink_source']})"))
             out.append(_row("note", "dataflow not proven — verify manually"))
     out.append("")
     return "\n".join(out)

@@ -34,6 +34,23 @@ class TestExplainFinding:
         # an endpoint is attack surface, explicitly NOT a vuln on its own
         assert "not a vulnerability" in endpoint["impact"].lower()
 
+    def test_taint_flow_into_eval_is_code_injection_not_dom_xss(self):
+        # over-fit fix: a taint_flow whose sink is eval() is code injection, not DOM-XSS
+        e = explain_finding(_f(Category.SINK, "taint_flow",
+                               meta={"sink": "eval()", "sink_source": "x", "source_kind": "url"}))
+        assert "dompurify" not in e["fix"].lower()          # DOM fix is nonsensical for eval
+        assert "eval" in e["fix"].lower() or "function" in e["fix"].lower()
+
+    def test_taint_flow_into_html_stays_dom_xss(self):
+        e = explain_finding(_f(Category.SINK, "taint_flow",
+                               meta={"sink": ".html()", "sink_source": "x", "source_kind": "ajax"}))
+        assert "xss" in e["impact"].lower()
+
+    def test_client_route_gets_route_explanation_not_endpoint(self):
+        # over-fit fix: client_route (value_type) wins over the endpoint category fallback
+        e = explain_finding(_f(Category.ENDPOINT, "client_route"))
+        assert "route" in e["why"].lower() and "server" in e["fix"].lower()
+
     def test_unknown_value_type_falls_back_to_category(self):
         # a value_type with no specific entry still gets a sensible sink-level explanation
         e = explain_finding(_f(Category.SINK, "some_new_sink_kind"))

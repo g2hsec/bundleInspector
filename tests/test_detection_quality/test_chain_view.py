@@ -90,6 +90,16 @@ def test_vendor_chain_tagged_and_optionally_filtered():
     assert any(c["file"].endswith("shopfront.js") for c in fp_only)  # app kept
 
 
+def test_render_labels_code_injection_for_an_eval_sink():
+    # over-fit fix: a taint_flow into eval() is code injection, not "DOM/stored-XSS"
+    tf = _f(Category.SINK, "taint_flow", 50, meta={
+        "source_kind": "url", "source_line": 49, "sink": "eval()", "sink_line": 50,
+        "sink_source": "location.hash", "flow_path": ["source @L49", "location.hash", "eval() @L50"]})
+    txt = render_chains(build_chains(Report(findings=[tf], correlations=[])))
+    assert "code-injection dataflow" in txt
+    assert "DOM/stored-XSS dataflow" not in txt
+
+
 def test_no_crash_on_empty_and_malformed():
     assert render_chains(build_chains(Report(findings=[], correlations=[]))) == ""
     # taint_flow with no metadata, correlation with dangling ids -> no exception

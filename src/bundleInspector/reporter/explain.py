@@ -94,6 +94,12 @@ _EXPLAIN: Dict[str, tuple[str, str, str]] = {
         "Real-time surface -- test origin checks and message authorization.",
         "Validate Origin and authorize every message server-side.",
     ),
+    "client_route": (
+        "A client-side route/view was discovered in the SPA router (not a server API).",
+        "Maps the app's navigable surface, incl. possibly privileged/admin views hidden only in JS.",
+        "Gate sensitive routes with SERVER-side authorization -- hiding a route in the client is not "
+        "access control.",
+    ),
 }
 
 # Coarser fallback by category name (finding.category.value).
@@ -164,6 +170,13 @@ def explain_finding(finding: Finding) -> Dict[str, str]:
     try:
         vt = getattr(finding, "value_type", "") or ""
         cat = getattr(getattr(finding, "category", None), "value", "") or ""
+        # A taint_flow is not always DOM-XSS -- when the sink is eval()/new Function()/string timer,
+        # it is code injection, so reuse the code-execution explanation (a DOM/DOMPurify fix would be
+        # nonsensical there).
+        if vt == "taint_flow":
+            sink = str((getattr(finding, "metadata", {}) or {}).get("sink", "")).lower()
+            if any(k in sink for k in ("eval", "function", "settimeout", "setinterval", "execscript")):
+                vt = "code_eval_sink"
         why, impact, fix = _EXPLAIN.get(vt) or _CATEGORY_EXPLAIN.get(cat) or _GENERIC
         return {"why": why, "impact": impact, "fix": fix}
     except Exception:
