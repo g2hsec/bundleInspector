@@ -305,8 +305,9 @@ HTML_TEMPLATE = """
             <h2>Findings</h2>
             {% if noise_count > 0 %}
             <div class="noise-banner">
-                Showing <strong>{{ real_count }}</strong> likely-real finding{{ 's' if real_count != 1 }} &mdash;
-                <strong>{{ noise_count }}</strong> vendor / likely-FP finding{{ 's' if noise_count != 1 }} hidden by default (kept in the report). Use the toggle to show them.
+                Showing <strong>{{ first_party_count }}</strong> first-party finding{{ 's' if first_party_count != 1 }} to review &mdash;
+                <strong>{{ noise_count }}</strong> vendor / likely-FP finding{{ 's' if noise_count != 1 }} hidden (kept in the report; use the toggle to show).
+                <span style="opacity:.75">These are not all vulnerabilities &mdash; endpoints/flags are attack surface. Sorted by severity; confirmed dataflows &amp; injections rank first.</span>
             </div>
             {% endif %}
             <div class="filter-bar">
@@ -408,7 +409,7 @@ HTML_TEMPLATE = """
 
     <script>
         // Severity and noise are two independent filters; a finding shows only if it passes both.
-        // Noise (vendor / likely-FP) starts HIDDEN so the default view is the likely-real findings.
+        // Noise (vendor / likely-FP) starts HIDDEN so the default view is the first-party findings.
         var curSeverity = 'all', hideNoise = true;
         function applyFilters() {
             document.querySelectorAll('.finding[data-severity]').forEach(function (f) {
@@ -521,7 +522,9 @@ class HTMLReporter(BaseReporter):
             findings_sorted=findings_sorted,
             findings_view=findings_view,
             noise_count=noise_count,
-            real_count=len(findings_view) - noise_count,
+            # NOT "real vulnerabilities" -- these are first-party findings after vendor/likely-FP
+            # noise is removed; they still include attack surface (endpoints) and need triage.
+            first_party_count=len(findings_view) - noise_count,
             report_json=report_json,
         )
 

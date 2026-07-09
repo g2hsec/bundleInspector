@@ -343,7 +343,10 @@ def test_html_reporter_hides_noise_by_default_with_banner():
     )
     html = HTMLReporter().generate(Report(findings=[real, noise]))
     assert "hideNoise = true" in html          # default view hides noise
-    assert "noise-banner" in html and "hidden by default" in html
+    assert "noise-banner" in html and "first-party finding" in html and "to review" in html
+    # honest framing: the banner must NOT call them real vulnerabilities
+    assert "likely-real" not in html
+    assert "not all vulnerabilities" in html
     assert 'data-noise="1"' in html            # the noise finding is still present (recoverable)
 
 

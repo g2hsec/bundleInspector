@@ -414,7 +414,7 @@ A **CONFIRMED** taint flow (proven `source → sink` dataflow) is **never** demo
 
 **Where you see it**
 - **Console** — likely-FP / vendor findings sort to the bottom, are tagged (`[3p:…]` / `[likely FP: …]`), and a count line points to `--first-party-only` to hide them.
-- **HTML report** — noise findings are **hidden by default** (a banner states "showing N real · M vendor/likely-FP hidden"); a toggle reveals them, and they stay in the saved report. Each sink shows a **DANGEROUS VALUE** line naming the exact value that reaches the sink, and the code snippet is anchored on that value (even when it sits deep inside a multi-line HTML template) so you can see it highlighted.
+- **HTML report** — noise findings are **hidden by default** (a banner states "showing N **first-party findings to review** · M vendor/likely-FP hidden"); a toggle reveals them, and they stay in the saved report. Note the N are **not all vulnerabilities** — they still include attack surface (endpoints/flags); they are sorted by severity so confirmed dataflows & injections rank first. Each sink shows a **DANGEROUS VALUE** line naming the exact value that reaches the sink, and the code snippet is anchored on that value (even when it sits deep inside a multi-line HTML template) so you can see it highlighted.
 
 > Example: on a real 145-finding scan, 102 were demoted as vendor/likely-FP noise while **all** confirmed XSS flows and dangerous-field injections were retained and ranked first.
 
