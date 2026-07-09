@@ -325,6 +325,28 @@ def test_html_reporter_demotes_and_labels_noise_findings():
     assert html.index("Real sink") < html.index("Vendor secret")
 
 
+def test_html_reporter_hides_noise_by_default_with_banner():
+    """Noise (vendor / likely-FP) is HIDDEN by default so the FP reduction is visible; a banner
+    states the counts and the toggle can reveal it (findings stay in the report)."""
+    real = Finding(
+        rule_id="sink-detector", category=Category.SINK, severity=Severity.HIGH,
+        confidence=Confidence.MEDIUM, title="Real sink",
+        evidence=Evidence(file_url="https://x/app.js", file_hash="h", line=10),
+        extracted_value=".html()", value_type="dom_html_sink",
+    )
+    noise = Finding(
+        rule_id="secret-detector", category=Category.SECRET, severity=Severity.MEDIUM,
+        confidence=Confidence.LOW, title="Vendor secret",
+        evidence=Evidence(file_url="https://x/jquery.min.js", file_hash="h", line=2),
+        extracted_value="regexnoise", value_type="potential_secret",
+        metadata={"third_party_file": "jquery", "likely_fp": True, "fp_reason": "vendor"},
+    )
+    html = HTMLReporter().generate(Report(findings=[real, noise]))
+    assert "hideNoise = true" in html          # default view hides noise
+    assert "noise-banner" in html and "hidden by default" in html
+    assert 'data-noise="1"' in html            # the noise finding is still present (recoverable)
+
+
 def test_html_reporter_never_demotes_confirmed_flow_even_in_vendor_file():
     """INVARIANT: a CONFIRMED source->sink taint flow must never be treated as noise, even when it
     lives in a vendor-classified file (third_party_file set)."""

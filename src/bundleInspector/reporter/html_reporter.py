@@ -120,6 +120,10 @@ HTML_TEMPLATE = """
         }
         .noise-toggle { margin-left: auto; }
         .noise-toggle.active { background: #7a5; color: #041; }
+        .noise-banner {
+            background: rgba(120,150,80,0.14); border-left: 3px solid #7a5;
+            padding: 8px 12px; border-radius: 5px; margin-bottom: 12px; font-size: 0.92em;
+        }
         /* the specific value that reaches the sink -- "where is it vulnerable" */
         .danger-value {
             background: rgba(255,68,68,0.10); border-left: 3px solid var(--critical);
@@ -299,6 +303,12 @@ HTML_TEMPLATE = """
 
         <div class="section">
             <h2>Findings</h2>
+            {% if noise_count > 0 %}
+            <div class="noise-banner">
+                Showing <strong>{{ real_count }}</strong> likely-real finding{{ 's' if real_count != 1 }} &mdash;
+                <strong>{{ noise_count }}</strong> vendor / likely-FP finding{{ 's' if noise_count != 1 }} hidden by default (kept in the report). Use the toggle to show them.
+            </div>
+            {% endif %}
             <div class="filter-bar">
                 <button class="filter-btn active" onclick="setSeverity(event, 'all')">All</button>
                 <button class="filter-btn" onclick="setSeverity(event, 'critical')">Critical</button>
@@ -306,7 +316,7 @@ HTML_TEMPLATE = """
                 <button class="filter-btn" onclick="setSeverity(event, 'medium')">Medium</button>
                 <button class="filter-btn" onclick="setSeverity(event, 'low')">Low</button>
                 <button class="filter-btn noise-toggle" onclick="toggleNoise(this)"
-                    title="Hide third-party library findings and likely false positives">&#128683; Hide vendor / likely-FP noise</button>
+                    title="Show/hide third-party library findings and likely false positives">&#128065; Show vendor / likely-FP noise</button>
             </div>
 
             {% for v in findings_view %}
@@ -398,7 +408,8 @@ HTML_TEMPLATE = """
 
     <script>
         // Severity and noise are two independent filters; a finding shows only if it passes both.
-        var curSeverity = 'all', hideNoise = false;
+        // Noise (vendor / likely-FP) starts HIDDEN so the default view is the likely-real findings.
+        var curSeverity = 'all', hideNoise = true;
         function applyFilters() {
             document.querySelectorAll('.finding[data-severity]').forEach(function (f) {
                 var okSev = (curSeverity === 'all' || f.dataset.severity === curSeverity);
@@ -416,12 +427,15 @@ HTML_TEMPLATE = """
         }
         function toggleNoise(btn) {
             hideNoise = !hideNoise;
-            btn.classList.toggle('active', hideNoise);
+            btn.classList.toggle('active', !hideNoise);
             btn.innerHTML = hideNoise
-                ? '✅ Noise hidden (vendor / likely-FP)'
-                : '🚫 Hide vendor / likely-FP noise';
+                ? '👁 Show vendor / likely-FP noise'
+                : '🙈 Hide vendor / likely-FP noise';
             applyFilters();
         }
+        // Apply the default (noise hidden) once the DOM is parsed. The script tag sits at the end
+        // of <body>, so all .finding elements already exist.
+        applyFilters();
     </script>
     <script id="bundleInspector-report-data" type="application/json">{{ report_json | safe }}</script>
 </body>
@@ -501,10 +515,13 @@ class HTMLReporter(BaseReporter):
 
         env = Environment(autoescape=True)
         template = env.from_string(HTML_TEMPLATE)
+        noise_count = sum(1 for v in findings_view if v["noise"])
         return template.render(
             report=report,
             findings_sorted=findings_sorted,
             findings_view=findings_view,
+            noise_count=noise_count,
+            real_count=len(findings_view) - noise_count,
             report_json=report_json,
         )
 
