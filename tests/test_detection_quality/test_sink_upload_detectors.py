@@ -102,6 +102,33 @@ def test_jquery_attr_safe_attribute_not_flagged():
     assert _sink_by_type('$el.attr("class", dyn);', "dom_attr_sink") == []
 
 
+def test_attr_injection_snippet_anchored_on_the_interpolation():
+    # The ${x} interpolation sits several lines below the template-literal start. The code SNIPPET
+    # must show the interpolation (so the reported DANGEROUS VALUE is actually visible), while the
+    # finding `line` stays at the construct start (detection-gate stable, snippet is not in the gate).
+    src = (
+        "function render(item) {\n"          # 1
+        "  var html = `\n"                    # 2  <- template start
+        "    <section>\n"                     # 3
+        "      <h2>title</h2>\n"              # 4
+        "      <p>body copy here</p>\n"       # 5
+        "      <div class=\"thumb\">\n"        # 6
+        "        <img src=\"${item.image_url}\" alt=\"x\">\n"  # 7  <- interpolation (5 lines below)
+        "      </div>\n"                       # 8
+        "    </section>`;\n"                   # 9
+        "  $('#c').append(html);\n"           # 10
+        "}\n"
+    )
+    fs = _sink_by_type(src, "dom_attr_injection")
+    assert fs, "no dom_attr_injection finding"
+    f = fs[0]
+    assert f.metadata.get("sink_source") == "item.image_url"
+    # the fix: the interpolation (hence the dangerous value) is inside the snippet
+    assert "item.image_url" in f.evidence.snippet
+    # ...and the finding line still anchors at/above the construct, not the interpolation line
+    assert f.evidence.line <= 7
+
+
 # ---------------------------------------------------------------- file upload
 
 def test_formdata_is_upload_surface():

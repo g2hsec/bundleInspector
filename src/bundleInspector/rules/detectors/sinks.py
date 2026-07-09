@@ -318,19 +318,25 @@ class DomSinkDetector(BaseRule):
             if key in seen:
                 continue
             seen.add(key)
+            # The `${source}` interpolation usually sits many lines below the template's start line;
+            # anchor the SNIPPET there so it actually shows the vulnerable value (the finding `line`
+            # stays at the construct start for the detection gate).
+            snippet_line = (line + text[:m.start()].count("\n")) if line else None
             yield self._result(
                 f"html {attr}= injection", "dom_attr_injection", Severity.HIGH, Confidence.MEDIUM,
                 line, col,
                 f"Dynamic value `{source}` interpolated into a '{attr}' HTML attribute "
                 f"(e.g. <tag {attr}=\"${{{source}}}\">) built for a DOM sink -- DOM/stored-XSS if "
                 f"`{source}` is user- or upload-controlled",
-                metadata={"sink_source": source, "sink_attr": attr})
+                metadata={"sink_source": source, "sink_attr": attr},
+                snippet_line=snippet_line)
 
     # ---------------------------------------------------------------- helper
 
     def _result(self, sink: str, value_type: str, severity: Severity, confidence: Confidence,
                 line: int, column: int, description: str,
-                metadata: Optional[dict] = None) -> RuleResult:
+                metadata: Optional[dict] = None,
+                snippet_line: Optional[int] = None) -> RuleResult:
         return RuleResult(
             rule_id=self.id,
             category=self.category,
@@ -345,4 +351,5 @@ class DomSinkDetector(BaseRule):
             ast_node_type="",
             tags=["dom_sink", value_type],
             metadata=metadata or {},
+            snippet_line=snippet_line,
         )

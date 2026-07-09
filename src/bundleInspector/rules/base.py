@@ -76,6 +76,11 @@ class RuleResult:
     ast_node_type: str = ""
     tags: list[str] = field(default_factory=list)
     metadata: dict[str, Any] = field(default_factory=dict)
+    # Optional: anchor the code SNIPPET on a different line than `line` (which stays the finding
+    # location + detection-gate signature). Used when the vulnerable expression sits deep inside a
+    # multi-line construct (e.g. `${x}` far below a template-literal's start), so the snippet shows
+    # the actual value instead of the construct's opening line. Snippet is not in the gate signature.
+    snippet_line: int | None = None
 
 
 class BaseRule(ABC):
@@ -122,7 +127,9 @@ class BaseRule(ABC):
         Returns:
             Finding
         """
-        snippet, (start, end) = context.get_snippet(result.line)
+        snippet, (start, end) = context.get_snippet(
+            result.snippet_line if result.snippet_line is not None else result.line
+        )
 
         evidence = Evidence(
             file_url=context.file_url,
