@@ -33,6 +33,17 @@ _LIB_NAMES = (
     "core-js", "systemjs", "requirejs", "es5-shim", "es6-shim", "babel-polyfill", "webpack",
     "normalize", "font-awesome", "fontawesome", "raphael", "velocity", "anime", "aos",
     "wow", "isotope", "masonry", "imagesloaded", "flickity", "splide", "glide", "tiny-slider",
+    # modern framework / build / util ecosystem
+    "tailwind", "alpine", "alpinejs", "htmx", "stimulus", "turbo", "preact", "svelte", "solid-js",
+    "pdfjs", "pdf-lib", "recharts", "apexcharts", "hls", "hls.js", "video.js", "videojs", "plyr",
+    "dompurify", "marked", "prismjs", "highlight.js", "ag-grid", "handsontable", "tabulator",
+    "framer-motion", "immutable", "immer", "date-fns", "luxon", "rxjs", "js-cookie", "js.cookie",
+    "nanoid", "numeral", "big.js", "decimal.js", "pixi", "pixi.js", "konva", "fabric", "signature-pad",
+    "cropperjs", "cropper", "flatpickr", "air-datepicker", "daterangepicker", "intro.js", "shepherd",
+    "swiper-bundle", "aos", "gsap", "lottie", "lottie-web", "particles", "typed.js", "countup",
+    # payment / social / map SDKs common in Korean e-commerce
+    "kakao", "kakaomap", "naver", "navermaps", "tosspayments", "iamport", "nicepay", "inicis",
+    "daumcdn", "jusopostcode", "channeltalk", "channel-io", "sentry", "sentry-bundle",
 )
 _LIB_PARTS = {name: frozenset(re.split(r"[.\-_]", name)) for name in _LIB_NAMES}
 
@@ -41,13 +52,19 @@ _LIB_PARTS = {name: frozenset(re.split(r"[.\-_]", name)) for name in _LIB_NAMES}
 _NOISE_TOKENS = frozenset({
     "js", "mjs", "cjs", "min", "map", "bundle", "slim", "esm", "umd", "iife", "amd", "common",
     "prod", "production", "dev", "development", "debug", "pack", "packed", "dist", "src", "core",
+    "full", "standalone", "browser",
 })
 _VERSION_TOKEN = re.compile(r"^v?\d[\d.]*$")
+# A content-hash / fingerprint token (webpack/vite builds: jquery.min.8f2a9c.js). Requires a digit
+# so real words that are coincidentally all-hex (facade, decade, deface) are NOT stripped.
+_HASH_TOKEN = re.compile(r"^(?=.*\d)[0-9a-f]{6,}$")
 
 
 def _meaningful_tokens(tokens: frozenset) -> frozenset:
-    """Filename tokens excluding build/version/format noise -- the identity-bearing tokens."""
-    return frozenset(t for t in tokens if t not in _NOISE_TOKENS and not _VERSION_TOKEN.match(t))
+    """Filename tokens excluding build/version/format/content-hash noise -- the identity tokens."""
+    return frozenset(t for t in tokens
+                     if t not in _NOISE_TOKENS and not _VERSION_TOKEN.match(t)
+                     and not _HASH_TOKEN.match(t))
 
 _VENDOR_PATH = re.compile(
     r"/(?:vendor|vendors|lib|libs|node_modules|bower_components|plugins?|"
@@ -77,7 +94,9 @@ def classify_vendor_file(url: str, content: Optional[str] = None) -> Optional[st
     #      (non-build/version) token instead. Multi-token names are checked first so the most
     #      specific label wins (jquery-migrate over jquery).
     for name, parts in _LIB_PARTS.items():
-        if len(parts) >= 2 and parts <= tokens:
+        # ...but a multi-token name whose parts are ALL build/format noise (only `core-js`, parts
+        # {core, js}) must not match a first-party `core.js` -- require >=1 identity-bearing token.
+        if len(parts) >= 2 and parts <= tokens and _meaningful_tokens(parts):
             return name
     for name, parts in _LIB_PARTS.items():
         if len(parts) == 1 and meaningful == parts:

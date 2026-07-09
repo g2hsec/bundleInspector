@@ -20,6 +20,11 @@ from bundleInspector.core.vendor import classify_vendor_file
     ("https://x/vendor/anything.js", "vendor-dir"),
     ("https://x/node_modules/foo/index.js", "vendor-dir"),
     ("https://x/plugins/slider.js", "vendor-dir"),
+    # over-fit audit: content-hashed builds + multi-descriptor distributions + modern/Korean SDKs
+    ("https://x/js/jquery.min.8f2a9c.js", "jquery"),   # webpack/vite content hash stripped
+    ("https://x/js/xlsx.full.min.js", "xlsx"),          # 'full' descriptor is build noise
+    ("https://x/js/kakao.min.js", "kakao"),             # KR payment/social SDK
+    ("https://x/js/dompurify.min.js", "dompurify"),
 ])
 def test_vendor_files_tagged(url, expect):
     assert classify_vendor_file(url) == expect
@@ -37,6 +42,10 @@ def test_vendor_files_tagged(url, expect):
     "https://x/js/grace.js",            # contains 'ace' but not the token 'ace'
     "https://x/js/purchart.js",         # contains 'chart' but not the token 'chart'
     "https://x/js/swiperConfig.js",     # app config, not the swiper library
+    "https://x/js/core.js",             # first-party core.js must NOT match vendor 'core-js'
+    "https://x/js/core.min.js",
+    "https://x/app/core.js",
+    "https://x/js/chart-facade.js",     # 'facade' is all-hex but not a content hash (no digit)
     # single-token library names are common English words: a first-party file that merely
     # CONTAINS the token (as one of several meaningful tokens) must NOT be classified vendor,
     # or a real finding/secret in it would be hidden.

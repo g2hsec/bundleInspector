@@ -95,11 +95,11 @@ _DIRECTORY_PARAMS = frozenset(_norm(x) for x in (
     "folderPath", "dirPath", "directory", "updDir", "uploadDir", "baseDir", "rootDir", "fileDir",
     "streCours", "streDir",
 ))
-# URL params that imply a SERVER-side fetch (SSRF). `downloadUrl` (client redirect target) and
-# `callbackUrl` (OAuth) are intentionally excluded -- they are not server-fetched.
+# URL params that imply a SERVER-side fetch (SSRF) on their own. `downloadUrl` (client redirect),
+# `callbackUrl` (OAuth), and `imageUrl`/`imgUrl`/`targetUrl` (usually a stored image URL on an
+# ordinary save form) are NOT here -- they only get an SSRF role inside a fetch/download context.
 _URL_PARAMS_STRONG = frozenset(_norm(x) for x in (
-    "fileUrl", "imageUrl", "imgUrl", "remoteUrl", "targetUrl",
-    "resourceUrl", "fetchUrl", "proxyUrl",
+    "fileUrl", "remoteUrl", "resourceUrl", "fetchUrl", "proxyUrl",
 ))
 
 # Ambiguous, only meaningful inside an established download context.
@@ -107,8 +107,18 @@ _CTX_NAME_PARAMS = frozenset(_norm(x) for x in ("name", "file", "filename", "doc
                                                 "attach", "attachment", "img", "image", "photo",
                                                 "media", "content", "resource", "asset"))
 _CTX_PATH_PARAMS = frozenset(_norm(x) for x in ("path", "pth", "dir", "folder", "location", "loc"))
-_CTX_URL_PARAMS = frozenset(_norm(x) for x in ("url", "src", "link", "href", "uri", "target"))
+_CTX_URL_PARAMS = frozenset(_norm(x) for x in ("url", "src", "link", "href", "uri", "target",
+                                               "imageUrl", "imgUrl", "targetUrl", "downloadUrl"))
 _CTX_ID_PARAMS = frozenset(_norm(x) for x in ("id", "seq", "sn", "no", "num", "idx", "key"))
+# A compound id parameter is a file selector in a download context. Camel/separator-aware so this
+# generalizes to EVERY domain (couponId, certId, claimId, orderNo, boardId, ...) without the earlier
+# curated e-commerce whitelist -- and single common words (grid/valid/android/payload) don't match.
+_ID_SUFFIX = frozenset(("id", "no", "seq", "sn", "idx", "key", "num", "cd", "srl"))
+
+
+def _looks_like_id(name: str) -> bool:
+    toks = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", name or "")
+    return len(toks) >= 2 and toks[-1].lower() in _ID_SUFFIX
 
 # ---------------------------------------------------------------------------------------------
 # Path keyword lexicons. STRONG = compound, file-specific (trigger on their own). WEAK = ambiguous
@@ -135,7 +145,20 @@ _STRONG_KEYWORDS = tuple(_norm(x) for x in (
 # (they word-match dropDown/countDown/socialMedia/liveStream and are not download intent); abbreviated
 # `...DownL` coupon endpoints that return JSON simply don't surface -- judged by file signals, not name.
 _WEAK_KEYWORDS = tuple(_norm(x) for x in (
-    "download", "dwnld", "dnload", "export", "attach", "attachment", "getbinary",
+    "download", "dwnld", "dnload", "export", "getbinary",
+))
+# Bare file-collection nouns that appear as a WHOLE path segment (`/files/{id}`, `/attachments/123`,
+# `/documents/{id}`) -- the idiomatic REST download/IDOR surface the eGov-.do lexicon otherwise
+# misses. Whole-segment match (so `fileList.do` / `documentView` do not trip it).
+_FILE_COLLECTION = frozenset((
+    "file", "files", "attachment", "attachments", "attach", "document", "documents", "doc", "docs",
+    "download", "downloads", "media", "asset", "assets", "photo", "photos", "image", "images", "img",
+))
+# Server-side-fetch / image-proxy semantics -> a `url`/`src` param here is an SSRF surface (the
+# cloud-metadata SSRF the module targets). Boundary-anchored via _path_runs.
+_FETCH_KEYWORDS = frozenset((
+    "proxy", "imageproxy", "imgproxy", "urlproxy", "fetchurl", "fetchimage", "imagefetch", "resize",
+    "thumbnail", "thumb", "remotefetch", "loadremote", "urlfetch", "getremote",
 ))
 # An upload endpoint is not a download surface -- suppress it unless a strong DOWNLOAD keyword is
 # also present (a combined up/down controller). Matched as whole path-word runs.
@@ -182,10 +205,11 @@ _RISK_SEV = {"path_traversal": "high", "ssrf": "high", "file_idor": "medium",
 _MECHANISM_RE = re.compile(r"""(?ix)
       responseType \s* [:=] \s* ['"]? (?: blob | arraybuffer )
     | \b createObjectURL \b
-    | \b new \s+ Blob \b
     | \.  (?: blob | arrayBuffer ) \s* \( \s* \)
     | \b saveAs \s* \(  | \b FileSaver \b
-    | \. download \s* =
+    # a FILENAME assignment to the download attribute -- NOT `this.download = false` / `x.download === y`
+    # (the whitespace lives INSIDE the lookahead so it cannot backtrack past the boolean/number RHS)
+    | \. download \s* = (?![=]) (?! \s* (?: true | false | null | undefined | \d ) \b )
     | (?: setAttribute | attr ) \( \s* ['"] download ['"]
     | <a\b [^>]{0,80} \b download \b
     | content -? disposition
@@ -198,17 +222,6 @@ _NONFILE_WORDS = frozenset((
     "count", "cnt", "agree", "yn", "check", "chk", "stat", "statistics", "log", "history", "hist",
     "search", "validate", "valid", "exists", "duplicate", "isvalid", "verify",
 ))
-
-# Selector ids that, IN A DOWNLOAD CONTEXT, likely choose the served file (IDOR candidates). Curated
-# (not a bare `*id$` regex -- that would match grid/android/valid). Broad + Korean-aware.
-_CTX_ID_LIKE = frozenset(_norm(x) for x in (
-    "id", "seq", "sn", "no", "num", "idx", "key", "srl",
-    "couponId", "couponNo", "certId", "certNo", "receiptId", "receiptNo", "giftId", "giftcardId",
-    "barcodeId", "ticketId", "voucherId", "invoiceId", "orderId", "orderNo", "goodsNo", "goodsId",
-    "itemCd", "itemId", "prdId", "prodId", "boardId", "postId", "articleId", "noticeId", "reportId",
-    "nttId", "bbsId", "docNo", "imgSeq", "photoNo", "mberId", "userId", "memberId", "custId",
-))
-
 
 def _download_mechanism(finding) -> str:
     """The file-download response mechanism found near the call (blob/createObjectURL/download
@@ -304,7 +317,7 @@ def _role_of(name: str, *, in_context: bool) -> Optional[str]:
             return "file_path"
         if n in _CTX_URL_PARAMS:
             return "url"
-        if n in _CTX_ID_PARAMS or n in _CTX_ID_LIKE:
+        if n in _CTX_ID_PARAMS or _looks_like_id(name):
             return "file_id"
     return None
 
@@ -324,17 +337,30 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
         strong_roles = {p: _role_of(p, in_context=False) for p in params}
         strong_roles = {p: r for p, r in strong_roles.items() if r}
 
-        strong_kw = next((k for k in _STRONG_KEYWORDS if k in runs), "")
-        weak_kw = next((k for k in _WEAK_KEYWORDS if k in runs), "")
+        # Boundary-anchored runs, incl. depluralized forms so `/downloads/`, `/attachments/`,
+        # `/exports/` match the singular download/attach/export keywords (singular/plural cliff fix).
+        runs_kw = runs | {r[:-1] for r in runs if len(r) > 3 and r.endswith("s")}
+        segments = [re.sub(r"\.[a-z0-9]+$", "", s.lower()) for s in path.split("/") if s]
+
+        strong_kw = next((k for k in _STRONG_KEYWORDS if k in runs_kw), "")
+        weak_kw = next((k for k in _WEAK_KEYWORDS if k in runs_kw), "")
         strong_ext = ext in _STRONG_EXT               # standalone download signal
         any_file_ext = ext in _STRONG_EXT or ext in _SENSITIVE_EXT or ext in _MEDIA_IMAGE_EXT
+        # A bare file-collection noun as a WHOLE path segment (/files/{id}, /documents/123) is a
+        # download/IDOR surface -- a weak-tier signal like a download keyword.
+        file_collection = any(s in _FILE_COLLECTION for s in segments)
+        fetch_kw = any(k in runs_kw for k in _FETCH_KEYWORDS)
 
         # An upload endpoint is the opposite of a download -- never classify it (unless a strong
         # DOWNLOAD keyword is also present, i.e. a combined up/down controller).
         if any(w in runs for w in _UPLOAD_WORDS) and not strong_kw:
             return None
 
-        is_asset = bool(_ASSET_PATH_RE.search(path)) and not strong_kw and not strong_roles
+        # A static-asset PATH is only excluded when it carries NO download/fetch signal and NO
+        # dynamic params -- `/img/thumb?src=` (proxy) and `/resources/download.do?fileId=` are not
+        # static assets.
+        is_asset = (bool(_ASSET_PATH_RE.search(path)) and not strong_kw and not strong_roles
+                    and not weak_kw and not fetch_kw and not params)
         mechanism = _download_mechanism(finding)
 
         # Precise param roles (strong lexicons + ambiguous-in-context: name/path/url + selector ids).
@@ -344,20 +370,23 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
             if r:
                 by_role.setdefault(r, []).append(p)
         roles = {p: r for r, ps in by_role.items() for p in ps}
+        has_url_param = any(r == "url" for r in roles.values())
+        weak_signal = bool(weak_kw) or file_collection
 
-        # CONFIRMED (it IS a file download): a file-download keyword, a strong file param, an
-        # office/archive extension, OR a file-RESPONSE mechanism (blob/download-attr/content-
-        # disposition) on a download-ish endpoint (keyword or a file/selector param present, which
-        # ties the snippet mechanism to this endpoint and limits cross-endpoint bleed).
-        mech_ctx = bool(weak_kw) or bool(by_role)
-        confirmed = bool(strong_kw or strong_roles or strong_ext or (mechanism and mech_ctx))
+        # CONFIRMED (it IS a file download / server fetch): a file-download keyword, a strong file
+        # param, an office/archive extension, a file-RESPONSE mechanism tied to a download-ish
+        # endpoint (a download keyword -- limits cross-endpoint snippet bleed), or a fetch/proxy
+        # keyword + a url param (image-proxy SSRF).
+        confirmed = bool(strong_kw or strong_roles or strong_ext
+                         or (mechanism and weak_signal) or (fetch_kw and has_url_param))
 
-        # POSSIBLE (it MIGHT serve a file -- lenient): a download/export keyword with no strong
-        # signal. A coupon/report/gift "download" commonly serves a barcode PDF/image, so surface it
-        # for VERIFICATION rather than hard-excluding. Data/action endpoints (count/agree/check/...)
-        # opt out via _NONFILE_WORDS.
+        # POSSIBLE (it MIGHT serve a file -- lenient): a download/export keyword or a file-collection
+        # segment with no strong signal; or a file-response mechanism / url param on a selector-id
+        # endpoint. Surfaced for VERIFICATION rather than hard-excluded. Data/action endpoints
+        # (count/agree/check/...) opt out via _NONFILE_WORDS.
         nonfile = any(w in runs for w in _NONFILE_WORDS)
-        possible = (not confirmed) and bool(weak_kw) and not nonfile
+        possible = (not confirmed) and not nonfile and (
+            weak_signal or (mechanism and bool(by_role)) or (fetch_kw and has_url_param))
 
         if is_asset or not (confirmed or possible):
             return None

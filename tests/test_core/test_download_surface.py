@@ -183,11 +183,14 @@ class TestGradedTiers_CouponDownloadsAreConsidered:
         assert d and d["certainty"] == "confirmed"
         assert d["signals"].get("mechanism")
 
-    def test_mechanism_confirms_even_without_a_download_keyword(self):
-        # a cert endpoint that createObjectURL's the response -> a file download, no 'download' in name
+    def test_mechanism_without_keyword_surfaces_as_possible(self):
+        # a cert endpoint that createObjectURL's the response is a file download even with no
+        # 'download' in its name -> surfaced (file_idor on certId). It stays POSSIBLE (not confirmed)
+        # because the mechanism came from the shared snippet -- tying confirmation to a download
+        # keyword avoids a neighbouring blob call upgrading a plain JSON API to CONFIRMED.
         d = classify_download_surface(_ep("/api/cert.do", query=["certId"],
                                           snippet="const url = URL.createObjectURL(await res.blob());"))
-        assert d and d["certainty"] == "confirmed" and d["primary_risk"] == "file_idor"
+        assert d and d["certainty"] == "possible" and d["primary_risk"] == "file_idor"
 
     def test_download_of_a_static_export_is_confirmed(self):
         assert classify_download_surface(_ep("/download/data.csv"))["certainty"] == "confirmed"
@@ -224,6 +227,39 @@ def test_annotate_tags_only_downloads_and_counts():
     assert all(f.category == Category.ENDPOINT for f in r.findings)
     surfaces = download_surfaces(r)
     assert surfaces[0][1]["primary_risk"] == "path_traversal"  # traversal sorts before file_idor
+
+
+class TestOverfitRegressions:
+    """From the over-fit audit -- generalize beyond the one target's eGov `.do` naming."""
+
+    def test_imageUrl_is_not_unconditional_ssrf(self):
+        # imageUrl on an ordinary save form (no download/fetch context) must NOT flag SSRF
+        assert classify_download_surface(_ep("/member/save.do", query=["imageUrl", "nickNm"])) is None
+
+    def test_download_boolean_flag_is_not_a_file_mechanism(self):
+        f = _ep("/api/getConfig.do", query=["userId"], snippet="this.download = false; return d;")
+        assert classify_download_surface(f) is None
+
+    @pytest.mark.parametrize("url,kw,risk", [
+        ("/api/files/123", {"query": ["id"]}, "file_idor"),   # plural REST collection (was missed)
+        ("/attachments/456", {"query": ["id"]}, "file_idor"),
+        ("/downloads/789", {"query": ["id"]}, "file_idor"),   # singular/plural cliff fixed
+        ("/api/documents/12", {"query": ["id"]}, "file_idor"),
+        ("/img/thumb", {"query": ["src"]}, "ssrf"),           # image-proxy SSRF (docstring's target)
+        ("/proxy", {"query": ["url"]}, "ssrf"),
+    ])
+    def test_generalized_surfaces_now_classify(self, url, kw, risk):
+        d = classify_download_surface(_ep(url, **kw))
+        assert d and d["primary_risk"] == risk
+
+    def test_id_suffix_generalizes_to_any_domain(self):
+        # claimId is not in any curated e-commerce list; the camelCase id-suffix check catches it
+        d = classify_download_surface(_ep("/downloadClaim.do", query=["claimId"]))
+        assert d and d["primary_risk"] == "file_idor"
+
+    def test_real_download_attribute_assignment_still_detected(self):
+        f = _ep("/downloadReport.do", query=["seq"], snippet="a.download = fileName; a.click();")
+        assert classify_download_surface(f) is not None
 
 
 def test_end_to_end_through_the_real_endpoint_detector():
