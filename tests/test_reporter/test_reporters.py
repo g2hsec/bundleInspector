@@ -292,11 +292,33 @@ def test_html_reporter_shows_original_source_location_and_snippet():
 
     html = HTMLReporter().generate(report)
 
-    assert "<strong>Location:</strong> https://example.com/static/app.js:40" in html
-    assert "<strong>Original:</strong>" in html
+    # both the minified location and the source-mapped original location are shown
+    assert "https://example.com/static/app.js:40" in html
     assert "src/app.ts:12" in html
-    assert "Original Source Snippet" in html
+    # the source-mapped original snippet is rendered under its own caption (escaped)
+    assert "ORIGINAL SOURCE" in html
     assert 'const endpoint = &#34;/api/users&#34;;' in html
+
+
+def test_html_reporter_does_not_leak_raw_secret_via_matched_text():
+    """The raw secret must not survive anywhere in the HTML -- including metadata.matched_text,
+    which is embedded verbatim in the report JSON. mask_secret_findings sweeps the whole tree."""
+    secret = "abcdefghijklmnopqrstuvwxyz123456"
+    finding = Finding(
+        rule_id="secret-detector",
+        category=Category.SECRET,
+        severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM,
+        title="Hardcoded Session Token",
+        evidence=Evidence(
+            file_url="https://example.com/static/app.js", file_hash="h", line=12,
+            snippet=f'const authorization = "Bearer {secret}";',
+        ),
+        extracted_value=secret,
+        metadata={"matched_text": f'authorization = "Bearer {secret}"'},
+    )
+    html = HTMLReporter().generate(Report(findings=[finding]))
+    assert secret not in html
 
 
 def test_html_reporter_shows_distinct_matched_text_when_value_is_captured():
@@ -323,8 +345,11 @@ def test_html_reporter_shows_distinct_matched_text_when_value_is_captured():
 
     html = HTMLReporter().generate(report)
 
-    assert "<strong>Matched Text:</strong>" in html
-    assert "authorization = &#34;Bearer abcdefghijklmnopqrstuvwxyz123456&#34;" in html
+    # The finding is surfaced by highlighting the matched region inside the code snippet, so the
+    # reader sees exactly what in the code triggered it -- and for a secret the value is MASKED
+    # (never shown raw) while the surrounding context (the assigned variable) stays visible.
+    assert "<mark>authorization = &quot;Bearer abcd" in html   # matched region highlighted
+    assert "3456&quot;</mark>" in html                         # ...ending on the masked value
 
 
 def test_wordlist_reporter_params_only_uses_endpoint_snippets():
