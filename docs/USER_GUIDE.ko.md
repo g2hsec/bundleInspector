@@ -337,6 +337,19 @@ BundleInspector는 자신의 UI 조작으로 타겟을 변경하지 않습니다
 
 > **BundleInspector는 DoS 도구가 아닙니다.** 다만 잘못 설정한 공격적 스캔은 일부 프로그램에 과할 수 있습니다. 항상 타겟 규칙과 트래픽 제한을 준수하세요.
 
+### 자주 겪는 차단 & 권장 옵션
+
+수정 가능한 이유로 차단/스킵될 때 경고 **바로 옆에 `hint=`**가 출력되고, **JS 0개 분석** 시에는 요약에 권장 조치 목록이 눈에 띄게 나옵니다:
+
+| 상황 (로그 이벤트) | 이유 | 권장 옵션 |
+|---|---|---|
+| `seed_url_blocked` / `ssrf_blocked` — *"Resolved IP is blocked"* | 대상이 **사설/내부** IP로 resolve됨 | **인가된** 내부/개발 대상이면: `--allow-private-ips` (또는 `scope.allow_private_ips: true`) |
+| `seed_url_blocked` — *"Blocked host"* | `localhost` / 클라우드 메타데이터 호스트명 | **설계상 차단** — 스캔 불가(우회 불가) |
+| `seed_url_blocked` — *"Blocked/Unsupported scheme"* | non-`http(s)` URL(`javascript:`/`data:`/`file:`) | `http://` 또는 `https://` URL 사용 |
+| `file_too_large` | JS가 `crawler.max_file_size`(10 MB) 초과 | `--config`에서 `crawler.max_file_size` 상향 |
+| `headless_error` | Playwright/Chromium 미설치 또는 TLS 가로채기 프록시 | `playwright install chromium`, 또는 `--no-headless`(conservative 프로파일) |
+| **JS 0개 분석** | 시드 차단 / 스코프 밖 / 런타임 주입 JS | 출력된 권장 목록 참고: `--allow-private-ips`, `--scope` 확대, 또는 헤드리스 프로파일 |
+
 ---
 
 ## 🔬 탐지 커버리지

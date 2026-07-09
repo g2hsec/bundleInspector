@@ -337,6 +337,20 @@ BundleInspector will not mutate a target through its own UI driving:
 
 > **BundleInspector is not a DoS tool**, but a misconfigured aggressive scan can still be too noisy for some programs. Always follow the target's rules and rate limits.
 
+### Common blocks & recommended options
+
+When the scanner blocks or skips something for a fixable reason it prints a `hint=` right next to
+the warning (and, when **0 JS files** were analyzed, a prominent remedy list at the summary):
+
+| Situation (log event) | Why | Recommended option |
+|---|---|---|
+| `seed_url_blocked` / `ssrf_blocked` — *"Resolved IP is blocked"* | The target resolves to a **private/internal** IP | If it's an **authorized** internal/dev target: `--allow-private-ips` (or `scope.allow_private_ips: true`) |
+| `seed_url_blocked` — *"Blocked host"* | `localhost` / cloud-metadata hostname | **Blocked by design** — cannot be scanned (not bypassable) |
+| `seed_url_blocked` — *"Blocked/Unsupported scheme"* | non-`http(s)` URL (`javascript:`/`data:`/`file:`) | Use an `http://` or `https://` URL |
+| `file_too_large` | JS asset exceeds `crawler.max_file_size` (10 MB) | Raise `crawler.max_file_size` in `--config` |
+| `headless_error` | Playwright/Chromium missing or a TLS-intercepting proxy | `playwright install chromium`, or re-run with `--no-headless` (conservative profiles) |
+| **0 JS files analyzed** | seed blocked / out of scope / JS injected at runtime | See the printed remedy list: `--allow-private-ips`, widen `--scope`, or use a headless profile |
+
 ---
 
 ## 🔬 Detection Coverage

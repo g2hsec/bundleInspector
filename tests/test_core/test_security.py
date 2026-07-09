@@ -130,6 +130,26 @@ class TestIPBlocking:
         assert is_ip_blocked("not-an-ip") is False
 
 
+class TestSsrfBlockHint:
+    """Actionable remedy shown next to an SSRF/URL block -- conditional and honest."""
+
+    def test_private_ip_recommends_the_flag(self):
+        from bundleInspector.core.security import ssrf_block_hint
+        h = ssrf_block_hint("Resolved IP is blocked for: dev.example.com")
+        assert "--allow-private-ips" in h and "AUTHORIZED" in h
+
+    def test_localhost_metadata_does_not_recommend_the_flag(self):
+        from bundleInspector.core.security import ssrf_block_hint
+        h = ssrf_block_hint("Blocked host: localhost")
+        assert "--allow-private-ips" not in h and "design" in h
+
+    def test_scheme_and_malformed_hints(self):
+        from bundleInspector.core.security import ssrf_block_hint
+        assert "http" in ssrf_block_hint("Blocked scheme: javascript")
+        assert "hostname" in ssrf_block_hint("No hostname in URL")
+        assert "--allow-private-ips" not in ssrf_block_hint("Blocked scheme: file")
+
+
 class TestAllowPrivateIps:
     """Opt-in SSRF bypass for authorized internal scanning (--allow-private-ips)."""
 
