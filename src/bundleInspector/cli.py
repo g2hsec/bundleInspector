@@ -1080,27 +1080,34 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
     except Exception:
         surfaces = []
     if surfaces:
+        n_conf = sum(1 for _, d in surfaces if d.get("certainty") == "confirmed")
+        n_poss = len(surfaces) - n_conf
         console.print()
         console.print(f"[bold magenta]Download Surfaces[/bold magenta]  "
-                      f"[dim]— {len(surfaces)} file-serving endpoint(s) to test "
-                      f"(path-traversal / file-IDOR / SSRF)[/dim]")
+                      f"[dim]— {n_conf} confirmed ● · {n_poss} possible ○ "
+                      f"(path-traversal / file-IDOR / SSRF; ○ = verify the response is a file)[/dim]")
         dtable = Table(box=box.SIMPLE_HEAD, show_header=True, header_style="bold",
                        expand=False, pad_edge=False, padding=(0, 1))
         dtable.add_column("Risk", no_wrap=True)
-        dtable.add_column("Endpoint", no_wrap=True, overflow="ellipsis", max_width=42, style="cyan")
-        dtable.add_column("Param(s)", no_wrap=True, overflow="ellipsis", max_width=26)
-        dtable.add_column("What to test", overflow="ellipsis", max_width=40, style="dim")
+        dtable.add_column("Endpoint", no_wrap=True, overflow="ellipsis", max_width=40, style="cyan")
+        dtable.add_column("Param(s)", no_wrap=True, overflow="ellipsis", max_width=24)
+        dtable.add_column("What to test", overflow="ellipsis", max_width=38, style="dim")
         _HINT = {"path_traversal": "../../etc/passwd, ..%2f, absolute path",
                  "ssrf": "internal host / 169.254.169.254",
                  "file_idor": "enumerate / swap the file id",
                  "forced_browsing": "reach it without login",
-                 "authz_review": "verify server-side authz"}
+                 "authz_review": "verify server-side authz",
+                 "file_download_review": "verify it serves a file, then IDOR/traversal"}
         for f, d in surfaces[:15]:
+            confirmed = d.get("certainty") == "confirmed"
             clr = _SEV_COLOR.get(d.get("risk_severity", "low"), "white")
-            risk = f"[{clr}]{risk_label(d['primary_risk'])}[/{clr}]"
+            mark = "●" if confirmed else "[dim]○[/dim]"
+            risk = f"{mark} [{clr}]{risk_label(d['primary_risk'])}[/{clr}]" if confirmed \
+                else f"{mark} [dim]{risk_label(d['primary_risk'])}[/dim]"
             ep = escape((f.extracted_value or "?"))
             params = escape(", ".join(p for ps in d.get("params", {}).values() for p in ps) or "—")
-            dtable.add_row(risk, ep, params, _HINT.get(d["primary_risk"], ""))
+            dtable.add_row(risk, ep, params, _HINT.get(d["primary_risk"], ""),
+                           style=None if confirmed else "dim")
         console.print(dtable)
         if len(surfaces) > 15:
             console.print(f"  [dim]… and {len(surfaces) - 15} more download surface(s)[/dim]")
@@ -1145,7 +1152,10 @@ def _finding_row(finding) -> tuple[str, str, str, str]:
     md = finding.metadata if isinstance(finding.metadata, dict) else {}
     dl = md.get("download_surface")
     if isinstance(dl, dict):                        # file-download surface -- high-value
-        cell += f"  [magenta]▾ download: {escape(risk_label(dl.get('primary_risk', '')))}[/magenta]"
+        if dl.get("certainty") == "confirmed":
+            cell += f"  [magenta]▾ download: {escape(risk_label(dl.get('primary_risk', '')))}[/magenta]"
+        else:
+            cell += f"  [dim magenta]▾ download? verify[/dim magenta]"
     if md.get("confirmed"):
         cell = f"[green]✓[/green] {cell}"           # confirmed dataflow -- the crown jewels
     elif md.get("third_party_file"):

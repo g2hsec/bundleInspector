@@ -389,12 +389,22 @@ File-serving endpoints (serve/stream a file to the client) are a high-value surf
 traversal, file IDOR, SSRF, and forced browsing. A dedicated classifier tags discovered endpoints
 that are **file** downloads and names the **specific parameter** and **risk** to test.
 
-**Precision first (no keyword-only guessing).** A bare `download`/`export` token is *not* enough — in
-Korean e-commerce "쿠폰 다운로드" (`couponDownL.do`) is a coupon claim, not a file. Classification
-requires a file-specific signal: a file-download keyword (`fileDown`/`getFile`/`atchFileDown`/
-`excelDown`/`download.php`…), a **strong file parameter**, or an office/archive/export extension.
+**Graded by how a file is *served*, not by the endpoint's name.** The question is "does it serve a
+**file**", never "is it a coupon" — a coupon/report/gift *download* commonly serves a barcode
+**PDF/image** (a real arbitrary-file-download / traversal / IDOR surface), so it is **not**
+blanket-excluded. Two tiers:
+
+- **CONFIRMED** — a file-download keyword (`fileDown`/`getFile`/`atchFileDown`/`excelDown`/
+  `download.php`…), a strong file parameter, an office/archive extension, **or a file-response
+  mechanism** near the call (`responseType:'blob'`, `createObjectURL`, `download` attribute,
+  `saveAs`, `content-disposition`, `application/pdf`) — this catches a coupon endpoint that streams a
+  PDF *regardless of its name*.
+- **POSSIBLE (verify)** — a download/export keyword with no strong signal; surfaced at low confidence
+  with a "verify the response is a file" note (data/action endpoints like `…Count`/`…Agree` opt out).
+
 Keyword matching is word-boundary anchored (so `uploadFile`/`profileView`/`targetImage` are *not*
-misread), and upload endpoints are excluded.
+misread), upload endpoints are excluded, and a high-severity claim needs a strong keyword **and** a
+strong parameter.
 
 **Korean enterprise conventions (deep).** eGovFrame / Nexacro / XE·Rhymix / gnuboard parameter names:
 

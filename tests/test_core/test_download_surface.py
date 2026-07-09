@@ -43,8 +43,8 @@ def _risk(url, **kw):
 # ---------------------------------------------------------------- FALSE-POSITIVE TRAPS (critical)
 
 @pytest.mark.parametrize("url,kw", [
-    ("/couponDownL.do", {"body": ["itemCd"]}),          # 쿠폰 다운로드 (coupon claim, JSON)
-    ("/couponDownload.do", {"body": ["itemCd"]}),       # full word "download" -- still a coupon
+    # abbreviated `...DownL` returns JSON here and lacks a full download keyword / file signal
+    ("/couponDownL.do", {"body": ["itemCd"]}),          # 쿠폰 다운로드 (coupon list, JSON)
     ("${...}/couponDownL.do", {"body": ["itemCd"]}),
     ("/board/list.do", {"query": ["name", "pageIndex"]}),   # search by name, no download context
     ("/static/mall/js/app.js", {}),                          # static asset
@@ -52,16 +52,14 @@ def _risk(url, **kw):
     ("/assets/report.pdf", {}),                              # a pdf but under an asset path
     ("/api/users.json", {}),                                 # REST JSON response, not a download
     ("/config/settings.xml", {}),                            # xml under non-download path
-    ("/api/downloadCount.do", {"query": ["goodsNo"]}),       # "download" but a counter, no file sig
+    ("/api/couponDownloadCount.do", {"query": ["goodsNo"]}), # "download" but a counter (NONFILE)
     ("/robots.txt", {}),
-    # --- regressions found by adversarial verification ---
+    # --- regressions found by adversarial verification (word-boundary / upload / narrowed weak kw) ---
     ("/cmm/fms/uploadFile.do", {"body": ["atchFileId"]}),    # UPLOAD (was: substring 'loadfile')
     ("/user/profileView.do", {"query": ["userId"]}),         # was: substring 'fileview'
     ("/ad/targetImage.do", {"query": ["campaignId"]}),       # was: substring 'getimage'
-    ("/event/couponDownload.do", {"query": ["name"]}),       # weak kw + bare 'name' (coupon!)
-    ("/api/socialMedia.do", {"query": ["name"]}),            # weak 'media' + bare 'name'
-    ("/report/export.do", {"query": ["name"]}),              # weak 'export' + bare 'name'
-    ("/menu/dropDown.do", {"query": ["id"]}),                # 'down' word, no file signal
+    ("/api/socialMedia.do", {"query": ["name"]}),            # 'media' is NOT a weak keyword
+    ("/menu/dropDown.do", {"query": ["id"]}),                # 'down' is NOT a weak keyword
     ("/oauth/callback.do", {"query": ["callbackUrl"]}),      # callbackUrl is NOT SSRF/download
 ])
 def test_false_positive_traps_are_NOT_classified(url, kw):
@@ -130,8 +128,9 @@ def test_ssrf_from_url_param():
     assert _risk("/api/fetch.do?remoteUrl=http://x") == "ssrf"
     # a bare `url` counts only once a download context is established by a strong keyword
     assert _risk("/fileDownload.do?url=http://x") == "ssrf"
-    # ...but a weak keyword + a bare `url` alone must NOT classify (precision guard)
-    assert classify_download_surface(_ep("/download?url=http://internal")) is None
+    # a weak keyword + a bare `url` is surfaced at the POSSIBLE tier (verify it's a server-side fetch)
+    d = classify_download_surface(_ep("/download?url=http://internal"))
+    assert d and d["certainty"] == "possible" and d["primary_risk"] == "ssrf"
 
 
 def test_traversal_outranks_idor_when_both_present():
@@ -162,10 +161,40 @@ def test_strong_download_keywords_classify(url):
     assert classify_download_surface(_ep(url)) is not None
 
 
-def test_weak_keyword_needs_corroboration():
-    # "download" + a file-ish extension corroborates; "download" + itemCd does not
-    assert classify_download_surface(_ep("/download/data.csv")) is not None
-    assert classify_download_surface(_ep("/download.do", body=["itemCd"])) is None
+class TestGradedTiers_CouponDownloadsAreConsidered:
+    """A coupon/report 'download' often serves a barcode PDF/image -> it must be surfaced, not
+    hard-excluded. Graded: CONFIRMED when a file signal/mechanism is present; POSSIBLE (verify) when
+    only a download keyword is."""
+
+    def test_coupon_download_is_surfaced_as_possible(self):
+        d = classify_download_surface(_ep("/event/couponDownload.do", query=["couponId"]))
+        assert d and d["certainty"] == "possible" and d["confidence"] == "low"
+        assert d["primary_risk"] == "file_idor"          # couponId is a selector in a dl context
+        assert "verify" in d["note"].lower() or "POSSIBLE" in d["note"]
+
+    def test_export_with_name_is_possible_traversal(self):
+        d = classify_download_surface(_ep("/report/export.do", query=["name"]))
+        assert d and d["certainty"] == "possible" and d["primary_risk"] == "path_traversal"
+
+    def test_coupon_download_serving_a_file_is_CONFIRMED_via_mechanism(self):
+        # responseType:'blob' proves it returns a FILE -> the coupon-PDF download IS a real surface
+        d = classify_download_surface(_ep("/event/couponDownload.do", query=["couponId"],
+                                          snippet="xhr.responseType = 'blob';"))
+        assert d and d["certainty"] == "confirmed"
+        assert d["signals"].get("mechanism")
+
+    def test_mechanism_confirms_even_without_a_download_keyword(self):
+        # a cert endpoint that createObjectURL's the response -> a file download, no 'download' in name
+        d = classify_download_surface(_ep("/api/cert.do", query=["certId"],
+                                          snippet="const url = URL.createObjectURL(await res.blob());"))
+        assert d and d["certainty"] == "confirmed" and d["primary_risk"] == "file_idor"
+
+    def test_download_of_a_static_export_is_confirmed(self):
+        assert classify_download_surface(_ep("/download/data.csv"))["certainty"] == "confirmed"
+
+    def test_nonfile_download_word_opts_out(self):
+        # a "download count/agree" data endpoint is not a file, even at the possible tier
+        assert classify_download_surface(_ep("/api/downloadAgree.do", query=["goodsNo"])) is None
 
 
 def test_snippet_params_do_not_bleed_across_endpoints():

@@ -112,6 +112,8 @@ HTML_TEMPLATE = """
         .badge.thirdparty { background: #555; color: #ddd; margin-right: 5px; }
         .badge.fp { background: #7a5; color: #041; margin-right: 5px; }
         .badge.download { background: #b15fd6; color: #fff; margin-right: 5px; }
+        .badge.download.possible { background: transparent; color: #b15fd6; border: 1px dashed #b15fd6; }
+        .download-note.possible { border-left-style: dashed; opacity: 0.9; }
         .download-note {
             background: rgba(177,95,214,0.12); border-left: 3px solid #b15fd6;
             padding: 6px 10px; border-radius: 4px; margin: 4px 0 10px; font-size: 0.9em;
@@ -340,7 +342,7 @@ HTML_TEMPLATE = """
                     <span class="finding-title">{{ finding.title }}</span>
                     <div>
                         {% if v.confirmed %}<span class="badge confirmed">CONFIRMED</span>{% endif %}
-                        {% if v.download %}<span class="badge download" title="file-download surface">&#11015; DOWNLOAD: {{ v.download.primary_risk | replace('_','-') }}</span>{% endif %}
+                        {% if v.download %}<span class="badge download{% if v.download.certainty != 'confirmed' %} possible{% endif %}" title="file-download surface">&#11015; {% if v.download.certainty == 'confirmed' %}DOWNLOAD: {{ v.download.primary_risk | replace('_','-') }}{% else %}DOWNLOAD? verify{% endif %}</span>{% endif %}
                         {% if v.likely_fp %}<span class="badge fp" title="{{ v.fp_reason }}">LIKELY FP</span>{% endif %}
                         {% if v.third_party %}<span class="badge thirdparty" title="third-party library file">3p:{{ v.third_party }}</span>{% endif %}
                         <span class="badge {{ finding.severity.value }}">{{ finding.severity.value | upper }}</span>
@@ -353,9 +355,10 @@ HTML_TEMPLATE = """
                 <div class="why"><span class="lbl">WHY</span>{{ v.explain.why }}</div>
 
                 {% if v.download %}
-                <div class="download-note">
-                    <span class="lbl dl">DOWNLOAD SURFACE</span>
+                <div class="download-note{% if v.download.certainty != 'confirmed' %} possible{% endif %}">
+                    <span class="lbl dl">{% if v.download.certainty == 'confirmed' %}DOWNLOAD SURFACE{% else %}POSSIBLE DOWNLOAD{% endif %}</span>
                     <strong>{{ v.download.primary_risk | replace('_','-') }}</strong>
+                    <span style="opacity:.7">({{ v.download.confidence }} confidence{% if v.download.signals.mechanism %}, file response: {{ v.download.signals.mechanism }}{% endif %})</span>
                     {% if v.download.params %}&nbsp;&middot;&nbsp; param(s):
                         {% for role, names in v.download.params.items() %}{% for n in names %}<code>{{ n }}</code> {% endfor %}{% endfor %}
                     {% endif %}

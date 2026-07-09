@@ -12,16 +12,26 @@ adds that knowledge as metadata on the endpoint findings, AFTER detection, so it
 the detection set or perturb the detection-invariance gate (which runs RuleEngine.analyze directly,
 never this path). It sets `metadata['download_surface']` and never mutates anything else.
 
-DESIGN -- precision first (must not false-positive):
-  A bare `download`/`export`/`down` token is NOT enough. In Korean e-commerce "쿠폰 다운로드"
-  (`couponDownL.do`, body `itemCd`, JSON response) is a coupon claim, NOT a file download. A
-  finding is classified as a file-download surface ONLY on a FILE-SPECIFIC signal:
-    (1) a file-download KEYWORD in the path   (fileDown/getFile/atchFileDown/excelDown/...),
+DESIGN -- graded by how a file is *served*, not by the endpoint's name (comprehensive + lenient):
+  The question is "does it serve a FILE", never "is it a coupon". A coupon/report/gift "download"
+  commonly serves a barcode PDF/image -- a real arbitrary-file-download / traversal / IDOR surface --
+  so it must NOT be blanket-excluded; one that returns JSON is not a file. Two tiers:
+
+  CONFIRMED (it IS a file download):
+    (1) a file-download KEYWORD in the path   (fileDown/getFile/atchFileDown/excelDown/download.php),
     (2) a STRONG file PARAMETER               (atchFileId/fileSn/fileNm/streFileNm/fileStreCours/...),
-    (3) a document/archive/data EXTENSION     (pdf/xlsx/hwp/zip/csv/xml/sql/...),
-  or a WEAK keyword (download/export) CORROBORATED by a file-ish parameter or extension. Weak,
-  ambiguous parameters (`name`/`path`/`file`/`url`) contribute a risk ONLY once a download context
-  is already established by a strong signal.
+    (3) an office/archive/export EXTENSION    (pdf/xlsx/hwp/zip/csv/...),
+    (4) a file-RESPONSE MECHANISM near the call (responseType blob/arraybuffer, createObjectURL,
+        `download` attribute, saveAs/FileSaver, content-disposition, application/pdf|octet-stream) --
+        this catches a coupon endpoint that streams a PDF regardless of its name/params.
+  POSSIBLE (it MIGHT serve a file -- verify): a download/export keyword with no strong signal, surfaced
+    at LOW confidence with a "verify the response is a file" note. Data/action endpoints (count/agree/
+    check/...) opt out. This is the lenient path for coupon/report downloads whose response type is
+    not visible in the bundle.
+
+  Precision guards: keyword matching is word-boundary anchored (uploadFile/profileView not misread),
+  upload endpoints are excluded, and a HIGH-severity claim needs a strong keyword AND a strong param --
+  a bare `name`/`path`/`url` never yields a high-confidence finding on its own.
 
 KOREAN ENTERPRISE CONVENTIONS (deep): eGovFrame (전자정부 표준프레임워크) and Nexacro/SI code use
 romanized-Hangul parameter names. Recognized here (not just surface):
@@ -121,8 +131,11 @@ _STRONG_KEYWORDS = tuple(_norm(x) for x in (
     #  `download` -- the coupon `couponDownload.do` never produces a `downloadphp`/... run.)
     "downloadphp", "downloadjsp", "downloadasp", "downloadaspx", "downloadcgi",
 ))
+# Weak (POSSIBLE-tier) keywords: download-INTENT words only. Deliberately NOT `down`/`media`/`stream`
+# (they word-match dropDown/countDown/socialMedia/liveStream and are not download intent); abbreviated
+# `...DownL` coupon endpoints that return JSON simply don't surface -- judged by file signals, not name.
 _WEAK_KEYWORDS = tuple(_norm(x) for x in (
-    "download", "down", "export", "attach", "attachment", "stream", "media", "blob", "getbinary",
+    "download", "dwnld", "dnload", "export", "attach", "attachment", "getbinary",
 ))
 # An upload endpoint is not a download surface -- suppress it unless a strong DOWNLOAD keyword is
 # also present (a combined up/down controller). Matched as whole path-word runs.
@@ -157,9 +170,53 @@ _ASSET_PATH_RE = re.compile(
     r"fonts?|media|webjars|node_modules|vendor)/", re.IGNORECASE)
 
 # Risk ordering (most severe first) + human-readable meaning.
-_RISK_ORDER = ("path_traversal", "ssrf", "file_idor", "forced_browsing", "authz_review")
+_RISK_ORDER = ("path_traversal", "ssrf", "file_idor", "forced_browsing", "authz_review",
+               "file_download_review")
 _RISK_SEV = {"path_traversal": "high", "ssrf": "high", "file_idor": "medium",
-             "forced_browsing": "medium", "authz_review": "low"}
+             "forced_browsing": "medium", "authz_review": "low", "file_download_review": "low"}
+
+# File-download RESPONSE mechanism -- the JS reveals that the endpoint returns a FILE (a blob/octet
+# stream / forced-download attribute), regardless of the endpoint's name or params. This is what
+# distinguishes a coupon endpoint that SERVES a barcode PDF/image (a real file-download surface)
+# from one that returns JSON. Matched on the call-site snippet.
+_MECHANISM_RE = re.compile(r"""(?ix)
+      responseType \s* [:=] \s* ['"]? (?: blob | arraybuffer )
+    | \b createObjectURL \b
+    | \b new \s+ Blob \b
+    | \.  (?: blob | arrayBuffer ) \s* \( \s* \)
+    | \b saveAs \s* \(  | \b FileSaver \b
+    | \. download \s* =
+    | (?: setAttribute | attr ) \( \s* ['"] download ['"]
+    | <a\b [^>]{0,80} \b download \b
+    | content -? disposition
+    | application/ (?: pdf | octet-stream | zip | x-hwp | haansofthwp | vnd\.ms-excel
+                      | vnd\.openxmlformats )
+""")
+
+# Words that mark a DATA/action endpoint (not a file): a "download" here is a count/agree/check, etc.
+_NONFILE_WORDS = frozenset((
+    "count", "cnt", "agree", "yn", "check", "chk", "stat", "statistics", "log", "history", "hist",
+    "search", "validate", "valid", "exists", "duplicate", "isvalid", "verify",
+))
+
+# Selector ids that, IN A DOWNLOAD CONTEXT, likely choose the served file (IDOR candidates). Curated
+# (not a bare `*id$` regex -- that would match grid/android/valid). Broad + Korean-aware.
+_CTX_ID_LIKE = frozenset(_norm(x) for x in (
+    "id", "seq", "sn", "no", "num", "idx", "key", "srl",
+    "couponId", "couponNo", "certId", "certNo", "receiptId", "receiptNo", "giftId", "giftcardId",
+    "barcodeId", "ticketId", "voucherId", "invoiceId", "orderId", "orderNo", "goodsNo", "goodsId",
+    "itemCd", "itemId", "prdId", "prodId", "boardId", "postId", "articleId", "noticeId", "reportId",
+    "nttId", "bbsId", "docNo", "imgSeq", "photoNo", "mberId", "userId", "memberId", "custId",
+))
+
+
+def _download_mechanism(finding) -> str:
+    """The file-download response mechanism found near the call (blob/createObjectURL/download
+    attr/content-disposition/file MIME), or '' if none. Snippet-based (best-effort)."""
+    ev = getattr(finding, "evidence", None)
+    snip = (getattr(ev, "snippet", "") if ev else "") or ""
+    m = _MECHANISM_RE.search(snip)
+    return (m.group(0).strip()[:32]) if m else ""
 
 
 def _path_and_query(url: str) -> tuple[str, str]:
@@ -247,7 +304,7 @@ def _role_of(name: str, *, in_context: bool) -> Optional[str]:
             return "file_path"
         if n in _CTX_URL_PARAMS:
             return "url"
-        if n in _CTX_ID_PARAMS:
+        if n in _CTX_ID_PARAMS or n in _CTX_ID_LIKE:
             return "file_id"
     return None
 
@@ -278,23 +335,33 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
             return None
 
         is_asset = bool(_ASSET_PATH_RE.search(path)) and not strong_kw and not strong_roles
+        mechanism = _download_mechanism(finding)
 
-        # A WEAK keyword ("download"/"export"/...) needs corroboration -- ONLY a real file extension
-        # or a STRONG file param (never a bare `name`/`path`/`url`). This is what stops
-        # "쿠폰 다운로드" (couponDownload.do?name=..., couponDownL.do body itemCd) from flagging.
-        weak_ok = bool(weak_kw) and any_file_ext
-
-        is_download = bool(strong_kw or strong_roles or strong_ext or weak_ok) and not is_asset
-        if not is_download:
-            return None
-
-        # Download context established -> re-classify every parameter (ambiguous ones now count).
+        # Precise param roles (strong lexicons + ambiguous-in-context: name/path/url + selector ids).
         by_role: Dict[str, List[str]] = {}
-        for p in params:                              # params already sorted
+        for p in params:                              # params already sorted -> deterministic
             r = _role_of(p, in_context=True)
             if r:
                 by_role.setdefault(r, []).append(p)
         roles = {p: r for r, ps in by_role.items() for p in ps}
+
+        # CONFIRMED (it IS a file download): a file-download keyword, a strong file param, an
+        # office/archive extension, OR a file-RESPONSE mechanism (blob/download-attr/content-
+        # disposition) on a download-ish endpoint (keyword or a file/selector param present, which
+        # ties the snippet mechanism to this endpoint and limits cross-endpoint bleed).
+        mech_ctx = bool(weak_kw) or bool(by_role)
+        confirmed = bool(strong_kw or strong_roles or strong_ext or (mechanism and mech_ctx))
+
+        # POSSIBLE (it MIGHT serve a file -- lenient): a download/export keyword with no strong
+        # signal. A coupon/report/gift "download" commonly serves a barcode PDF/image, so surface it
+        # for VERIFICATION rather than hard-excluding. Data/action endpoints (count/agree/check/...)
+        # opt out via _NONFILE_WORDS.
+        nonfile = any(w in runs for w in _NONFILE_WORDS)
+        possible = (not confirmed) and bool(weak_kw) and not nonfile
+
+        if is_asset or not (confirmed or possible):
+            return None
+        certainty = "confirmed" if confirmed else "possible"
 
         risks: List[str] = []
         if any(r in ("file_name", "file_path", "directory") for r in roles.values()):
@@ -304,47 +371,68 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
         if any(r == "file_id" for r in roles.values()):
             risks.append("file_idor")
         if not risks:
-            risks.append("forced_browsing" if any_file_ext else "authz_review")
+            risks.append("forced_browsing" if (confirmed and any_file_ext)
+                         else "authz_review" if confirmed else "file_download_review")
         risks.sort(key=lambda r: _RISK_ORDER.index(r) if r in _RISK_ORDER else 99)
 
-        confidence = ("high" if (strong_kw and (strong_roles or by_role)) else
-                      "medium" if (strong_kw or strong_roles or strong_ext) else "low")
+        confidence = ("high" if (strong_kw and strong_roles) else "medium" if confirmed else "low")
+
+        signals: Dict[str, str] = {}
+        if strong_kw or weak_kw:
+            signals["keyword"] = strong_kw or weak_kw
+        if any_file_ext:
+            signals["extension"] = ext
+        if mechanism:
+            signals["mechanism"] = mechanism
 
         return {
             "is_download": True,
+            "certainty": certainty,          # "confirmed" (is a file dl) | "possible" (verify)
             "confidence": confidence,
             "risks": risks,
             "primary_risk": risks[0],
             "risk_severity": _RISK_SEV.get(risks[0], "low"),
             "params": by_role,
-            "signals": {k: v for k, v in (("keyword", strong_kw or weak_kw),
-                                          ("extension", ext if any_file_ext else "")) if v},
-            "note": _note(risks[0], by_role, ext),
+            "signals": signals,
+            "note": _note(risks[0], by_role, ext, certainty, mechanism),
         }
     except Exception:
         return None
 
 
-def _note(primary: str, by_role: Dict[str, List[str]], ext: str) -> str:
+def _note(primary: str, by_role: Dict[str, List[str]], ext: str,
+          certainty: str = "confirmed", mechanism: str = "") -> str:
     def _p(*roles):
         out = []
         for r in roles:
             out.extend(by_role.get(r, []))
         return ", ".join(f"`{x}`" for x in out)
+
+    mech = f" (file response detected: {mechanism})" if mechanism else ""
+    # A "possible" surface is unverified -- lead with the verify-it-serves-a-file caveat, since a
+    # coupon/report/gift "download" may return JSON (not a file) OR a barcode PDF/image (a real
+    # arbitrary-file-download / traversal / IDOR surface).
+    if certainty == "possible":
+        params = ", ".join(f"`{p}`" for ps in by_role.values() for p in ps) or "its parameters"
+        risk = {"path_traversal": "path traversal", "file_idor": "IDOR / enumeration",
+                "ssrf": "SSRF"}.get(primary, "path traversal / IDOR")
+        return (f"POSSIBLE file download{mech} -- coupon/report/gift 'download' endpoints often serve "
+                f"a barcode PDF/image. Verify the response is a FILE; if so, test {risk} on {params}.")
+
     if primary == "path_traversal":
         return (f"File name/path parameter ({_p('file_name', 'file_path', 'directory')}) -> test "
-                f"path traversal / arbitrary file read (../../, ..%2f, absolute path, NUL byte).")
+                f"path traversal / arbitrary file read (../../, ..%2f, absolute path, NUL byte).{mech}")
     if primary == "ssrf":
         return (f"URL parameter ({_p('url')}) -> test SSRF: the server may fetch it "
-                f"(internal hosts, 169.254.169.254 cloud metadata).")
+                f"(internal hosts, 169.254.169.254 cloud metadata).{mech}")
     if primary == "file_idor":
         return (f"File-ID parameter ({_p('file_id')}) -> test IDOR / enumeration: increment or "
-                f"replace the id to read other users' files.")
+                f"replace the id to read other users' files.{mech}")
     if primary == "forced_browsing":
         return (f"Static {ext or 'file'} download -> verify server-side authorization; it may be "
-                f"reachable without login (forced browsing).")
+                f"reachable without login (forced browsing).{mech}")
     return ("Download surface -> confirm server-side authorization, file-type restriction, and "
-            "rate-limiting.")
+            f"rate-limiting.{mech}")
 
 
 def annotate_download_surfaces(report) -> int:
@@ -367,7 +455,8 @@ def annotate_download_surfaces(report) -> int:
 # Console/HTML helpers ------------------------------------------------------------------------
 
 _RISK_LABEL = {"path_traversal": "path-traversal", "ssrf": "SSRF", "file_idor": "file-IDOR",
-               "forced_browsing": "forced-browsing", "authz_review": "authz-review"}
+               "forced_browsing": "forced-browsing", "authz_review": "authz-review",
+               "file_download_review": "verify-file-download"}
 
 
 def risk_label(risk: str) -> str:
@@ -375,13 +464,15 @@ def risk_label(risk: str) -> str:
 
 
 def download_surfaces(report) -> List[tuple]:
-    """(finding, descriptor) for every tagged download surface, most-severe risk first."""
+    """(finding, descriptor) for every tagged download surface: CONFIRMED before POSSIBLE, then most
+    severe risk first."""
     out = []
     for f in getattr(report, "findings", []) or []:
         md = f.metadata if isinstance(f.metadata, dict) else {}
         d = md.get("download_surface")
         if isinstance(d, dict):
             out.append((f, d))
-    out.sort(key=lambda fd: _RISK_ORDER.index(fd[1]["primary_risk"])
-             if fd[1]["primary_risk"] in _RISK_ORDER else 99)
+    out.sort(key=lambda fd: (0 if fd[1].get("certainty") == "confirmed" else 1,
+                             _RISK_ORDER.index(fd[1]["primary_risk"])
+                             if fd[1]["primary_risk"] in _RISK_ORDER else 99))
     return out

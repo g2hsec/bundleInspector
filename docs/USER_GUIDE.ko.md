@@ -388,11 +388,19 @@ BundleInspector는 자신의 UI 조작으로 타겟을 변경하지 않습니다
 forced browsing. 전용 분류기가 **파일** 다운로드 엔드포인트를 태깅하고 **어떤 파라미터**가 **어떤 위험**인지
 지목합니다.
 
-**정밀도 우선(키워드만으로 추측 안 함).** 단순 `download`/`export` 토큰만으로는 부족합니다 — 한국 이커머스에서
-"쿠폰 다운로드"(`couponDownL.do`)는 파일이 아닌 쿠폰 발급입니다. 분류에는 **파일-특이 신호**가 필요:
-파일-다운로드 키워드(`fileDown`/`getFile`/`atchFileDown`/`excelDown`/`download.php`…), **강한 파일 파라미터**,
-또는 office/archive/export 확장자. 키워드는 **단어 경계**로 매칭(→ `uploadFile`/`profileView`/`targetImage`
-오탐 없음), 업로드 엔드포인트는 제외됩니다.
+**엔드포인트 이름이 아니라 "파일을 서빙하느냐"로 등급 판정.** 판단 기준은 "쿠폰이냐"가 아니라 **"파일을
+서빙하느냐"** — 쿠폰/리포트/기프트 "다운로드"는 바코드 **PDF/이미지**를 서빙하는 경우가 많고(임의파일다운로드/
+traversal/IDOR 취약점), 그래서 **일괄 제외하지 않습니다.** 2단계:
+
+- **CONFIRMED** — 파일-다운로드 키워드(`fileDown`/`getFile`/`atchFileDown`/`excelDown`/`download.php`…),
+  강한 파일 파라미터, office/archive 확장자, **또는 호출부 근처의 파일-응답 메커니즘**(`responseType:'blob'`,
+  `createObjectURL`, `download` 속성, `saveAs`, `content-disposition`, `application/pdf`) — 이름과 무관하게
+  PDF를 스트리밍하는 쿠폰 엔드포인트도 잡습니다.
+- **POSSIBLE(검증)** — 강한 신호 없는 download/export 키워드; 낮은 신뢰도로 "응답이 파일인지 검증하라" 노트와 함께
+  표기(`…Count`/`…Agree` 같은 데이터/액션 엔드포인트는 제외).
+
+키워드는 **단어 경계** 매칭(→ `uploadFile`/`profileView`/`targetImage` 오탐 없음), 업로드 엔드포인트 제외,
+고위험 판정은 강키워드 **AND** 강파라미터 필요.
 
 **한국 엔터프라이즈 관례(깊이).** eGovFrame / Nexacro / XE·Rhymix / 그누보드 파라미터명:
 
