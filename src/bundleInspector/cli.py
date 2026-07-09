@@ -980,11 +980,24 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
     first_party_n = len(all_findings) - noise_n
 
     # --- Scan Summary panel: target, files, findings split, severity (one compact block) ---
-    sev_counts = report.summary.findings_by_severity or {}
-    sev_cells = [f"[{clr}]{sev_counts.get(k, 0)} {lbl}[/{clr}]"
-                 for k, lbl, clr in (("critical", "CRIT", "red"), ("high", "HIGH", "yellow"),
-                                     ("medium", "MED", "cyan"), ("low", "LOW", "green"),
-                                     ("info", "INFO", "white")) if sev_counts.get(k, 0)]
+    # Split severity by first-party vs demoted so the counts match the (noise-demoted) findings
+    # list -- otherwise a demoted vendor CRITICAL is counted but never shown.
+    _SEVDEF = (("critical", "CRIT", "red"), ("high", "HIGH", "yellow"), ("medium", "MED", "cyan"),
+               ("low", "LOW", "green"), ("info", "INFO", "white"))
+    fp_sev: dict = {}
+    noise_sev: dict = {}
+    for f in all_findings:
+        s = f.severity.value if f.severity else "info"
+        bucket = noise_sev if _is_noise(f) else fp_sev
+        bucket[s] = bucket.get(s, 0) + 1
+
+    def _sev_cells(counts: dict, dim: bool = False) -> list:
+        cells = []
+        for k, lbl, clr in _SEVDEF:
+            n = counts.get(k, 0)
+            if n:
+                cells.append(f"[dim]{n} {lbl}[/dim]" if dim else f"[{clr}]{n} {lbl}[/{clr}]")
+        return cells
     targets = list(getattr(report, "seed_urls", []) or [])
     target = escape(targets[0] + (f"  (+{len(targets) - 1} more)" if len(targets) > 1 else "")) \
         if targets else "local files"
@@ -1000,8 +1013,13 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
         fl += (f"    [dim]|[/dim]    {first_party_n} first-party"
                f"    [dim]|[/dim]    [dim]{noise_n} demoted (noise)[/dim]")
     grid.add_row("Findings", fl)
-    if sev_cells:
-        grid.add_row("Severity", "   ".join(sev_cells))
+    fp_cells = _sev_cells(fp_sev)
+    if fp_cells:
+        suffix = "   [dim](first-party)[/dim]" if noise_n else ""
+        grid.add_row("Severity", "   ".join(fp_cells) + suffix)
+    noise_cells = _sev_cells(noise_sev, dim=True)
+    if noise_cells:
+        grid.add_row("[dim]demoted[/dim]", "   ".join(noise_cells) + "   [dim](vendor / likely-FP)[/dim]")
     console.print(Panel(grid, title="[bold]Scan Summary[/bold]", border_style="blue",
                         box=box.ROUNDED, expand=False, padding=(0, 1)))
 

@@ -5,6 +5,7 @@ must not be treated as live credentials.
 """
 
 import json
+import re
 
 from bundleInspector.reporter.html_reporter import HTMLReporter
 from bundleInspector.reporter.json_reporter import JSONReporter
@@ -323,6 +324,36 @@ def test_html_reporter_demotes_and_labels_noise_findings():
     assert "Demoted, not dropped" in html
     # ...but the real finding must render BEFORE the noise finding (noise sinks to the bottom)
     assert html.index("Real sink") < html.index("Vendor secret")
+
+
+def test_html_severity_split_is_consistent_with_the_noise_demotion():
+    """The severity distribution must MATCH the (noise-hidden) findings view: a demoted vendor
+    CRITICAL must count as demoted, not first-party -- otherwise the summary reports a CRITICAL the
+    default view never shows. Columns must sum to first-party / demoted / total."""
+    crit_vendor = Finding(
+        rule_id="secret-detector", category=Category.SECRET, severity=Severity.CRITICAL,
+        confidence=Confidence.HIGH, title="Hardcoded Private Key",
+        evidence=Evidence(file_url="https://x/jsencrypt.min.js", file_hash="h", line=1),
+        extracted_value="-----BEGIN", value_type="private_key",
+        metadata={"third_party_file": "jsencrypt", "likely_fp": True, "fp_reason": "vendor"},
+    )
+    high_fp = Finding(
+        rule_id="sink-detector", category=Category.SINK, severity=Severity.HIGH,
+        confidence=Confidence.MEDIUM, title="Real sink",
+        evidence=Evidence(file_url="https://x/app.js", file_hash="h", line=9),
+        extracted_value=".html()", value_type="dom_html_sink",
+    )
+    html = HTMLReporter().generate(Report(findings=[crit_vendor, high_fp]))
+    rows = re.findall(
+        r'badge (\w+)">\w+</span></td>\s*<td><strong>(\d+)</strong></td>'
+        r'\s*<td[^>]*>(\d+)</td>\s*<td>(\d+)</td>', html)
+    by = {sv: (int(fp), int(nz), int(tot)) for sv, fp, nz, tot in rows}
+    assert by["critical"] == (0, 1, 1)   # vendor CRITICAL: 0 first-party, 1 demoted, 1 total
+    assert by["high"] == (1, 0, 1)       # real HIGH: 1 first-party
+    # columns are internally consistent
+    assert sum(v[0] for v in by.values()) == 1   # first-party total
+    assert sum(v[1] for v in by.values()) == 1   # demoted total
+    assert sum(v[2] for v in by.values()) == 2   # grand total
 
 
 def test_html_reporter_hides_noise_by_default_with_banner():

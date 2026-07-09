@@ -274,12 +274,12 @@ HTML_TEMPLATE = """
                 <div class="stat-label">Total Findings</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value">{{ report.summary.findings_by_tier.get('P0', 0) + report.summary.findings_by_tier.get('P1', 0) }}</div>
-                <div class="stat-label">Critical/High</div>
+                <div class="stat-value">{{ first_party_count }}</div>
+                <div class="stat-label">First-party (to review)</div>
             </div>
             <div class="stat-card">
-                <div class="stat-value">{{ report.summary.total_clusters }}</div>
-                <div class="stat-label">Clusters</div>
+                <div class="stat-value" style="color:var(--muted)">{{ noise_count }}</div>
+                <div class="stat-label">Demoted as noise</div>
             </div>
         </div>
 
@@ -288,17 +288,23 @@ HTML_TEMPLATE = """
             <table>
                 <tr>
                     <th>Severity</th>
-                    <th>Count</th>
+                    <th title="First-party findings shown by default">First-party</th>
+                    <th title="Vendor / likely-FP findings hidden by default">Demoted (noise)</th>
+                    <th>Total</th>
                 </tr>
-                {% for sev, count in report.summary.findings_by_severity.items() %}
-                {% if count > 0 %}
+                {% for r in sev_rows %}
                 <tr>
-                    <td><span class="badge {{ sev }}">{{ sev | upper }}</span></td>
-                    <td>{{ count }}</td>
+                    <td><span class="badge {{ r.sev }}">{{ r.sev | upper }}</span></td>
+                    <td><strong>{{ r.fp }}</strong></td>
+                    <td style="color:var(--muted)">{{ r.noise }}</td>
+                    <td>{{ r.total }}</td>
                 </tr>
-                {% endif %}
                 {% endfor %}
             </table>
+            <p style="color:var(--muted);font-size:0.85em;margin-top:8px;">
+                <strong>First-party</strong> = findings shown by default (what to review).
+                <strong>Demoted</strong> = vendor / likely-FP hidden by default — e.g. a CRITICAL here is a library string, not app code.
+            </p>
         </div>
 
         <div class="section">
@@ -517,6 +523,20 @@ class HTMLReporter(BaseReporter):
         env = Environment(autoescape=True)
         template = env.from_string(HTML_TEMPLATE)
         noise_count = sum(1 for v in findings_view if v["noise"])
+        # Severity split so the summary is CONSISTENT with the (noise-hidden) findings list: the
+        # aggregate counted demoted noise (e.g. a vendor CRITICAL) that never appears in the default
+        # view. Show first-party vs demoted vs total per severity.
+        _sev_names = ["critical", "high", "medium", "low", "info"]
+        fp_sev: dict = {}
+        noise_sev: dict = {}
+        for f in report.findings:
+            s = getattr(getattr(f, "severity", None), "value", "info")
+            (noise_sev if _noise(f) else fp_sev)[s] = (noise_sev if _noise(f) else fp_sev).get(s, 0) + 1
+        sev_rows = [
+            {"sev": s, "fp": fp_sev.get(s, 0), "noise": noise_sev.get(s, 0),
+             "total": fp_sev.get(s, 0) + noise_sev.get(s, 0)}
+            for s in _sev_names if (fp_sev.get(s, 0) + noise_sev.get(s, 0)) > 0
+        ]
         return template.render(
             report=report,
             findings_sorted=findings_sorted,
@@ -525,6 +545,7 @@ class HTMLReporter(BaseReporter):
             # NOT "real vulnerabilities" -- these are first-party findings after vendor/likely-FP
             # noise is removed; they still include attack surface (endpoints) and need triage.
             first_party_count=len(findings_view) - noise_count,
+            sev_rows=sev_rows,
             report_json=report_json,
         )
 
