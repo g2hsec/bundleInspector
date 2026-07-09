@@ -240,6 +240,25 @@ def is_url_safe(
     return True, "OK"
 
 
+def ssrf_block_hint(reason: str) -> str:
+    """Map an is_url_safe() block reason to an actionable remedy shown next to the warning.
+
+    Honest and conditional: a resolved private IP CAN be scanned with --allow-private-ips (for an
+    authorized internal target), but loopback / cloud-metadata / non-http schemes stay blocked by
+    design, so those never recommend the flag."""
+    r = (reason or "").lower()
+    if "resolved ip is blocked" in r:
+        return ("if this is an AUTHORIZED internal/dev target on a private network, re-run with "
+                "--allow-private-ips (loopback & cloud-metadata stay blocked regardless)")
+    if "blocked host" in r:
+        return "localhost / cloud-metadata hostnames are blocked by design and cannot be scanned"
+    if "scheme" in r:
+        return "only http:// and https:// URLs are scanned"
+    if "hostname" in r or "empty url" in r or "invalid url" in r:
+        return "check the URL -- missing or invalid hostname"
+    return "verify the target is authorized and reachable"
+
+
 def sanitize_url(url: str) -> Optional[str]:
     """
     Sanitize and validate a URL.
@@ -253,7 +272,7 @@ def sanitize_url(url: str) -> Optional[str]:
     is_safe, reason = is_url_safe(url, resolve_dns=False)
 
     if not is_safe:
-        logger.warning("url_blocked", url=url[:100], reason=reason)
+        logger.warning("url_blocked", url=url[:100], reason=reason, hint=ssrf_block_hint(reason))
         return None
 
     return url

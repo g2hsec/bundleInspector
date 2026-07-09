@@ -37,7 +37,7 @@ from bundleInspector.core.resume_policy import (
     embed_report_resume_signature,
     report_matches_resume_signature,
 )
-from bundleInspector.core.security import is_url_safe
+from bundleInspector.core.security import is_url_safe, ssrf_block_hint
 from bundleInspector.correlator.graph import Correlator
 from bundleInspector.normalizer.beautify import Beautifier
 from bundleInspector.normalizer.line_mapping import LineMapper
@@ -628,7 +628,8 @@ class Orchestrator:
             is_url_safe, url, True, self.config.scope.allow_private_ips
         )
         if not is_safe:
-            logger.warning("seed_url_blocked", url=url[:100], reason=reason)
+            logger.warning("seed_url_blocked", url=url[:100], reason=reason,
+                           hint=ssrf_block_hint(reason))
             return refs
 
         static_cls = (
@@ -831,6 +832,7 @@ class Orchestrator:
                 "ssrf_blocked",
                 url=ref.url[:100],
                 reason=reason,
+                hint=ssrf_block_hint(reason),
             )
             return None
 
@@ -848,7 +850,9 @@ class Orchestrator:
                 if content_length:
                     try:
                         if int(content_length) > self.config.crawler.max_file_size:
-                            logger.warning("file_too_large", url=ref.url)
+                            logger.warning("file_too_large", url=ref.url,
+                                           limit_bytes=self.config.crawler.max_file_size,
+                                           hint="raise crawler.max_file_size in --config to scan this asset")
                             return None
                     except ValueError:
                         pass
@@ -858,7 +862,9 @@ class Orchestrator:
 
             # Check actual size limit
             if len(content) > self.config.crawler.max_file_size:
-                logger.warning("file_too_large", url=ref.url)
+                logger.warning("file_too_large", url=ref.url,
+                               limit_bytes=self.config.crawler.max_file_size,
+                               hint="raise crawler.max_file_size in --config to scan this asset")
                 return None
 
             asset = JSAsset(

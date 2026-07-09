@@ -976,6 +976,20 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
 
     console.print(table)
 
+    # No JS analyzed is almost always a fixable block/scope/network issue -- surface remedies
+    # prominently instead of leaving the user to guess (the per-event `hint=` in the warnings
+    # above carries the exact reason).
+    if report.summary.total_js_files == 0:
+        console.print(
+            "\n[yellow]No JS files were analyzed.[/yellow] Common causes & recommended options:\n"
+            "  - seed blocked by SSRF (resolves to an internal IP): if this is an AUTHORIZED "
+            "internal/dev target, re-run with [cyan]--allow-private-ips[/cyan]\n"
+            "  - target out of scope: widen [cyan]--scope \"*.your-domain\"[/cyan]\n"
+            "  - JS is injected at runtime: use a headless profile "
+            "(needs [cyan]playwright install chromium[/cyan])\n"
+            "  [dim](see the warnings above -- each carries a `hint=` with the exact reason)[/dim]"
+        )
+
     # Severity breakdown
     if report.summary.total_findings > 0:
         console.print()
