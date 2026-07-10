@@ -2,9 +2,11 @@
 their specific risk (path traversal / file-IDOR / SSRF / forced-browsing), with deep coverage of
 Korean enterprise (eGovFrame / Nexacro) parameter conventions.
 
-INVARIANT: precision first -- a bare `download`/`export` keyword must NEVER classify (Korean
-"쿠폰 다운로드" = a coupon claim, not a file). A finding is a file download only on a file-specific
-signal. Non-destructive: never mutates a finding beyond metadata['download_surface']."""
+DESIGN: graded by how a file is SERVED, not by the endpoint's name. CONFIRMED on a file signal
+(keyword / strong param / office-archive ext / file-response mechanism); a bare download/export
+keyword surfaces as POSSIBLE (verify) rather than being excluded, because a coupon/report download
+often serves a barcode PDF/image. Non-destructive: never mutates a finding beyond
+metadata['download_surface']."""
 
 from __future__ import annotations
 
