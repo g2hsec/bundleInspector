@@ -27,3 +27,8 @@ env/
 
 # Scan output (never commit target scan data)
 artifacts/
+
+# CLI scan output (never commit)
+bundleInspector_*report*.json
+bundleInspector_*report*.html
+bundleInspector_local_report.*
