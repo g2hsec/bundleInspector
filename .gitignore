@@ -24,3 +24,6 @@ htmlcov/
 venv/
 env/
 
+
+# Scan output (never commit target scan data)
+artifacts/
