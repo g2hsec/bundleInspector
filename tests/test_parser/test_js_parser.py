@@ -143,6 +143,46 @@ class TestJSParser:
         assert result.success
         assert result.ast is not None
 
+    def test_optional_chaining_member_normalizes_and_recovers(self):
+        """`?.` (ES2020) is unparseable by esprima; without recovery a minified `?.` bundle
+        collapses to the string-only regex fallback, zeroing every AST detector."""
+        source = 'var u = a?.b?.c; fn(u);'
+        parser = JSParser()
+        normalized = parser._normalize_modern_syntax_for_esprima(source)
+        result = parser.parse(source)
+        assert "?." not in normalized
+        assert len(normalized) == len(source)   # width-preserved (enh1 offset invariant)
+        assert result.success and result.ast is not None
+
+    def test_optional_chaining_call_and_computed_recover(self):
+        source = 'cb?.(1, 2); arr?.[i]?.name;'
+        parser = JSParser()
+        normalized = parser._normalize_modern_syntax_for_esprima(source)
+        assert "?." not in normalized
+        assert len(normalized) == len(source)
+        assert parser.parse(source).success
+
+    def test_optional_chaining_digit_guard_preserves_ternary(self):
+        """`a?.5:b` is the conditional operator with a fractional literal, NOT optional chaining --
+        esprima parses it natively, so it must be left intact."""
+        source = 'var t = cond ?.5 : other; var u = x?.y;'
+        parser = JSParser()
+        normalized = parser._normalize_modern_syntax_for_esprima(source)
+        assert "?.5" in normalized          # ternary preserved
+        assert "x?.y" not in normalized     # real optional chain still normalized
+        assert parser.parse(source).success
+
+    def test_optional_chaining_restores_ast_detection(self):
+        """End-to-end: a `?.` bundle recovers its function-call AST (endpoints/sinks/taint depend
+        on ir.function_calls, which the regex fallback never populates)."""
+        from bundleInspector.parser.ir_builder import build_ir
+        source = 'function f(a){ var u = a?.b?.c; eval(u); fetch("/api/secret"); }'
+        result = parse_js(source)
+        assert result.parser_used == "esprima-normalized"
+        ir = build_ir(result.ast, "f.js", "h")
+        names = {c.name for c in ir.function_calls}
+        assert "eval" in names and "fetch" in names
+
     def test_parse_es_modules(self):
         """Test parsing ES modules."""
         source = '''

@@ -32,6 +32,7 @@ from bundleInspector.storage.models import (
 from bundleInspector.rules.detectors.sinks import (
     _expr_source,
     _flatten_concat,
+    _literal_str,
     _DANGEROUS_ATTRS,
 )
 
@@ -61,6 +62,9 @@ _TRANSFORMS = {
 }
 _HTML_CALL_SINKS = {"html", "append", "prepend", "after", "before", "replacewith", "wrap"}
 _ATTR_SINK_CALLS = {"attr", "prop", "setattribute"}
+# jQuery reverse-insertion: the built HTML is the RECEIVER, the target is the arg
+# (`$('<div>'+x).appendTo(t)`) -- the mirror of _HTML_CALL_SINKS.
+_REVERSE_INSERT_METHODS = {"appendto", "prependto", "insertafter", "insertbefore", "replaceall"}
 
 _SOURCE_SEVERITY = {
     "ajax_response": (Severity.HIGH, Confidence.HIGH, "server response"),
@@ -95,6 +99,48 @@ def _member_root_name(node: Any) -> str:
             return "this"
         cur = cur.get("object") if t == "MemberExpression" else (cur.get("callee") if t == "CallExpression" else None)
     return ""
+
+
+# `.location` is a URL source only off a window-family global -- NOT off an app object
+# (store.location, router.location, marker.location) which would false-positive.
+_LOCATION_HOSTS = {"window", "self", "top", "parent", "globalthis", "document"}
+# location components that carry ONLY same-origin data (not attacker-controllable) -- a redirect to
+# location.pathname / .origin is safe, so the navigation sink must ignore them.
+_SAFE_LOC_PROPS = {"origin", "protocol", "host", "hostname", "port", "pathname"}
+
+
+def _is_location_expr(node: Any) -> bool:
+    """True for `location`, `window.location`, `document.location`, `self.location`, ... (the object
+    whose .href/.assign/.replace is a navigation sink)."""
+    if not isinstance(node, dict):
+        return False
+    if node.get("type") == "Identifier":
+        return (node.get("name") or "").lower() == "location"
+    if node.get("type") == "MemberExpression" and _prop_name(node) == "location":
+        return _member_root_name(node.get("object")) in _LOCATION_HOSTS
+    return False
+
+
+def _nav_fp_safe(info: Any) -> bool:
+    """A location source reading a same-origin component (pathname/origin/...) is not attacker-
+    controllable -- navigating to it is not an open redirect."""
+    return isinstance(info, dict) and info.get("label") == "location" \
+        and info.get("loc_prop") in _SAFE_LOC_PROPS
+
+
+def _is_built_html(arg: Any) -> bool:
+    """True if the arg is an HTML string being CONSTRUCTED (template/concat whose literal part
+    contains `<`) -- distinguishes `$('<div>'+u)` (HTML sink) from `$('#'+id)` (selector, safe)."""
+    if not isinstance(arg, dict):
+        return False
+    if arg.get("type") == "TemplateLiteral":
+        return any("<" in ((q.get("value") or {}).get("raw") or "")
+                   for q in arg.get("quasis") or [])
+    if arg.get("type") == "BinaryExpression" and arg.get("operator") == "+":
+        parts: list = []
+        _flatten_concat(arg, parts)
+        return any("<" in _literal_str(p) for p in parts)
+    return False
 
 
 def _callee_last_name(callee: Any) -> str:
@@ -464,6 +510,10 @@ class TaintFlowDetector(BaseRule):
                 return {**base, "step": "FileReader .result"} if prop in ("result", "target") else None
             if prop == "length":
                 return None
+            # carry which URL component is read (hash/search/href vs pathname/origin) so the
+            # navigation sink can suppress same-origin redirects.
+            if base.get("label") == "location":
+                return {**base, "step": f".{prop}", "loc_prop": prop}
             return {**base, "step": f".{prop}"}
         if prop in _RESPONSE_MEMBERS:
             ob = self._eval(obj, scope, env, depth)
@@ -471,7 +521,11 @@ class TaintFlowDetector(BaseRule):
                 return {**ob, "label": "ajax_response", "step": f".{prop}"}
         root = _member_root_name(node)
         if root == "location":
-            return {"label": "location", "line": _line_of(node), "step": "location.*"}
+            return {"label": "location", "line": _line_of(node), "step": "location.*", "loc_prop": prop}
+        # window.location / document.location / self.location ... -- the dominant real-world spelling
+        # that `_member_root_name` (deepest-identifier) otherwise roots at window/document and misses.
+        if prop == "location" and root in _LOCATION_HOSTS:
+            return {"label": "location", "line": _line_of(node), "step": f"{root}.location"}
         if root == "document" and prop in ("cookie", "url", "documenturi", "referrer"):
             return {"label": "location", "line": _line_of(node), "step": "document.*"}
         # e.target.value / e.target.files inside an event handler are DOM input
@@ -501,6 +555,18 @@ class TaintFlowDetector(BaseRule):
             if rt is not None and node.get("operator") == "=":
                 self._record(node, right, "", f"{_prop_name(left)}=", rt, scope, env)
             return rt
+        # navigation / open-redirect assignment sink: location.href = X, window.location = X.
+        # Only member forms (a bare `location = x` is a common React-router local var -> ambiguous).
+        if node.get("operator") == "=" and left.get("type") == "MemberExpression":
+            lp = _prop_name(left)
+            if lp == "href" and _is_location_expr(left.get("object")):
+                if rt is not None and not _nav_fp_safe(rt):
+                    self._record(node, right, "", "location.href=", rt, scope, env)
+                return rt
+            if lp == "location" and _member_root_name(left.get("object")) in _LOCATION_HOSTS:
+                if rt is not None and not _nav_fp_safe(rt):
+                    self._record(node, right, "", "location=", rt, scope, env)
+                return rt
         # env update for a simple / destructuring target (flow-sensitive kill/gen)
         if node.get("operator") == "=":
             if left.get("type") == "Identifier":
@@ -518,7 +584,10 @@ class TaintFlowDetector(BaseRule):
         # --- SINK checks (value taint against current env) ---
         for value_node, attr, sink_label in self._call_sinks(node, callee, args):
             vt = self._eval(value_node, scope, env, depth)
-            if vt is not None:
+            # navigation sinks ignore same-origin location components (redirect to location.pathname
+            # is not an open redirect); HTML/attr/code sinks are unaffected by this guard.
+            nav = sink_label.startswith("location.") or sink_label == "window.open()"
+            if vt is not None and not (nav and _nav_fp_safe(vt)):
                 self._record(node, value_node, attr, sink_label, vt, scope, env)
 
         # --- CALLBACK SEEDING (side effects; must run regardless of this call's return value) ---
@@ -677,11 +746,57 @@ class TaintFlowDetector(BaseRule):
             yield (args[0], "", f".{last}()")
         elif last == "eval" and args:
             yield (args[0], "", "eval()")
+        # navigation / open-redirect sinks -- location.assign/replace(<tainted>), window.open(<tainted>).
+        # Object-rooted at location (excludes str.replace / Object.assign) and window/self (excludes
+        # xhr.open / a local open()).
+        elif last in ("assign", "replace") and _is_location_expr(callee.get("object")) and args:
+            yield (args[0], "", f"location.{last}()")
+        elif (last == "open" and callee.get("type") == "MemberExpression"
+              and _member_root_name(callee) in ("window", "self") and args):
+            yield (args[0], "", "window.open()")
+        # jQuery factory HTML parsing: $('<div>'+tainted) runs innerHTML on a detached node -> DOM-XSS.
+        # Only when the arg is CONSTRUCTED HTML (contains `<`), never a selector like $('#'+id).
+        elif (callee.get("type") == "Identifier" and (callee.get("name") or "").lower() in ("$", "jquery")
+              and args and _is_built_html(args[0])):
+            yield (args[0], "", "$() html")
+        # jQuery reverse-insertion: $('<div>'+tainted).appendTo(target) -- the built HTML is the
+        # receiver, so the outer call's own name isn't a sink; reach into the $() receiver.
+        elif last in _REVERSE_INSERT_METHODS and callee.get("type") == "MemberExpression":
+            ob = callee.get("object") or {}
+            if (isinstance(ob, dict) and ob.get("type") == "CallExpression"
+                    and _callee_last_name(ob.get("callee") or {}) in ("$", "jquery")):
+                jargs = ob.get("arguments") or []
+                if jargs and _is_built_html(jargs[0]):
+                    yield (jargs[0], "", f".{last}()")
         elif last in _ATTR_SINK_CALLS and len(args) >= 2:
             a0 = args[0]
             an = a0.get("value") if isinstance(a0, dict) and a0.get("type") == "Literal" else ""
             if isinstance(an, str) and an.lower() in _DANGEROUS_ATTRS:
                 yield (args[1], an.lower(), f".{last}({an.lower()})")
+        # jQuery `$(builtHtml)` / `jQuery(builtHtml)`: passing an HTML *string* to the jQuery
+        # factory parses it into elements (running `<img onerror>` etc.), so a tainted value
+        # concatenated/interpolated into a string that contains a literal `<` is a real DOM-XSS
+        # sink. Restricted to built-HTML shape (a `<` in the literal parts) so selector building
+        # -- `$("#"+id)`, `$("."+cls)` -- never matches. Bare `$(tainted)` is NOT flagged.
+        elif callee.get("type") == "Identifier" and last in ("$", "jquery") and args \
+                and self._is_built_html(args[0]):
+            yield (args[0], "", "$() html")
+
+    @staticmethod
+    def _is_built_html(arg: Any) -> bool:
+        """True if `arg` is a string built by concatenation/interpolation whose LITERAL portion
+        contains a `<` -- i.e. HTML being constructed, not a jQuery selector. A bare identifier
+        or a plain literal returns False (kept out to hold false positives near zero)."""
+        if not isinstance(arg, dict):
+            return False
+        t = arg.get("type")
+        if t == "TemplateLiteral":
+            return any("<" in ((q.get("value") or {}).get("raw") or "") for q in arg.get("quasis") or [])
+        if t == "BinaryExpression" and arg.get("operator") == "+":
+            parts: list = []
+            _flatten_concat(arg, parts)
+            return any("<" in _literal_str(p) for p in parts)
+        return False
 
     # ------------------------------------------------------------ finding emission
 

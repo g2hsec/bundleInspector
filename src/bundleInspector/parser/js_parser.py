@@ -227,6 +227,25 @@ class JSParser:
                     result.append("||")
                     i += 2
                     continue
+                # Optional chaining `?.` (ES2020) -- esprima cannot parse it, so a single-line
+                # minified bundle that uses it fails the full parse and collapses to the string-only
+                # regex fallback, ZEROING every AST detector (endpoints/sinks/taint/flags/debug).
+                # Downgrade `?.` to plain member access, width-preserving (absolute char offsets are
+                # relied on by enh1 access-control gating). GUARD: `a?.5:b` is the ternary operator
+                # with a fractional literal, NOT optional chaining -- leave it for esprima.
+                if char == "?" and next_char == ".":
+                    after = source[i + 2] if i + 2 < len(source) else ""
+                    if after.isdigit():
+                        result.append(char)          # ternary `?.5` -> leave `?` intact
+                        i += 1
+                        continue
+                    if after in ("(", "["):          # `?.(` optional call / `?.[` computed
+                        result.append("  ")          # 2 spaces ('.' before ( / [ is illegal)
+                        i += 2
+                        continue
+                    result.append(" ")               # `?.id` -> ` .id`
+                    i += 1
+                    continue
                 if template_expr_stack:
                     if char == "{":
                         template_expr_stack[-1] += 1

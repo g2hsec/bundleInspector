@@ -50,6 +50,14 @@ _EXPLAIN: Dict[str, tuple[str, str, str]] = {
         "Attacker-controlled input executes as JavaScript -- full client-side compromise.",
         "Remove eval/Function-on-strings; use a parser or a fixed dispatch table instead.",
     ),
+    "open_redirect": (
+        "Dynamic data flows into client-side navigation (location.href / location.assign / "
+        "location.replace / window.open).",
+        "An attacker-controlled URL redirects the victim to a phishing site (open redirect), or a "
+        "`javascript:` URL runs script (DOM XSS).",
+        "Allow only same-origin or an allow-listed set of destinations; reject `javascript:`/`data:` "
+        "schemes and absolute off-site URLs.",
+    ),
     "alert_call": (
         "A debug/PoC alert() call was left in the shipped bundle.",
         "Low direct risk, but often marks unfinished code or a former XSS test point.",
@@ -177,6 +185,8 @@ def explain_finding(finding: Finding) -> Dict[str, str]:
             sink = str((getattr(finding, "metadata", {}) or {}).get("sink", "")).lower()
             if any(k in sink for k in ("eval", "function", "settimeout", "setinterval", "execscript")):
                 vt = "code_eval_sink"
+            elif sink.startswith("location.") or sink in ("location=", "window.open()"):
+                vt = "open_redirect"
         why, impact, fix = _EXPLAIN.get(vt) or _CATEGORY_EXPLAIN.get(cat) or _GENERIC
         return {"why": why, "impact": impact, "fix": fix}
     except Exception:

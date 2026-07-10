@@ -24,6 +24,8 @@ def _vuln_class(sink: str) -> str:
     s = (sink or "").lower()
     if any(k in s for k in ("eval", "function", "settimeout", "setinterval", "execscript")):
         return "code-injection"
+    if s.startswith("location.") or s in ("location=", "window.open()"):
+        return "open-redirect"
     return "DOM/stored-XSS"
 
 

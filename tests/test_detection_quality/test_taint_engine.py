@@ -129,6 +129,112 @@ def test_branch_merge_no_leak(label, src):
     assert _taint_flows(src) == [], f"branch leak: {label}"
 
 
+# ---------------------------------------------------------------- open-redirect / navigation sinks
+
+def _sinks(src):
+    return [(f.metadata["sink"], f.metadata["source_kind"]) for f in _taint_flows(src)]
+
+
+@pytest.mark.parametrize("label,src,sink,source", [
+    ("location.hash -> location.href", "var q=location.hash; location.href=q;", "location.href=", "location"),
+    ("window.location.hash -> location.assign",
+     "location.assign(window.location.hash);", "location.assign()", "location"),
+    ("location.search -> location.replace",
+     "location.replace(location.search);", "location.replace()", "location"),
+    ("location.hash -> window.open", "window.open(location.hash);", "window.open()", "location"),
+    ("window.location = tainted", "window.location = location.hash;", "location=", "location"),
+    ("dom input -> location.href", 'var v=$("#x").val(); location.href=v;', "location.href=", "dom_input"),
+    ("ajax response -> location.href",
+     '$.ajax({url:"/a"}).done(function(r){ location.href=r.next; });', "location.href=", "ajax_response"),
+])
+def test_open_redirect_true_positives(label, src, sink, source):
+    got = _sinks(src)
+    assert (sink, source) in got, f"{label}: expected ({sink},{source}), got {got}"
+
+
+@pytest.mark.parametrize("label,src", [
+    # same-origin location components are not attacker-controllable -> not an open redirect
+    ("pathname redirect", "location.href = location.pathname;"),
+    ("origin redirect", "location.href = location.origin + '/dashboard';"),
+    ("host redirect", "location.assign(location.host);"),
+    # object-root guards: str.replace / Object.assign / xhr.open are not navigation
+    ("str.replace not nav", 'var u=location.hash; el.textContent=u.replace("a","b");'),
+    ("Object.assign not nav", "var o=Object.assign({}, location.hash);"),
+    ("xhr.open not nav", 'xhr.open("GET", location.hash);'),
+    ("bare open() not nav", "var f=open; f(location.hash);"),
+    # static / clean values are not flows
+    ("static redirect literal", 'location.href="/home";'),
+    ("bare location= is ambiguous (react-router)", "var location=useLocation(); location = next;"),
+    # app object .location is not the URL global
+    ("store.location is not a URL", "location.href = store.location.name;"),
+])
+def test_open_redirect_false_positives(label, src):
+    assert _sinks(src) == [], f"nav FP: {label}"
+
+
+# ---------------------------------------------------------------- window.location source recognition
+
+@pytest.mark.parametrize("src", [
+    "el.innerHTML = window.location.hash;",
+    "el.html(document.location.href);",
+    "el.innerHTML = self.location.search;",
+    "var l = window.location; el.innerHTML = l.hash;",   # aliased
+])
+def test_window_location_is_a_url_source(src):
+    assert any(f.metadata["source_kind"] == "location" for f in _taint_flows(src)), src
+
+
+@pytest.mark.parametrize("src", [
+    "el.innerHTML = store.location.name;",
+    "el.html(router.location.pathname);",
+    "el.innerHTML = marker.location.lat;",
+])
+def test_app_object_location_is_not_a_source(src):
+    assert _taint_flows(src) == [], src
+
+
+# ---------------------------------------------------------------- jQuery $(builtHtml) DOM-XSS sink
+
+@pytest.mark.parametrize("label,src,source", [
+    ("$('<div>'+tainted)", 'var u=location.hash; $("<div>"+u+"</div>");', "location"),
+    ("$(`<a href=${u}>`)", "var u=location.hash; $(`<a href='${u}'>x</a>`);", "location"),
+    ("jQuery(built html)", "var u=location.hash; jQuery(`<b>${u}</b>`);", "location"),
+    ("$() ajax html", '$.ajax({url:"/a"}).done(function(r){ $("<li>"+r.name+"</li>"); });', "ajax_response"),
+])
+def test_jquery_html_construction_is_a_sink(label, src, source):
+    got = _sinks(src)
+    assert ("$() html", source) in got, f"{label}: got {got}"
+
+
+@pytest.mark.parametrize("src", [
+    'var id=$("#x").val(); $("#"+id);',       # selector construction, not HTML
+    "var c=location.hash; $(`#${c}`);",       # template selector
+    "var u=location.hash; $(u);",             # bare tainted arg (selector-vs-html ambiguous)
+    '$("<div>static</div>");',                # clean literal
+])
+def test_jquery_selector_is_not_a_sink(src):
+    assert not any(f.metadata["sink"] == "$() html" for f in _taint_flows(src)), src
+
+
+@pytest.mark.parametrize("src,sink", [
+    ('$("<div>"+location.hash+"</div>").appendTo("#log");', ".appendto()"),
+    ('$("<li>"+location.hash).prependTo(list);', ".prependto()"),
+    ('$("<b>"+location.hash+"</b>").insertAfter(el);', ".insertafter()"),
+])
+def test_jquery_reverse_insertion_is_a_sink(src, sink):
+    # $('<div>'+tainted).appendTo(t) -- built HTML is the receiver, not the arg
+    assert (sink, "location") in _sinks(src), src
+
+
+@pytest.mark.parametrize("src", [
+    '$("#existing").appendTo("#target");',     # selector receiver, no HTML built
+    'var el=$("#x"); el.appendTo("#y");',      # non-jQuery-factory receiver
+    '$("<div>"+"static").appendTo("#t");',     # clean concat
+])
+def test_jquery_reverse_insertion_no_false_positive(src):
+    assert _sinks(src) == [], src
+
+
 @pytest.mark.parametrize("label,src", [
     ("taint then sink inside if", 'function f(c){ if(c){ var x=location.hash; document.write(x); } }'),
     ("taint in if, sink after join", 'function f(c){ var x="s"; if(c){ x=location.hash; } document.write(x); }'),

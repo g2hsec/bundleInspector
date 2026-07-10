@@ -41,6 +41,9 @@ class DomainDetector(BaseRule):
         (r"\b(?:dev|development|staging|stg|stage|test|qa|uat|preprod|pre-prod|sandbox)[-.]", "staging_domain"),
         (r"[-.](?:dev|development|staging|stg|stage|test|qa|uat|preprod|pre-prod|sandbox)\.", "staging_domain"),
 
+        # Cloud metadata host (SSRF/IMDS) -- specific, before the broad `.internal` suffix
+        (r"\bmetadata\.google\.internal\b", "gcp_metadata_host"),
+
         # Internal suffixes
         (r"\.(?:internal|local|localhost|corp|intranet|private|lan)\b", "internal_domain"),
 
@@ -58,6 +61,11 @@ class DomainDetector(BaseRule):
 
     # Private IP patterns
     PRIVATE_IP_PATTERNS = [
+        # Cloud metadata (IMDS) -- the single highest-signal SSRF target. SPECIFIC before the broad
+        # 169.254.0.0/16 link-local so the loop `break` dedups to one finding for 169.254.169.254.
+        (r"\b169\.254\.169\.254\b", "cloud_metadata_ip"),
+        # 169.254.0.0/16 link-local (also the base for GCP/Azure IMDS reachability)
+        (r"\b169\.254\.(?:[0-9]{1,3}\.)[0-9]{1,3}\b", "link_local_ip"),
         # 10.0.0.0/8
         (r"\b10\.(?:[0-9]{1,3}\.){2}[0-9]{1,3}\b", "private_ip_10"),
         # 172.16.0.0/12
@@ -139,19 +147,35 @@ class DomainDetector(BaseRule):
                     if any(int(p) > 255 for p in parts):
                         continue
 
+                    if ip_type == "cloud_metadata_ip":
+                        sev = Severity.HIGH
+                        title = "Cloud Metadata (IMDS) Endpoint"
+                        desc = (f"Reference to the cloud instance-metadata service {ip} -- a prime "
+                                f"SSRF target (steals IAM/instance credentials).")
+                        tags = ["ip", "ssrf", "cloud-metadata"]
+                    elif ip_type == "link_local_ip":
+                        sev = Severity.MEDIUM
+                        title = "Link-Local Address"
+                        desc = f"Reference to a link-local address {ip} (169.254.0.0/16) -- SSRF/IMDS reachable."
+                        tags = ["ip", "link-local"]
+                    else:
+                        sev = Severity.LOW if ip_type == "loopback_ip" else Severity.MEDIUM
+                        title = "Private IP Address"
+                        desc = f"Found private IP address: {ip}"
+                        tags = ["ip", "private"]
                     yield RuleResult(
                         rule_id=self.id,
                         category=self.category,
-                        severity=Severity.LOW if ip_type == "loopback_ip" else Severity.MEDIUM,
+                        severity=sev,
                         confidence=Confidence.HIGH,
-                        title=f"Private IP Address",
-                        description=f"Found private IP address: {ip}",
+                        title=title,
+                        description=desc,
                         extracted_value=ip,
                         value_type=ip_type,
                         line=literal.line,
                         column=literal.column,
                         ast_node_type="Literal",
-                        tags=["ip", "private"],
+                        tags=tags,
                     )
                     break
 

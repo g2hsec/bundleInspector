@@ -46,6 +46,14 @@ class TestExplainFinding:
                                meta={"sink": ".html()", "sink_source": "x", "source_kind": "ajax"}))
         assert "xss" in e["impact"].lower()
 
+    def test_taint_flow_into_navigation_is_open_redirect(self):
+        # a taint_flow into location.href / window.open is an open redirect, not DOM-XSS
+        for sink in ("location.href=", "location.assign()", "window.open()", "location="):
+            e = explain_finding(_f(Category.SINK, "taint_flow",
+                                   meta={"sink": sink, "sink_source": "location.hash", "source_kind": "url"}))
+            assert "redirect" in e["impact"].lower(), sink
+            assert "dompurify" not in e["fix"].lower()   # DOM-sanitize fix is nonsensical here
+
     def test_client_route_gets_route_explanation_not_endpoint(self):
         # over-fit fix: client_route (value_type) wins over the endpoint category fallback
         e = explain_finding(_f(Category.ENDPOINT, "client_route"))

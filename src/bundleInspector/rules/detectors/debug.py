@@ -86,6 +86,15 @@ class DebugDetector(BaseRule):
         (r"\bDEVELOPMENT\s*[=:]\s*true", "dev_enabled"),
     ]
 
+    # `//# sourceMappingURL=...` (or legacy `//@`, or `/* ... */`) points at the source map, which
+    # reconstructs the ORIGINAL (pre-minification) source -- comments, dev endpoints, sometimes
+    # secrets. Anchored to the start of a (beautified) line so it can't match the directive text
+    # embedded inside a bundled tooling string literal.
+    SOURCE_MAP_DIRECTIVE = re.compile(
+        r'^[ \t]*(?://|/\*)[#@]\s*(sourceMappingURL|sourceURL)\s*=\s*(\S+?)(?:\s*\*/)?[ \t]*\r?$',
+        re.IGNORECASE | re.MULTILINE,
+    )
+
     def match(
         self,
         ir: IntermediateRepresentation,
@@ -106,6 +115,9 @@ class DebugDetector(BaseRule):
 
         # Check source for development patterns
         yield from self._check_dev_patterns(context)
+
+        # Check source for source-map disclosure directives
+        yield from self._check_source_map(context)
 
     def _check_debug_endpoints(self, literal) -> Iterator[RuleResult]:
         """Check for debug endpoints in strings."""
@@ -272,4 +284,28 @@ class DebugDetector(BaseRule):
                     ast_node_type="Expression",
                     tags=["debug", "development"],
                 )
+
+    def _check_source_map(
+        self,
+        context: AnalysisContext,
+    ) -> Iterator[RuleResult]:
+        """Check for `//# sourceMappingURL=` disclosure directives in source."""
+        for match in self.SOURCE_MAP_DIRECTIVE.finditer(context.source_content or ""):
+            line = context.source_content[:match.start()].count("\n") + 1
+            directive, target = match.group(1), match.group(2)
+            yield RuleResult(
+                rule_id=self.id,
+                category=self.category,
+                severity=Severity.LOW,
+                confidence=Confidence.HIGH,
+                title="Source Map Disclosure",
+                description=(f"{directive} directive exposes the source map ({target}), which "
+                             f"reconstructs the original pre-minification source."),
+                extracted_value=target,
+                value_type="source_map_reference",
+                line=line,
+                column=0,
+                ast_node_type="Line",
+                tags=["debug", "source-map", "disclosure"],
+            )
 
