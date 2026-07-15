@@ -11,8 +11,9 @@ because these method bodies are unchanged.
 
 from __future__ import annotations
 
+import hashlib
 import json
-from typing import Any, Optional
+from typing import TYPE_CHECKING, Any
 
 import structlog
 
@@ -22,23 +23,129 @@ from bundleInspector.parser.export_scopes import (
     build_commonjs_default_object_export_members,
     build_commonjs_export_metadata,
     build_commonjs_named_object_export_members,
-    build_commonjs_require_bindings,
     build_commonjs_re_export_bindings,
+    build_commonjs_require_bindings,
     build_default_object_export_members,
     build_export_scope_map,
     build_named_object_export_members,
     build_re_export_bindings,
 )
+from bundleInspector.parser.language import language_hint_from_path
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.storage.models import Finding, JSAsset
 
+if TYPE_CHECKING:
+    from bundleInspector.core.dedup import DedupCache
+    from bundleInspector.normalizer.line_mapping import LineMapper
+    from bundleInspector.normalizer.sourcemap import SourceMapInfo
+    from bundleInspector.parser.ir_builder import IRBuilder
+    from bundleInspector.parser.js_parser import JSParser
+    from bundleInspector.rules.engine import RuleEngine
+    from bundleInspector.storage.models import FunctionDef, IntermediateRepresentation
+
 logger = structlog.get_logger(__name__)
+
+_MAX_VIRTUAL_SOURCE_EVENTS = 256
+_MAX_SOURCE_OCCURRENCES = 256
+_MAX_EVENT_DETAILS = 32
+_MAX_VIRTUAL_SOURCES = 512
+_MAX_VIRTUAL_SOURCE_BYTES = 20 * 1024 * 1024
+_ASSET_ENRICHMENT_SUMMARY = (
+    "asset analysis incomplete (component=asset_enrichment; reason=failed)"
+)
+
+
+def _asset_enrichment_event() -> dict[str, Any]:
+    """Return the stable, secret-free enrichment completeness event."""
+    return {
+        "component": "asset_enrichment",
+        "reason": "failed",
+        "partial_results": True,
+    }
+
+
+def _ir_incomplete_event() -> dict[str, Any]:
+    """Return the stable final-IR completeness event shared by every analysis path."""
+    return {
+        "component": "intermediate_representation",
+        "reason": "truncated",
+        "partial_results": True,
+    }
+
+
+def _append_unique_analysis_event(
+    events: list[dict[str, Any]],
+    event: dict[str, Any],
+) -> None:
+    if event not in events:
+        events.append(event)
+
+
+def _virtual_source_hash(source_path: str, content: str) -> str:
+    """Bind virtual evidence identity to both its logical path and exact source content."""
+    digest = hashlib.sha256()
+    digest.update(source_path.encode("utf-8", "surrogatepass"))
+    digest.update(b"\0")
+    digest.update(content.encode("utf-8", "surrogatepass"))
+    return digest.hexdigest()[:16]
+
+
+def _append_virtual_source_event(
+    events: list[dict[str, Any]] | None,
+    event: dict[str, Any],
+) -> None:
+    """Append one bounded, unique event without suppressing a diagnostic-cap disclosure."""
+    if events is None or event in events:
+        return
+    virtual_count = sum(
+        1
+        for existing in events
+        if isinstance(existing, dict)
+        and (
+            str(existing.get("component", "")).startswith("virtual_source")
+            or existing.get("virtual_source") is True
+        )
+        and existing.get("reason") != "diagnostic_cap"
+    )
+    if virtual_count < _MAX_VIRTUAL_SOURCE_EVENTS:
+        events.append(event)
+        return
+    capped = {
+        "component": "virtual_source",
+        "reason": "diagnostic_cap",
+        "partial_results": True,
+        "event_cap": _MAX_VIRTUAL_SOURCE_EVENTS,
+    }
+    if capped not in events:
+        events.append(capped)
+
+
+def _virtual_event_summary(event: dict[str, Any]) -> str | None:
+    component = str(event.get("component", ""))
+    if component == "asset_enrichment" and event.get("reason") == "failed":
+        return _ASSET_ENRICHMENT_SUMMARY
+    if not component.startswith("virtual_source"):
+        return None
+    parts = [
+        f"component={component}",
+        f"reason={event.get('reason', 'incomplete')}",
+    ]
+    for key in ("source_hash", "backend", "error_count", "event_cap"):
+        if key in event:
+            parts.append(f"{key}={event[key]}")
+    return "virtual source analysis incomplete (" + "; ".join(parts) + ")"
 
 
 class AssetAnalyzer:
     """Stateless per-asset analyzer carrying only the collaborators the moved logic uses."""
 
-    def __init__(self, parser, ir_builder, rule_engine, dedup):
+    def __init__(
+        self,
+        parser: JSParser,
+        ir_builder: IRBuilder,
+        rule_engine: RuleEngine,
+        dedup: DedupCache,
+    ) -> None:
         self.parser = parser
         self.ir_builder = ir_builder
         self.rule_engine = rule_engine
@@ -47,32 +154,36 @@ class AssetAnalyzer:
     def _apply_mappings(
         self,
         findings: list[Finding],
-        line_mapper,
-        sourcemap,
+        line_mapper: LineMapper | None,
+        sourcemap: SourceMapInfo | None,
     ) -> None:
         """Apply position mappings using an explicit line_mapper/sourcemap (no self state),
         so per-asset analysis can run in a worker process without the orchestrator's maps."""
         resolver = SourceMapResolver()
-        original_sources = (
-            resolver.get_original_sources(sourcemap) if sourcemap else {}
-        )
+        original_sources = resolver.get_original_sources(sourcemap) if sourcemap else {}
 
         for finding in findings:
+            # DQ-P07: the sourcemap's mappings describe the GENERATED (minified) coordinate space.
+            # The parser runs on the beautified/normalized asset, so finding.evidence.line/column are
+            # normalized coords; the LineMapper reconstructs the generated coords from them. Use those
+            # for the sourcemap lookup -- passing the raw normalized coords mis-resolves any beautified
+            # asset. For an identity mapper the generated coords equal the finding coords.
+            gen_line, gen_col = finding.evidence.line, finding.evidence.column
             if line_mapper and finding.evidence.line > 0:
-                original_line, original_column = line_mapper.get_original(
+                gen_line, gen_col = line_mapper.get_original(
                     finding.evidence.line,
                     finding.evidence.column,
                 )
-                finding.evidence.original_line = original_line
-                finding.evidence.original_column = original_column
+                finding.evidence.original_line = gen_line
+                finding.evidence.original_column = gen_col
 
             if not sourcemap or finding.evidence.line <= 0:
                 continue
 
             position = resolver.get_original_position(
                 sourcemap,
-                finding.evidence.line,
-                finding.evidence.column,
+                gen_line,
+                gen_col,
             )
             if not position:
                 continue
@@ -90,11 +201,272 @@ class AssetAnalyzer:
                 finding.metadata["original_snippet"] = snippet
                 finding.metadata["original_snippet_lines"] = list(snippet_lines)
 
+    def _analyze_one_virtual_source(
+        self,
+        source_path: str,
+        content: str,
+        is_first_party: bool,
+        *,
+        incomplete_events: list[dict[str, Any]] | None = None,
+    ) -> list[Finding]:
+        """Parse + analyze a single original (pre-minification) source as its own virtual asset."""
+        file_hash = _virtual_source_hash(source_path, content)
+        result = self.parser.parse(
+            content,
+            language_hint=language_hint_from_path(source_path),
+        )
+        if getattr(result, "partial", False):
+            _append_virtual_source_event(
+                incomplete_events,
+                {
+                    "component": "virtual_source_parser",
+                    "reason": "partial",
+                    "partial_results": True,
+                    "source_hash": file_hash,
+                    "backend": str(getattr(result, "parser_used", "unknown")),
+                    "error_count": len(getattr(result, "errors", ()) or ()),
+                    "capability_gaps": sorted(
+                        str(item) for item in (getattr(result, "capability_gaps", ()) or ())
+                    )[:_MAX_EVENT_DETAILS],
+                    "truncation_reasons": sorted(
+                        str(item) for item in (getattr(result, "truncation_reasons", ()) or ())
+                    )[:_MAX_EVENT_DETAILS],
+                },
+            )
+        if not (result.success and result.ast):
+            _append_virtual_source_event(
+                incomplete_events,
+                {
+                    "component": "virtual_source_parser",
+                    "reason": "failed",
+                    "partial_results": True,
+                    "source_hash": file_hash,
+                    "backend": str(getattr(result, "parser_used", "unknown")),
+                    "error_count": len(getattr(result, "errors", ()) or ()),
+                    "capability_gaps": sorted(
+                        str(item) for item in (getattr(result, "capability_gaps", ()) or ())
+                    )[:_MAX_EVENT_DETAILS],
+                },
+            )
+            return []
+        ir = self.ir_builder.build(result.ast, source_path, file_hash)
+        if getattr(ir, "partial", False):
+            _append_virtual_source_event(
+                incomplete_events,
+                {
+                    "component": "virtual_source_ir",
+                    "reason": "partial",
+                    "partial_results": True,
+                    "source_hash": file_hash,
+                    "error_count": len(getattr(ir, "errors", ()) or ()),
+                    "errors": sorted(
+                        str(item) for item in (getattr(ir, "errors", ()) or ())
+                    )[:_MAX_EVENT_DETAILS],
+                },
+            )
+        context = AnalysisContext(
+            file_url=source_path,
+            file_hash=file_hash,
+            source_content=content,
+            is_first_party=is_first_party,
+        )
+        findings = self.rule_engine.analyze(ir, context)
+        events = context.metadata.get("analysis_incomplete", [])
+        if isinstance(events, list):
+            for event in events:
+                if not isinstance(event, dict):
+                    continue
+                virtual_event = dict(event)
+                virtual_event.setdefault("source_hash", file_hash)
+                virtual_event["virtual_source"] = True
+                _append_virtual_source_event(incomplete_events, virtual_event)
+        try:
+            self._annotate_finding_metadata(None, ir, findings)
+        except Exception as e:  # metadata is best-effort; never drop the findings
+            logger.warning("virtual_source_annotate_error", source=source_path[:120], error=str(e))
+            _append_virtual_source_event(
+                incomplete_events,
+                {
+                    "component": "virtual_source_enrichment",
+                    "reason": "failed",
+                    "partial_results": True,
+                    "source_hash": file_hash,
+                    "exception_type": type(e).__name__,
+                },
+            )
+        for f in findings:
+            # Already in ORIGINAL coordinates -> do NOT run _apply_mappings on these.
+            f.evidence.original_file_url = source_path
+            f.metadata["virtual_source"] = True
+        return findings
+
+    def _analyze_virtual_sources(
+        self,
+        sourcemap: SourceMapInfo | None,
+        is_first_party: bool,
+        parent_findings: list[Finding] | None = None,
+        *,
+        incomplete_events: list[dict[str, Any]] | None = None,
+    ) -> list[Finding]:
+        """DQ-P08: analyze each `sourcesContent` entry of a sourcemap as its OWN virtual source, so
+        endpoints/secrets/sinks present only in the pre-minification original (tree-shaken/DCE'd
+        code, unminified-only literals) are recovered instead of missed. Strictly additive and
+        fail-safe: a virtual-source failure never loses the parent asset's real findings and emits
+        structured incompleteness telemetry (INV-01/INV-02). Semantically identical findings retain
+        one canonical result while generated and original locations are unioned in deterministic
+        ``source_occurrences`` metadata."""
+        if not sourcemap:
+            return []
+        try:
+            sources = SourceMapResolver().get_original_sources(sourcemap)
+        except Exception as e:
+            logger.warning("virtual_source_extract_error", error=str(e))
+            _append_virtual_source_event(
+                incomplete_events,
+                {
+                    "component": "virtual_source_sourcemap",
+                    "reason": "source_extraction_failed",
+                    "partial_results": True,
+                    "exception_type": type(e).__name__,
+                },
+            )
+            return []
+        if not sources:
+            return []
+
+        def _key(f: Finding) -> tuple:
+            # Include the HTTP method so a source-only hidden verb (e.g. a tree-shaken DELETE on a
+            # path that also has a GET) is recovered, matching the endpoint detector's (method,url)
+            # preservation, while identical string-literal secrets/urls still dedupe vs the bundle.
+            return (f.rule_id, f.value_type, f.extracted_value, f.metadata.get("method"))
+
+        def _occurrence(f: Finding) -> dict[str, Any]:
+            evidence = f.evidence
+            return {
+                "kind": "virtual_source" if f.metadata.get("virtual_source") else "generated",
+                "file_url": evidence.file_url,
+                "file_hash": evidence.file_hash,
+                "line": evidence.line,
+                "column": evidence.column,
+                "end_line": evidence.end_line,
+                "end_column": evidence.end_column,
+                "original_file_url": evidence.original_file_url,
+                "original_line": evidence.original_line,
+                "original_column": evidence.original_column,
+            }
+
+        def _occurrence_key(item: dict[str, Any]) -> str:
+            return json.dumps(item, sort_keys=True, separators=(",", ":"), default=str)
+
+        def _merge_occurrence(canonical: Finding, duplicate: Finding) -> None:
+            candidates: list[dict[str, Any]] = []
+            existing = canonical.metadata.get("source_occurrences", [])
+            if isinstance(existing, list):
+                candidates.extend(dict(item) for item in existing if isinstance(item, dict))
+            if not candidates:
+                candidates.append(_occurrence(canonical))
+            candidates.append(_occurrence(duplicate))
+            unique = {_occurrence_key(item): item for item in candidates}
+            ordered = [unique[key] for key in sorted(unique)]
+            canonical.metadata["source_occurrences_total"] = len(ordered)
+            canonical.metadata["source_occurrences"] = ordered[:_MAX_SOURCE_OCCURRENCES]
+            if len(ordered) > _MAX_SOURCE_OCCURRENCES:
+                canonical.metadata["source_occurrences_truncated"] = True
+                _append_virtual_source_event(
+                    incomplete_events,
+                    {
+                        "component": "virtual_source_provenance",
+                        "reason": "occurrence_cap",
+                        "partial_results": True,
+                        "source_hash": canonical.evidence.file_hash,
+                        "occurrence_count": len(ordered),
+                        "occurrence_cap": _MAX_SOURCE_OCCURRENCES,
+                    },
+                )
+
+        canonical_by_key: dict[tuple, Finding] = {}
+        for f in parent_findings or []:
+            canonical_by_key.setdefault(_key(f), f)
+        out: list[Finding] = []
+        eligible = sorted(
+            (
+                (str(source_path), content)
+                for source_path, content in sources.items()
+                if isinstance(content, str) and content.strip()
+            ),
+            key=lambda item: (
+                item[0],
+                hashlib.sha256(item[1].encode("utf-8", "surrogatepass")).hexdigest(),
+            ),
+        )
+        analyzed_count = 0
+        analyzed_bytes = 0
+        skipped_count = 0
+        for source_path, content in eligible:
+            content_bytes = len(content.encode("utf-8", "surrogatepass"))
+            if (
+                analyzed_count >= _MAX_VIRTUAL_SOURCES
+                or analyzed_bytes + content_bytes > _MAX_VIRTUAL_SOURCE_BYTES
+            ):
+                skipped_count += 1
+                continue
+            source_path = str(source_path)
+            analyzed_count += 1
+            analyzed_bytes += content_bytes
+            try:
+                found = self._analyze_one_virtual_source(
+                    source_path,
+                    content,
+                    is_first_party,
+                    incomplete_events=incomplete_events,
+                )
+            except Exception as e:
+                logger.warning(
+                    "virtual_source_analyze_error", source=source_path[:120], error=str(e)
+                )
+                _append_virtual_source_event(
+                    incomplete_events,
+                    {
+                        "component": "virtual_source_analysis",
+                        "reason": "failed",
+                        "partial_results": True,
+                        "source_hash": _virtual_source_hash(source_path, content),
+                        "exception_type": type(e).__name__,
+                    },
+                )
+                continue
+            for f in found:
+                key = _key(f)
+                canonical = canonical_by_key.get(key)
+                if canonical is not None:
+                    _merge_occurrence(canonical, f)
+                    continue
+                canonical_by_key[key] = f
+                _merge_occurrence(f, f)
+                out.append(f)
+        if skipped_count:
+            _append_virtual_source_event(
+                incomplete_events,
+                {
+                    "component": "virtual_source_analysis",
+                    "reason": "budget_exceeded",
+                    "partial_results": True,
+                    "source_count": len(eligible),
+                    "analyzed_count": analyzed_count,
+                    "skipped_count": skipped_count,
+                    "source_cap": _MAX_VIRTUAL_SOURCES,
+                    "byte_cap": _MAX_VIRTUAL_SOURCE_BYTES,
+                    "analyzed_bytes": analyzed_bytes,
+                },
+            )
+        return out
+
     def analyze_asset_standalone(
         self,
         asset: JSAsset,
-        line_mapper,
-        sourcemap,
+        line_mapper: LineMapper | None,
+        sourcemap: SourceMapInfo | None,
+        incomplete_events: list[dict[str, Any]] | None = None,
     ) -> list[Finding]:
         """Full per-asset analysis (parse -> IR -> rules -> annotate -> map) with no I/O.
 
@@ -104,15 +476,32 @@ class AssetAnalyzer:
         asset.parse_success / parse_errors / ast_hash (read back by the caller).
         """
         content = decode_js_bytes(asset.content)
-        result = self.parser.parse(content)
+        result = self.parser.parse(content, language_hint=asset.language_hint)
         asset.parse_success = result.success
-        asset.parse_errors = result.errors
+        asset.parse_errors = list(result.errors)
+        virtual_events = incomplete_events if incomplete_events is not None else []
+        initial_event_count = len(virtual_events)
         if not (result.success and result.ast):
-            return []
+            findings = self._analyze_virtual_sources(
+                sourcemap,
+                asset.is_first_party,
+                incomplete_events=virtual_events,
+            )
+            for event in virtual_events[initial_event_count:]:
+                summary = _virtual_event_summary(event)
+                if summary and summary not in asset.parse_errors:
+                    asset.parse_errors.append(summary)
+            return findings
         asset.ast_hash = self.dedup.compute_hash(
             json.dumps(result.ast, separators=(",", ":"), sort_keys=True).encode()
         )[:16]
         ir = self.ir_builder.build(result.ast, asset.url, asset.content_hash)
+        # Surface IR-level truncation (AST depth / unique-identifier caps) so an INCOMPLETE
+        # analysis is not reported as a clean parse with 0 findings (DQ-C04). Parse itself
+        # succeeded, so parse_success stays True; the cap note rides the existing parse_errors
+        # plumbing into the report.
+        if getattr(ir, "partial", False) and ir.errors:
+            asset.parse_errors = list(asset.parse_errors or []) + list(ir.errors)
         context = AnalysisContext(
             file_url=asset.url,
             file_hash=asset.content_hash,
@@ -120,6 +509,9 @@ class AssetAnalyzer:
             is_first_party=asset.is_first_party,
         )
         findings = self.rule_engine.analyze(ir, context)
+        events = context.metadata.get("analysis_incomplete", [])
+        if incomplete_events is not None and isinstance(events, list):
+            incomplete_events.extend(dict(event) for event in events if isinstance(event, dict))
         # Secure findings BEFORE enrichment: a failure annotating metadata or
         # applying line maps must degrade metadata, never discard the findings
         # already extracted for this asset (previously it dropped all of them).
@@ -127,15 +519,40 @@ class AssetAnalyzer:
             self._annotate_finding_metadata(asset, ir, findings)
             self._apply_mappings(findings, line_mapper, sourcemap)
         except Exception as e:
-            logger.warning("finding_enrichment_error", url=asset.url[:120], error=str(e))
+            logger.warning(
+                "finding_enrichment_error",
+                url=asset.url[:120],
+                exception_type=type(e).__name__,
+            )
+            _append_unique_analysis_event(virtual_events, _asset_enrichment_event())
+        # DQ-P08: also analyze the sourcemap's sourcesContent as virtual sources (appended AFTER
+        # mapping the real findings, since these are already in original coords). Deduped vs the
+        # bundle findings above so shared string literals are not double-reported.
+        findings.extend(
+            self._analyze_virtual_sources(
+                sourcemap,
+                asset.is_first_party,
+                findings,
+                incomplete_events=virtual_events,
+            )
+        )
+        if getattr(ir, "partial", False):
+            _append_unique_analysis_event(virtual_events, _ir_incomplete_event())
+        for event in virtual_events[initial_event_count:]:
+            summary = _virtual_event_summary(event)
+            if summary and summary not in asset.parse_errors:
+                asset.parse_errors.append(summary)
+        for error in getattr(ir, "errors", ()) or ():
+            if error not in asset.parse_errors:
+                asset.parse_errors.append(error)
         return findings
 
     def analyze_prebuilt_ir(
         self,
-        ir,
+        ir: IntermediateRepresentation,
         context: AnalysisContext,
-        line_mapper=None,
-        sourcemap=None,
+        line_mapper: LineMapper | None = None,
+        sourcemap: SourceMapInfo | None = None,
     ) -> list[Finding]:
         """Run rules + annotation + line/source mapping on an ALREADY-parsed IR.
 
@@ -150,21 +567,50 @@ class AssetAnalyzer:
             self._annotate_finding_metadata(None, ir, findings)
             self._apply_mappings(findings, line_mapper, sourcemap)
         except Exception as e:
-            logger.warning("finding_enrichment_error", url=context.file_url[:120], error=str(e))
+            logger.warning(
+                "finding_enrichment_error",
+                url=context.file_url[:120],
+                exception_type=type(e).__name__,
+            )
+            events = context.metadata.get("analysis_incomplete")
+            if not isinstance(events, list):
+                events = []
+                context.metadata["analysis_incomplete"] = events
+            _append_unique_analysis_event(events, _asset_enrichment_event())
+        # DQ-P08: analyze sourcesContent virtual sources (no-op for local files, which carry no
+        # sourcemap). Deduped vs the findings above.
+        virtual_events: list[dict[str, Any]] = []
+        findings.extend(
+            self._analyze_virtual_sources(
+                sourcemap,
+                context.is_first_party,
+                findings,
+                incomplete_events=virtual_events,
+            )
+        )
+        if virtual_events:
+            events = context.metadata.setdefault("analysis_incomplete", [])
+            if isinstance(events, list):
+                for event in virtual_events:
+                    _append_unique_analysis_event(events, event)
+        if getattr(ir, "partial", False):
+            events = context.metadata.get("analysis_incomplete")
+            if not isinstance(events, list):
+                events = []
+                context.metadata["analysis_incomplete"] = events
+            _append_unique_analysis_event(events, _ir_incomplete_event())
         return findings
 
     def _annotate_finding_metadata(
         self,
-        asset: Optional[JSAsset],
-        ir,
+        asset: JSAsset | None,
+        ir: IntermediateRepresentation,
         findings: list[Finding],
     ) -> None:
         """Attach IR and runtime context metadata used by correlators/reporters."""
-        # Safe defaults: if ANY of the metadata builders below RecursionError on a deeply
-        # nested/obfuscated raw AST (the export_scopes / scope-map / alias-binding walkers
-        # recurse over the uncapped raw_ast), degrade to whatever was computed so far rather
-        # than aborting ALL metadata for the asset (which would silently lose the
-        # correlation metadata inter-module detection + risk scoring rely on).
+        # Initialize every projection before building it, but never publish these defaults as if
+        # enrichment completed. A RecursionError is re-raised to the shared analysis boundary,
+        # which preserves findings and emits the explicit `asset_enrichment` incomplete event.
         imports = []
         dynamic_imports = []
         import_bindings = []
@@ -195,11 +641,15 @@ class AssetAnalyzer:
                 for binding in re_export_bindings
                 if str(binding.get("source") or "").strip()
             ]
-            imports = list(dict.fromkeys([
-                *[imp.source for imp in ir.imports if imp.source],
-                *commonjs_require_sources,
-                *re_export_sources,
-            ]))
+            imports = list(
+                dict.fromkeys(
+                    [
+                        *[imp.source for imp in ir.imports if imp.source],
+                        *commonjs_require_sources,
+                        *re_export_sources,
+                    ]
+                )
+            )
             dynamic_imports = [imp.source for imp in ir.imports if imp.is_dynamic and imp.source]
             import_bindings = [
                 *self._build_import_bindings(ir),
@@ -209,8 +659,7 @@ class AssetAnalyzer:
             scope_parents = self._build_scope_parent_map(function_defs)
             if ir.raw_ast:
                 seen_binding_keys = {
-                    self._import_binding_key(binding)
-                    for binding in import_bindings
+                    self._import_binding_key(binding) for binding in import_bindings
                 }
                 for _ in range(4):
                     alias_bindings = self._collect_import_alias_bindings(
@@ -227,31 +676,45 @@ class AssetAnalyzer:
                         break
                     import_bindings.extend(fresh_bindings)
                     seen_binding_keys.update(
-                        self._import_binding_key(binding)
-                        for binding in fresh_bindings
+                        self._import_binding_key(binding) for binding in fresh_bindings
                     )
             commonjs_exports, commonjs_export_scopes = build_commonjs_export_metadata(ir)
-            default_object_exports = list(dict.fromkeys([
-                *build_default_object_export_members(ir),
-                *build_commonjs_default_object_export_members(ir),
-            ]))
+            default_object_exports = list(
+                dict.fromkeys(
+                    [
+                        *build_default_object_export_members(ir),
+                        *build_commonjs_default_object_export_members(ir),
+                    ]
+                )
+            )
             named_object_exports = self._merge_named_object_exports(
                 build_named_object_export_members(ir),
                 build_commonjs_named_object_export_members(ir),
             )
-            exports = list(dict.fromkeys([
-                *[exp.name for exp in ir.exports if exp.name],
-                *commonjs_exports,
-            ]))
+            exports = list(
+                dict.fromkeys(
+                    [
+                        *[exp.name for exp in ir.exports if exp.name],
+                        *commonjs_exports,
+                    ]
+                )
+            )
             export_scopes = self._merge_export_scopes(
                 build_export_scope_map(ir),
                 commonjs_export_scopes,
             )
-            call_names = [call.full_name or call.name for call in ir.function_calls if (call.full_name or call.name)]
+            call_names = [
+                call.full_name or call.name
+                for call in ir.function_calls
+                if (call.full_name or call.name)
+            ]
             scoped_calls = self._build_scoped_calls(ir)
             call_graph = ir.call_graph
         except RecursionError:
-            logger.debug("annotation_recursion_degraded", url=(getattr(asset, 'url', '') or '')[:120])
+            logger.debug(
+                "annotation_recursion_degraded", url=(getattr(asset, "url", "") or "")[:120]
+            )
+            raise
 
         for finding in findings:
             finding.metadata.setdefault("imports", imports)
@@ -288,14 +751,9 @@ class AssetAnalyzer:
                 if not isinstance(export_name, str):
                     continue
                 merged.setdefault(export_name, set()).update(
-                    scope for scope in scopes or []
-                    if isinstance(scope, str) and scope
+                    scope for scope in scopes or [] if isinstance(scope, str) and scope
                 )
-        return {
-            export_name: sorted(scopes)
-            for export_name, scopes in merged.items()
-            if scopes
-        }
+        return {export_name: sorted(scopes) for export_name, scopes in merged.items() if scopes}
 
     def _merge_named_object_exports(
         self,
@@ -310,16 +768,14 @@ class AssetAnalyzer:
                 if not isinstance(export_name, str):
                     continue
                 merged.setdefault(export_name, set()).update(
-                    member for member in members or []
-                    if isinstance(member, str) and member
+                    member for member in members or [] if isinstance(member, str) and member
                 )
-        return {
-            export_name: sorted(members)
-            for export_name, members in merged.items()
-            if members
-        }
+        return {export_name: sorted(members) for export_name, members in merged.items() if members}
 
-    def _build_import_bindings(self, ir) -> list[dict[str, Any]]:
+    def _build_import_bindings(
+        self,
+        ir: IntermediateRepresentation,
+    ) -> list[dict[str, Any]]:
         """Expand IR import declarations into structured import bindings."""
         bindings: list[dict[str, Any]] = []
         for import_decl in ir.imports:
@@ -333,7 +789,7 @@ class AssetAnalyzer:
             bindings.extend(self._collect_dynamic_import_bindings(ir.raw_ast))
         return bindings
 
-    def _parse_import_specifier(self, source: str, specifier: str) -> Optional[dict[str, Any]]:
+    def _parse_import_specifier(self, source: str, specifier: str) -> dict[str, Any] | None:
         """Parse a serialized import specifier into a structured binding."""
         value = (specifier or "").strip()
         if not value:
@@ -342,7 +798,7 @@ class AssetAnalyzer:
             return {
                 "source": source,
                 "imported": "default",
-                "local": value[len("default as "):],
+                "local": value[len("default as ") :],
                 "kind": "default",
                 "scope": "global",
                 "is_dynamic": False,
@@ -351,7 +807,7 @@ class AssetAnalyzer:
             return {
                 "source": source,
                 "imported": "*",
-                "local": value[len("* as "):],
+                "local": value[len("* as ") :],
                 "kind": "namespace",
                 "scope": "global",
                 "is_dynamic": False,
@@ -557,7 +1013,7 @@ class AssetAnalyzer:
         existing_bindings: list[dict[str, Any]],
         scope_parents: dict[str, list[str]],
         scope: str,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Convert `const alias = importedBinding` back into an import-like binding."""
         local = self._extract_pattern_target_name(target)
         if not local or not isinstance(value, dict) or value.get("type") != "Identifier":
@@ -655,8 +1111,8 @@ class AssetAnalyzer:
         *,
         local: str,
         scope: str,
-        imported: Optional[str] = None,
-        kind: Optional[str] = None,
+        imported: str | None = None,
+        kind: str | None = None,
         is_alias: bool = False,
         is_destructured_alias: bool = False,
     ) -> dict[str, Any]:
@@ -699,7 +1155,7 @@ class AssetAnalyzer:
         existing_bindings: list[dict[str, Any]],
         scope_parents: dict[str, list[str]],
         scope: str,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Convert `const fn = ns.member` aliases back into import-like bindings."""
         local = self._extract_pattern_target_name(target)
         if not local or not isinstance(value, dict) or value.get("type") != "MemberExpression":
@@ -707,7 +1163,11 @@ class AssetAnalyzer:
 
         object_node = value.get("object")
         property_name = self._extract_pattern_name(value.get("property"))
-        if not property_name or not isinstance(object_node, dict) or object_node.get("type") != "Identifier":
+        if (
+            not property_name
+            or not isinstance(object_node, dict)
+            or object_node.get("type") != "Identifier"
+        ):
             return None
 
         object_name = str(object_node.get("name") or "").strip()
@@ -792,14 +1252,16 @@ class AssetAnalyzer:
             local = str(target.get("name") or "").strip()
             if not local:
                 return []
-            return [{
-                "source": source,
-                "imported": "*",
-                "local": local,
-                "kind": "namespace",
-                "scope": scope,
-                "is_dynamic": True,
-            }]
+            return [
+                {
+                    "source": source,
+                    "imported": "*",
+                    "local": local,
+                    "kind": "namespace",
+                    "scope": scope,
+                    "is_dynamic": True,
+                }
+            ]
 
         if target.get("type") != "ObjectPattern":
             return []
@@ -813,14 +1275,16 @@ class AssetAnalyzer:
             if not imported or not local:
                 continue
             kind = "default" if imported == "default" else "named"
-            bindings.append({
-                "source": source,
-                "imported": imported,
-                "local": local,
-                "kind": kind,
-                "scope": scope,
-                "is_dynamic": True,
-            })
+            bindings.append(
+                {
+                    "source": source,
+                    "imported": imported,
+                    "local": local,
+                    "kind": kind,
+                    "scope": scope,
+                    "is_dynamic": True,
+                }
+            )
         return bindings
 
     def _extract_dynamic_import_source(self, node: Any) -> str:
@@ -843,7 +1307,8 @@ class AssetAnalyzer:
             return value if isinstance(value, str) else ""
         if source_node.get("type") == "TemplateLiteral":
             quasis = source_node.get("quasis", [])
-            if quasis:
+            expressions = source_node.get("expressions", [])
+            if quasis and not expressions:
                 return str(quasis[0].get("value", {}).get("cooked") or "")
         return ""
 
@@ -888,7 +1353,10 @@ class AssetAnalyzer:
         prefix = prefix_map.get(node_type, "function")
         return f"function:{prefix}@{line}"
 
-    def _build_scoped_calls(self, ir) -> dict[str, list[str]]:
+    def _build_scoped_calls(
+        self,
+        ir: IntermediateRepresentation,
+    ) -> dict[str, list[str]]:
         """Group function calls by lexical scope for correlation."""
         scoped_calls: dict[str, set[str]] = {}
         for call in ir.function_calls:
@@ -897,18 +1365,16 @@ class AssetAnalyzer:
             if not name:
                 continue
             scoped_calls.setdefault(scope, set()).add(name)
-        return {
-            scope: sorted(call_names)
-            for scope, call_names in scoped_calls.items()
-        }
+        return {scope: sorted(call_names) for scope, call_names in scoped_calls.items()}
 
-    def _find_enclosing_scope(self, line: int, function_defs) -> str:
+    def _find_enclosing_scope(self, line: int, function_defs: list[FunctionDef]) -> str:
         """Find the innermost function scope containing a finding line."""
         if line <= 0:
             return "global"
 
         matching = [
-            func_def for func_def in function_defs
+            func_def
+            for func_def in function_defs
             if func_def.line <= line <= max(func_def.end_line, func_def.line)
         ]
         if not matching:
@@ -919,11 +1385,12 @@ class AssetAnalyzer:
 
     def _build_scope_parent_map(
         self,
-        function_defs: list[Any],
+        function_defs: list[FunctionDef],
     ) -> dict[str, list[str]]:
         """Build lexical parent-scope chains from nested function ranges."""
         normalized_defs = [
-            func_def for func_def in function_defs
+            func_def
+            for func_def in function_defs
             if getattr(func_def, "scope", "") and getattr(func_def, "line", 0) > 0
         ]
         if not normalized_defs:
@@ -932,7 +1399,8 @@ class AssetAnalyzer:
         parent_map: dict[str, str] = {}
         for func_def in normalized_defs:
             candidates = [
-                candidate for candidate in normalized_defs
+                candidate
+                for candidate in normalized_defs
                 if candidate.scope != func_def.scope
                 and candidate.line <= func_def.line
                 and candidate.end_line >= func_def.end_line
@@ -972,4 +1440,3 @@ class AssetAnalyzer:
         end = min(len(lines), line + context_lines)
         snippet = "\n".join(lines[start:end])
         return snippet, (start + 1, end)
-

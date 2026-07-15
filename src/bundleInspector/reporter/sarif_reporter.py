@@ -8,19 +8,17 @@ GitHub Code Scanning, Azure DevOps, and other CI/CD tools.
 from __future__ import annotations
 
 import json
-from datetime import datetime
+import re
 from typing import Any
-from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 from bundleInspector import __version__
-from bundleInspector.reporter.base import BaseReporter, mask_secret_findings
+from bundleInspector.reporter.base import BaseReporter
+from bundleInspector.reporter.redaction import sanitize_report_copy
 from bundleInspector.storage.models import (
     Category,
-    Report,
     Finding,
+    Report,
     Severity,
-    Confidence,
-    RiskTier,
 )
 
 
@@ -50,27 +48,43 @@ class SARIFReporter(BaseReporter):
 
     def generate(self, report: Report) -> str:
         """Generate SARIF report."""
+        fingerprints = {
+            finding.id: self._stable_fingerprint(
+                finding,
+                self._result_rule_id(finding),
+            )
+            for finding in report.findings
+        }
+        # DQ-O15: mask on a deep copy so masking never mutates the caller's shared Report in place.
         if self.mask_secrets:
-            mask_secret_findings(report, self.secret_visible_chars)
+            report = sanitize_report_copy(
+                report,
+                visible_chars=self.secret_visible_chars,
+                honor_existing_mask=False,
+            )
         sarif = {
             "$schema": self.SARIF_SCHEMA,
             "version": self.SARIF_VERSION,
-            "runs": [self._generate_run(report)],
+            "runs": [self._generate_run(report, fingerprints)],
         }
 
         return json.dumps(sarif, indent=2, ensure_ascii=False)
 
-    def _generate_run(self, report: Report) -> dict[str, Any]:
+    def _generate_run(
+        self,
+        report: Report,
+        fingerprints: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Generate a SARIF run object."""
         return {
-            "tool": self._generate_tool(),
+            "tool": self._generate_tool(report),
             "invocations": [self._generate_invocation(report)],
             "artifacts": self._generate_artifacts(report),
-            "results": self._generate_results(report),
+            "results": self._generate_results(report, fingerprints or {}),
             "taxonomies": self._generate_taxonomies(),
         }
 
-    def _generate_tool(self) -> dict[str, Any]:
+    def _generate_tool(self, report: Report | None = None) -> dict[str, Any]:
         """Generate tool information."""
         return {
             "driver": {
@@ -78,11 +92,11 @@ class SARIFReporter(BaseReporter):
                 "fullName": self.TOOL_FULL_NAME,
                 "version": __version__,
                 "informationUri": self.TOOL_INFO_URI,
-                "rules": self._generate_rules(),
+                "rules": self._generate_rules(report),
             }
         }
 
-    def _generate_rules(self) -> list[dict[str, Any]]:
+    def _generate_rules(self, report: Report | None = None) -> list[dict[str, Any]]:
         """Generate rule definitions."""
         rules = [
             {
@@ -140,14 +154,102 @@ class SARIFReporter(BaseReporter):
                 "defaultConfiguration": {"level": "note"},
                 "properties": {"category": "Information", "tags": ["debug", "logging"]},
             },
+            {
+                "id": "JSFINDER006",
+                "name": "DomXssSink",
+                "shortDescription": {"text": "DOM-XSS / code-injection sink"},
+                "fullDescription": {
+                    "text": "A dangerous DOM or code-execution sink (e.g. innerHTML, .html(), document.write, "
+                            "eval, new Function) receives a dynamic or attacker-influenced value, enabling DOM-based "
+                            "cross-site scripting or code injection."
+                },
+                "helpUri": f"{self.TOOL_INFO_URI}/docs/rules/sinks",
+                "defaultConfiguration": {"level": "error"},
+                "properties": {"category": "Security", "tags": ["sink", "xss", "CWE-79"]},
+            },
+            {
+                "id": "JSFINDER007",
+                "name": "InsecureFileUpload",
+                "shortDescription": {"text": "Client-side file-upload surface"},
+                "fullDescription": {
+                    "text": "A file-upload surface was detected whose validation is enforced only on the client "
+                            "(e.g. an allow-listed extension/MIME check). Such checks are bypassable, so the server "
+                            "must re-validate uploaded files to prevent unrestricted file upload."
+                },
+                "helpUri": f"{self.TOOL_INFO_URI}/docs/rules/uploads",
+                "defaultConfiguration": {"level": "warning"},
+                "properties": {"category": "Security", "tags": ["upload", "file-upload", "CWE-434"]},
+            },
         ]
+        defined = {rule["id"] for rule in rules}
+        for finding in report.findings if report is not None else []:
+            rule_id = self._result_rule_id(finding)
+            if rule_id in defined:
+                continue
+            rules.append({
+                "id": rule_id,
+                "name": self._custom_rule_name(finding.rule_id),
+                "shortDescription": {"text": finding.title or finding.rule_id},
+                "fullDescription": {
+                    "text": finding.description or f"Finding emitted by rule {finding.rule_id}."
+                },
+                "defaultConfiguration": {"level": self._severity_to_level(finding.severity)},
+                "properties": {
+                    "category": finding.category.value,
+                    "tags": ["custom-rule", finding.category.value],
+                    "sourceRuleId": finding.rule_id,
+                },
+            })
+            defined.add(rule_id)
         return rules
+
+    @staticmethod
+    def _custom_rule_name(rule_id: str) -> str:
+        parts = re.split(r"[^A-Za-z0-9]+", rule_id)
+        return "".join(part[:1].upper() + part[1:] for part in parts if part) or "CustomRule"
+
+    @staticmethod
+    def _stable_fingerprint(finding: Any, rule_id: str) -> str:
+        """Deterministic per-finding fingerprint from stable content (DQ-O16)."""
+        import hashlib
+        ev = getattr(finding, "evidence", None)
+        key = "|".join(str(x) for x in (
+            rule_id,
+            getattr(ev, "file_url", "") or "",
+            getattr(ev, "file_hash", "") or "",
+            getattr(ev, "line", 0) or 0,
+            getattr(ev, "column", 0) or 0,
+            getattr(finding, "value_type", "") or "",
+            getattr(finding, "extracted_value", "") or "",
+        ))
+        return hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
 
     def _generate_invocation(self, report: Report) -> dict[str, Any]:
         """Generate invocation information."""
+        errors = [str(e) for e in (getattr(report, "errors", None) or [])]
+        warnings = [str(w) for w in (getattr(report, "warnings", None) or [])]
+        # DQ-O16: reflect REAL completeness (not unconditionally True) and surface report
+        # errors/warnings as execution notifications instead of an empty list.
+        completeness = getattr(report, "completeness", None)
+        completeness_issues = list(getattr(completeness, "issues", None) or [])
         invocation: dict[str, Any] = {
-            "executionSuccessful": True,
-            "toolExecutionNotifications": [],
+            "executionSuccessful": not errors and bool(
+                getattr(completeness, "is_complete", True)
+            ),
+            "toolExecutionNotifications": [
+                {"level": "error", "message": {"text": e}} for e in errors
+            ] + [
+                {"level": "warning", "message": {"text": w}} for w in warnings
+            ] + [
+                {
+                    "level": "warning" if issue.retryable else "error",
+                    "message": {
+                        "text": f"[{issue.stage}:{issue.code}] {issue.message}",
+                    },
+                    "properties": {"details": issue.details},
+                }
+                for issue in completeness_issues
+            ],
         }
         if report.created_at:
             invocation["startTimeUtc"] = report.created_at.isoformat()
@@ -175,12 +277,16 @@ class SARIFReporter(BaseReporter):
 
         return artifacts
 
-    def _generate_results(self, report: Report) -> list[dict[str, Any]]:
+    def _generate_results(
+        self,
+        report: Report,
+        fingerprints: dict[str, str] | None = None,
+    ) -> list[dict[str, Any]]:
         """Generate results (findings)."""
         results = []
 
         for finding in report.findings:
-            result = self._finding_to_result(finding, report)
+            result = self._finding_to_result(finding, report, fingerprints or {})
             results.append(result)
 
         return results
@@ -189,10 +295,11 @@ class SARIFReporter(BaseReporter):
         self,
         finding: Finding,
         report: Report,
+        fingerprints: dict[str, str] | None = None,
     ) -> dict[str, Any]:
         """Convert a Finding to a SARIF result."""
         # Map finding type to rule ID
-        rule_id = self._get_rule_id(finding)
+        rule_id = self._result_rule_id(finding)
 
         # Map severity to SARIF level
         level = self._severity_to_level(finding.severity)
@@ -206,7 +313,12 @@ class SARIFReporter(BaseReporter):
             },
             "locations": self._generate_locations(finding, report),
             "fingerprints": {
-                "primaryLocationLineHash": finding.id[:32],
+                # DQ-O16: derive from STABLE content, not the per-run uuid finding.id, so SARIF
+                # baselining/dedup is deterministic across runs.
+                "primaryLocationLineHash": (fingerprints or {}).get(
+                    finding.id,
+                    self._stable_fingerprint(finding, rule_id),
+                ),
             },
             "properties": {
                 "confidence": finding.confidence.value if finding.confidence else "medium",
@@ -235,7 +347,7 @@ class SARIFReporter(BaseReporter):
         report: Report,
     ) -> list[dict[str, Any]]:
         """Generate location information for a finding."""
-        locations = []
+        locations: list[dict[str, Any]] = []
 
         if not finding.evidence:
             return locations
@@ -258,7 +370,7 @@ class SARIFReporter(BaseReporter):
         start_column = ((original_column if original_column is not None else finding.evidence.column or 0) + 1)
         snippet_text = finding.metadata.get("original_snippet") or finding.evidence.snippet
 
-        location = {
+        location: dict[str, Any] = {
             "physicalLocation": {
                 "artifactLocation": {
                     "uri": location_uri,
@@ -356,7 +468,7 @@ class SARIFReporter(BaseReporter):
                 artifact_index = i
                 break
 
-        related = {
+        related: dict[str, Any] = {
             "id": 1,
             "physicalLocation": {
                 "artifactLocation": {
@@ -418,6 +530,17 @@ class SARIFReporter(BaseReporter):
 
         return category_map.get(finding.category, "JSFINDER002")
 
+    def _result_rule_id(self, finding: Finding) -> str:
+        """Preserve built-ins while giving custom rules a distinct, stable SARIF identity."""
+        builtin_ids = {
+            "secret-detector", "endpoint-detector", "domain-detector", "flag-detector",
+            "debug-detector", "sink-detector", "taint", "upload-detector",
+        }
+        if finding.rule_id in builtin_ids:
+            return self._get_rule_id(finding)
+        normalized = re.sub(r"[^A-Z0-9._-]+", "-", finding.rule_id.upper()).strip("-._")
+        return f"BUNDLEINSPECTOR-{normalized or 'CUSTOM'}"
+
     def _severity_to_level(self, severity: Severity) -> str:
         """Map BundleInspector severity to SARIF level."""
         severity_map = {
@@ -429,4 +552,3 @@ class SARIFReporter(BaseReporter):
         }
 
         return severity_map.get(severity, "warning")
-

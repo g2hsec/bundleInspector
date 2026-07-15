@@ -10,17 +10,19 @@ from __future__ import annotations
 import json
 import time
 
-import pytest
-
 from bundleInspector.config import Config
-from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.rules.engine import RuleEngine
 from bundleInspector.storage.models import (
-    Category, Confidence, Evidence, Finding, Report, Severity,
+    Category,
+    Confidence,
+    Evidence,
+    Finding,
+    Report,
+    Severity,
 )
-
 
 # ---------------------------------------------------------------- sourcemap crash-safety
 
@@ -84,7 +86,8 @@ def test_detectors_no_redos_on_large_literal():
     blob = "a1.b2-" * 11000  # ~64KB, worst case for S3/discord/db regexes
     src = f'const x="{blob}";fetch("/api/x");'
     ir = build_ir(parse_js(src).ast, "f.js", "h")
-    eng = RuleEngine(Config().rules); eng.register_defaults()
+    eng = RuleEngine(Config().rules)
+    eng.register_defaults()
     ctx = AnalysisContext(file_url="f.js", file_hash="h", source_content=src)
     t = time.perf_counter()
     eng.analyze(ir, ctx)
@@ -95,9 +98,8 @@ def test_detectors_no_redos_on_large_literal():
 
 def test_manifest_deep_json_no_crash():
     from bundleInspector.collector.manifest import ManifestCollector
-    from bundleInspector.config import CrawlerConfig, AuthConfig
+    from bundleInspector.config import AuthConfig, CrawlerConfig
     mc = ManifestCollector(CrawlerConfig(), AuthConfig())
-    deep = "[" * 6000 + "]" * 6000
     # deeply nested -> the extractor must not RecursionError
     mc._extract_js_paths_from_json(json.loads("[" * 400 + "]" * 400))  # valid deep, iterative
 
@@ -156,6 +158,7 @@ def test_html_reporter_escapes_all_script_breakout_variants():
 
 def test_extract_page_links_preserves_order_and_dedups():
     import inspect
+
     from bundleInspector.collector.static import MultiPageStaticCollector
     src = inspect.getsource(MultiPageStaticCollector._extract_page_links)
     assert "return list(dict.fromkeys(links))" in src   # order-preserving dedup

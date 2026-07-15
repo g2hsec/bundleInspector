@@ -4,15 +4,15 @@ from bundleInspector.parser.export_scopes import (
     build_commonjs_default_object_export_members,
     build_commonjs_export_metadata,
     build_commonjs_named_object_export_members,
-    build_commonjs_require_bindings,
     build_commonjs_re_export_bindings,
+    build_commonjs_require_bindings,
     build_default_object_export_members,
     build_export_scope_map,
     build_named_object_export_members,
     build_re_export_bindings,
 )
-from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 
 
 def test_build_call_graph_for_named_functions():
@@ -151,6 +151,75 @@ def test_build_export_scope_map_for_default_and_named_class_members():
     assert export_scopes["loadUsers"] == ["function:loadUsers"]
     assert export_scopes["ping"] == ["function:ping"]
     assert export_scopes["fetchToken"] == ["function:fetchToken"]
+
+
+def test_runtime_type_exports_and_abstract_class_are_projected_precisely():
+    source = """
+    import type {Foo} from "./types";
+    import {type Baz, Bar} from "./mixed";
+    import {type as runtimeType} from "./runtime-type";
+    import type from "./runtime-default";
+    export type {Foo} from "./types";
+    export {type Baz, Bar as RuntimeBar} from "./mixed";
+    export abstract class Api { load = () => fetch("/api/load"); }
+    """
+    result = parse_js(source, language_hint="typescript")
+    assert result.ast is not None and result.partial is False
+    ir = build_ir(result.ast, "file:///bundle.ts", "hash123")
+
+    assert [(item.source, item.specifiers) for item in ir.imports] == [
+        ("./mixed", ["Bar"]),
+        ("./runtime-type", ["type as runtimeType"]),
+        ("./runtime-default", ["default as type"]),
+    ]
+    assert [item.name for item in ir.exports] == ["RuntimeBar", "Api"]
+    assert build_re_export_bindings(ir) == [{
+        "source": "./mixed",
+        "imported": "Bar",
+        "local": "RuntimeBar",
+        "kind": "named",
+        "scope": "global",
+        "is_dynamic": False,
+        "is_reexport": True,
+    }]
+    assert build_named_object_export_members(ir) == {"Api": ["load"]}
+
+
+def test_exported_class_members_exclude_private_and_dynamic_computed_names():
+    source = """
+    export default class Api {
+      load = () => fetch("/api/load");
+      #secret() {}
+      [runtimeName]() {}
+      ["literal"]() {}
+      publicMethod() {}
+    }
+    """
+    result = parse_js(source, language_hint="javascript")
+    assert result.ast is not None and result.partial is False
+    ir = build_ir(result.ast, "file:///bundle.js", "hash123")
+
+    assert build_default_object_export_members(ir) == ["literal", "load", "publicMethod"]
+    assert set(build_export_scope_map(ir)) == {
+        "default",
+        "literal",
+        "load",
+        "publicMethod",
+    }
+
+
+def test_interpolated_dynamic_import_is_not_an_exact_dependency():
+    source = (
+        "const dynamic=import(`https://example.test/${name}.js`);"
+        "const exact=import(`./static.js`);"
+    )
+    result = parse_js(source, language_hint="javascript")
+    assert result.ast is not None and result.partial is False
+    ir = build_ir(result.ast, "file:///bundle.js", "hash123")
+
+    assert [(item.source, item.is_dynamic) for item in ir.imports] == [
+        ("./static.js", True),
+    ]
 
 
 def test_build_default_object_export_members_for_direct_and_identifier_exports():
@@ -532,4 +601,3 @@ def test_build_commonjs_reexport_bindings_for_identifier_backed_require_aliases(
         "is_reexport": True,
         "is_commonjs_reexport": True,
     } in bindings
-

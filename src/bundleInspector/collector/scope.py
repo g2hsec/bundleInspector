@@ -5,11 +5,12 @@ Scope policy engine for filtering URLs.
 from __future__ import annotations
 
 import re
-from fnmatch import fnmatch
-from typing import Optional
-from bundleInspector.core.url_utils import safe_urlparse as urlparse
+import unicodedata
+from typing import Any
+from urllib.parse import unquote, urljoin, urlunparse
 
 from bundleInspector.config import ScopeConfig, ThirdPartyPolicy
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 
 class ScopePolicy:
@@ -20,24 +21,40 @@ class ScopePolicy:
     first-party or third-party.
     """
 
-    # Security limits to prevent ReDoS and resource exhaustion
+    # Security limits to prevent ReDoS and resource exhaustion.
+    # A glob compiles to overlapping `(?:charclass)*` groups; k wildcards over a hostile hostname
+    # that repeats a class char (`*a*a*a*a*a` vs `aaaa...!`) backtrack O(n^k). Cap wildcards low so
+    # the worst case stays quadratic, AND cap the MATCH INPUT so that quadratic stays tiny --
+    # together they keep matching near-constant (ReDoS-safe on Python 3.10+, which lacks atomic
+    # groups / possessive quantifiers).
     MAX_PATTERN_LENGTH = 256
-    MAX_WILDCARDS_PER_PATTERN = 5
+    MAX_WILDCARDS_PER_PATTERN = 2
     MAX_PATTERNS = 100
+    MAX_MATCH_INPUT_LENGTH = 255  # a DNS hostname is <=253 chars; longer inputs are invalid
 
     def __init__(self, config: ScopeConfig):
         self.config = config
-        self._compiled_allowed = self._compile_patterns(config.allowed_domains)
-        self._compiled_denied = self._compile_patterns(config.denied_domains)
-        self._compiled_cdn = self._compile_patterns(config.cdn_patterns)
+        self.pattern_diagnostics: list[dict[str, Any]] = []
+        self._compiled_allowed = self._compile_patterns(config.allowed_domains, "allowed_domains")
+        self._compiled_denied = self._compile_patterns(config.denied_domains, "denied_domains")
+        self._compiled_cdn = self._compile_patterns(config.cdn_patterns, "cdn_patterns")
 
     def recompile(self) -> None:
         """Recompile patterns from current config state."""
-        self._compiled_allowed = self._compile_patterns(self.config.allowed_domains)
-        self._compiled_denied = self._compile_patterns(self.config.denied_domains)
-        self._compiled_cdn = self._compile_patterns(self.config.cdn_patterns)
+        self.pattern_diagnostics = []
+        self._compiled_allowed = self._compile_patterns(
+            self.config.allowed_domains, "allowed_domains"
+        )
+        self._compiled_denied = self._compile_patterns(
+            self.config.denied_domains, "denied_domains"
+        )
+        self._compiled_cdn = self._compile_patterns(self.config.cdn_patterns, "cdn_patterns")
 
-    def _compile_patterns(self, patterns: list[str]) -> list[re.Pattern]:
+    def _compile_patterns(
+        self,
+        patterns: list[str],
+        category: str = "patterns",
+    ) -> list[re.Pattern]:
         """
         Compile glob patterns to regex safely.
 
@@ -46,25 +63,50 @@ class ScopePolicy:
         """
         compiled = []
 
-        # Limit number of patterns
+        # Limit number of patterns, but make the rejected portion observable. A silently
+        # truncated allowlist changes scope semantics and can otherwise look like a clean denial.
         safe_patterns = patterns[:self.MAX_PATTERNS]
+        if len(patterns) > self.MAX_PATTERNS:
+            self.pattern_diagnostics.append({
+                "category": category,
+                "reason": "pattern_limit",
+                "accepted": self.MAX_PATTERNS,
+                "rejected": len(patterns) - self.MAX_PATTERNS,
+            })
 
-        for pattern in safe_patterns:
+        for index, pattern in enumerate(safe_patterns):
             # Skip patterns that are too long
             if len(pattern) > self.MAX_PATTERN_LENGTH:
+                self.pattern_diagnostics.append({
+                    "category": category,
+                    "index": index,
+                    "pattern": pattern,
+                    "reason": "pattern_too_long",
+                })
                 continue
 
             # Skip patterns with too many wildcards
             if pattern.count('*') > self.MAX_WILDCARDS_PER_PATTERN:
+                self.pattern_diagnostics.append({
+                    "category": category,
+                    "index": index,
+                    "pattern": pattern,
+                    "reason": "too_many_wildcards",
+                })
                 continue
 
             try:
                 # Build regex safely to prevent ReDoS
                 regex = self._glob_to_safe_regex(pattern)
                 compiled.append(re.compile(regex, re.IGNORECASE))
-            except re.error:
-                # Skip invalid patterns
-                pass
+            except re.error as exc:
+                self.pattern_diagnostics.append({
+                    "category": category,
+                    "index": index,
+                    "pattern": pattern,
+                    "reason": "invalid_pattern",
+                    "detail": str(exc),
+                })
 
         return compiled
 
@@ -110,6 +152,61 @@ class ScopePolicy:
 
         return f'^{"".join(result)}$'
 
+    @staticmethod
+    def _canonicalize_scope_path(path: str) -> str | None:
+        """Return the path shape an HTTP server is likely to authorize.
+
+        Scope checks must not approve a raw path that becomes denied after percent decoding or
+        dot-segment processing. Repeated decoding is intentionally conservative: a path requiring
+        several decode passes is ambiguous across proxies/servers and is safer to reject.
+        """
+        if not isinstance(path, str) or re.search(r"%(?![0-9A-Fa-f]{2})", path):
+            return None
+
+        decoded = path
+        for _ in range(4):
+            try:
+                next_value = unquote(decoded, errors="strict")
+            except (UnicodeError, ValueError):
+                return None
+            if next_value == decoded:
+                break
+            decoded = next_value
+        else:
+            return None
+
+        decoded = unicodedata.normalize("NFKC", decoded).replace("\\", "/")
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in decoded):
+            return None
+
+        segments: list[str] = []
+        for raw_segment in decoded.split("/"):
+            # Matrix parameters are stripped for authorization comparison. This contains common
+            # `/allowed/..;/denied` and `/denied;param` proxy/backend interpretation drift.
+            segment = raw_segment.partition(";")[0]
+            if not segment or segment == ".":
+                continue
+            if segment == "..":
+                if segments:
+                    segments.pop()
+                continue
+            segments.append(segment)
+        return "/" + "/".join(segments)
+
+    @classmethod
+    def _path_prefix_matches(cls, path: str, configured_prefix: str) -> bool:
+        """Match a configured path at a segment boundary, not an arbitrary character prefix."""
+        canonical_path = cls._canonicalize_scope_path(path)
+        canonical_prefix = cls._canonicalize_scope_path(configured_prefix)
+        if canonical_path is None or canonical_prefix is None:
+            return False
+        if not configured_prefix:
+            return True
+        prefix = canonical_prefix.rstrip("/")
+        if not prefix:
+            return canonical_path.startswith("/")
+        return canonical_path == prefix or canonical_path.startswith(prefix + "/")
+
     def is_allowed(self, url: str) -> bool:
         """
         Check if URL is allowed by scope policy.
@@ -126,7 +223,9 @@ class ScopePolicy:
             return False
 
         domain = (parsed.hostname or "").lower()
-        path = parsed.path
+        path = self._canonicalize_scope_path(parsed.path)
+        if not domain or path is None:
+            return False
 
         # Check domain denial first (explicit deny wins)
         if self._matches_patterns(domain, self._compiled_denied):
@@ -134,7 +233,7 @@ class ScopePolicy:
 
         # Check path denial
         for denied_path in self.config.denied_paths:
-            if path.startswith(denied_path):
+            if self._path_prefix_matches(path, denied_path):
                 return False
 
         # If no allowed domains specified, allow all (except denied)
@@ -159,7 +258,7 @@ class ScopePolicy:
         # Check path allowance (if specified)
         if self.config.allowed_paths:
             for allowed_path in self.config.allowed_paths:
-                if path.startswith(allowed_path):
+                if self._path_prefix_matches(path, allowed_path):
                     return True
             return False
 
@@ -198,6 +297,10 @@ class ScopePolicy:
         patterns: list[re.Pattern]
     ) -> bool:
         """Check if value matches any pattern."""
+        # Refuse to run the globs on an over-long (invalid) hostname so a crafted value cannot
+        # amplify a wildcard pattern's bounded backtracking into a hang (ReDoS defense).
+        if len(value) > self.MAX_MATCH_INPUT_LENGTH:
+            return False
         for pattern in patterns:
             if pattern.match(value):
                 return True
@@ -231,7 +334,7 @@ class ScopePolicy:
         seed_urls: list[str],
         include_subdomains: bool = True,
         third_party_policy: ThirdPartyPolicy = ThirdPartyPolicy.TAG_ONLY,
-    ) -> "ScopePolicy":
+    ) -> ScopePolicy:
         """
         Create scope policy from seed URLs.
 
@@ -282,7 +385,7 @@ ALLOWED_SCHEMES = frozenset({'http', 'https'})
 
 def normalize_url(
     url: str,
-    base_url: Optional[str] = None,
+    base_url: str | None = None,
     strict: bool = False,
 ) -> str:
     """
@@ -299,49 +402,64 @@ def normalize_url(
     Raises:
         URLValidationError: If strict=True and URL is invalid/blocked
     """
-    from urllib.parse import urljoin, urlunparse
     from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
+    def invalid(message: str) -> str:
+        if strict:
+            raise URLValidationError(message)
+        return ""
+
+    if not isinstance(url, str):
+        return invalid("URL must be a string")
+
+    url = url.strip()
+    if not url or any(ord(char) < 0x20 or ord(char) == 0x7F for char in url):
+        return invalid("URL is empty or contains control characters")
+    if base_url is not None:
+        if not isinstance(base_url, str):
+            return invalid("Base URL must be a string")
+        base_url = base_url.strip()
+        if any(ord(char) < 0x20 or ord(char) == 0x7F for char in base_url):
+            return invalid("Base URL contains control characters")
+
     # Security: Block dangerous URL schemes
-    url_lower = url.lower().strip()
+    url_lower = url.lower()
     for scheme in BLOCKED_SCHEMES:
         if url_lower.startswith(f"{scheme}:"):
-            if strict:
-                raise URLValidationError(f"Blocked URL scheme: {scheme}")
-            return ""
+            return invalid(f"Blocked URL scheme: {scheme}")
 
-    # Handle relative URLs
-    if base_url and not url.startswith(("http://", "https://", "//")):
-        url = urljoin(base_url, url)
-    elif url.startswith("//"):
-        # Protocol-relative URL
-        if base_url:
-            parsed_base = urlparse(base_url)
-            url = f"{parsed_base.scheme}:{url}"
-        else:
-            url = f"https:{url}"
+    try:
+        # Handle relative and protocol-relative URLs. Detect a scheme case-insensitively so an
+        # uppercase absolute URL is not accidentally joined as a relative path.
+        if url.startswith("//"):
+            if base_url:
+                parsed_base = urlparse(base_url)
+                if parsed_base.scheme not in ALLOWED_SCHEMES:
+                    return invalid("Base URL has no supported scheme")
+                url = f"{parsed_base.scheme}:{url}"
+            else:
+                url = f"https:{url}"
+        elif base_url and re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", url) is None:
+            url = urljoin(base_url, url)
 
-    # Parse and normalize
-    parsed = urlparse(url)
+        # Parse and normalize. safe_urlparse contains malformed authorities, while the explicit
+        # authority checks below convert them to this function's stable failure contract.
+        parsed = urlparse(url)
+    except (TypeError, ValueError, UnicodeError) as exc:
+        return invalid(f"Malformed URL: {exc}")
 
     # Validate scheme
     scheme = (parsed.scheme or '').lower()
     if scheme and scheme not in ALLOWED_SCHEMES:
-        if strict:
-            raise URLValidationError(f"Unsupported URL scheme: {scheme}")
-        return ""
+        return invalid(f"Unsupported URL scheme: {scheme}")
 
     # Schemeless input (e.g., "example.com/script.js") produces empty scheme
     if not scheme and not url.startswith("//"):
-        if strict:
-            raise URLValidationError(f"Missing URL scheme: {url}")
-        return ""
+        return invalid(f"Missing URL scheme: {url}")
 
     # Check for scheme without authority (e.g., "http:path")
     if scheme and not parsed.netloc:
-        if strict:
-            raise URLValidationError(f"URL has no authority: {url}")
-        return ""
+        return invalid(f"URL has no authority: {url}")
 
     # Remove fragments
     normalized = urlunparse((
@@ -391,4 +509,3 @@ def is_js_url(url: str) -> bool:
             return True
 
     return False
-

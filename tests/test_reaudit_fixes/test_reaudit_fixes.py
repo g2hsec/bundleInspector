@@ -12,8 +12,8 @@ import json
 import pytest
 
 from bundleInspector.config import Config
-from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.rules.engine import RuleEngine
 
@@ -105,8 +105,9 @@ def test_local_ast_hash_matches_artifact_store_key():
     canonical = json.dumps(ast, separators=(",", ":"), sort_keys=True)
     expected = hashlib.sha256(canonical.encode()).hexdigest()[:16]
     # ArtifactStore.store_ast keys files by exactly this; the local parse stage must match.
-    from bundleInspector.storage.artifact_store import ArtifactStore
     import inspect
+
+    from bundleInspector.storage.artifact_store import ArtifactStore
     src = inspect.getsource(ArtifactStore.store_ast)
     assert 'json.dumps(ast, separators=(",", ":"), sort_keys=True)' in src
     # str(ast) hash must NOT equal it (the old, broken form).
@@ -117,6 +118,7 @@ def test_local_ast_hash_matches_artifact_store_key():
 
 def test_download_semaphore_clamped_to_at_least_one():
     import inspect
+
     from bundleInspector.core.orchestrator import Orchestrator
     src = inspect.getsource(Orchestrator._stage_download)
     assert "max(1, self.config.crawler.max_concurrent)" in src
@@ -136,8 +138,10 @@ async def test_serial_analyze_survives_enrichment_failure(monkeypatch, tmp_path)
     cfg.cache_dir = tmp_path
     insp = Orchestrator(cfg)
 
-    a1 = JSAsset(url="https://x/a.js", content=b'fetch("/api/one");'); a1.compute_hash()
-    a2 = JSAsset(url="https://x/b.js", content=b'fetch("/api/two");'); a2.compute_hash()
+    a1 = JSAsset(url="https://x/a.js", content=b'fetch("/api/one");')
+    a1.compute_hash()
+    a2 = JSAsset(url="https://x/b.js", content=b'fetch("/api/two");')
+    a2.compute_hash()
     for a in (a1, a2):
         insp._parse_results[a.content_hash] = JSParser(tolerant=True).parse(a.content.decode())
         a.parse_success = True

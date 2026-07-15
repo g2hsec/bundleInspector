@@ -6,7 +6,7 @@ rules:
     confidence: medium
     matcher:
       type: regex
-      pattern: "(?i)\\b(featureFlag|flag|toggle|experiment)\\b[^\\n]{0,80}['\"]([a-z0-9_\\-\\.]{3,40})['\"]"
+      pattern: "(?<!<)\\b((?i:featureFlag|flag|toggle|experiment))\\b[^\\n,{}<]{0,40}[.([:=]\\s*['\"]([A-Za-z0-9][A-Za-z0-9_.-]{2,39})['\"]"
       capture_group: 2
       capture_as: flag_key
     extract:

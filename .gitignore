@@ -1,9 +1,20 @@
 # Local editor / agent settings
+.claude/
 .claude/settings.local.json
 .idea/
 .vscode/
 .DS_Store
 Thumbs.db
+next_plan/
+
+# Agent operating-rule files (internal, not for the public repo)
+AGENTS.md
+CLAUDE.md
+
+# Build artifacts (regenerate with `python -m build`; publish via GitHub Releases)
+dist/
+build/
+*.egg-info/
 
 # Local runtime cache and generated artifacts
 .bundleInspector/

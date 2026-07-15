@@ -5,7 +5,6 @@ Line mapping for tracking positions through normalization.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
 
 
 @dataclass
@@ -53,8 +52,29 @@ class LineMapper:
             (original_line, original_column)
         """
         if normalized_line in self._by_normalized:
-            mapping = self._by_normalized[normalized_line][0]
-            return mapping.original_line, mapping.original_column
+            mappings = self._by_normalized[normalized_line]
+            # Column-aware: pick the mapping whose normalized_column is the greatest <= the requested
+            # column (best segment), instead of blindly taking the first -- two callsites on one
+            # minified line otherwise both map to the leftmost token (DQ-P09). Column 0 still picks
+            # the leftmost mapping, preserving prior behavior.
+            best = None
+            best_col = -1
+            for m in mappings:
+                mc = getattr(m, "normalized_column", 0) or 0
+                if mc <= normalized_column and mc > best_col:
+                    best, best_col = m, mc
+            mapping = best if best is not None else mappings[0]
+            # DQ-P07: preserve the intra-segment column offset. Mappings are stored one-per-line with
+            # normalized_column at the segment start, so returning the raw original_column dropped the
+            # requested column (an identity mapper always yielded column 0), which then mis-queried a
+            # sourcemap on the leftmost token. Add the offset so column 0 stays backward-compatible
+            # and a non-zero column resolves to its true original column.
+            # Clamp the offset to >= 0: a line-level finding queries column 0 while the segment starts
+            # at the indentation, so (0 - indent) would go negative -- an invalid coordinate that also
+            # defeats sourcemap resolution. Column 0 then correctly maps to the line's first token
+            # (mapping.original_column), and a real token column keeps its intra-segment offset.
+            seg_col = getattr(mapping, "normalized_column", 0) or 0
+            return mapping.original_line, mapping.original_column + max(0, normalized_column - seg_col)
 
         # Find nearest mapping
         nearest = self._find_nearest_normalized(normalized_line)
@@ -96,7 +116,7 @@ class LineMapper:
     def _find_nearest_normalized(
         self,
         line: int,
-    ) -> Optional[LineMapping]:
+    ) -> LineMapping | None:
         """Find mapping with nearest normalized line."""
         if not self.mappings:
             return None
@@ -116,7 +136,7 @@ class LineMapper:
     def _find_nearest_original(
         self,
         line: int,
-    ) -> Optional[LineMapping]:
+    ) -> LineMapping | None:
         """Find mapping with nearest original line."""
         if not self.mappings:
             return None
@@ -133,7 +153,7 @@ class LineMapper:
         return best
 
     @classmethod
-    def identity(cls, content: str) -> "LineMapper":
+    def identity(cls, content: str) -> LineMapper:
         """
         Create identity mapper (1:1 mapping).
 
@@ -167,7 +187,7 @@ class LineMapper:
         }
 
     @classmethod
-    def from_dict(cls, data: dict) -> "LineMapper":
+    def from_dict(cls, data: dict) -> LineMapper:
         """Deserialize from dictionary."""
         mapper = cls()
         for m in data.get("mappings", []):

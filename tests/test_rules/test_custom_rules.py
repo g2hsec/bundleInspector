@@ -8,13 +8,18 @@ import json
 import uuid
 from pathlib import Path
 
-from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE_SHORT, FAKE_STRIPE_TEST_SHORT
 from bundleInspector.config import RuleConfig
 from bundleInspector.parser.ir_builder import IRBuilder
 from bundleInspector.parser.js_parser import JSParser
 from bundleInspector.rules.base import AnalysisContext
-from bundleInspector.rules.custom import CustomDeclarativeRuleSpec, CustomSemanticRule
+from bundleInspector.rules.custom import (
+    CustomDeclarativeRuleSpec,
+    CustomSemanticRule,
+    _build_constant_table,
+    load_custom_rules,
+)
 from bundleInspector.rules.engine import RuleEngine
+from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE_SHORT, FAKE_STRIPE_TEST_SHORT
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
 TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -40,33 +45,35 @@ def test_semantic_value_resolution_preserves_empty_string_literals():
         source_content=source,
         is_first_party=True,
     )
-    spec = CustomDeclarativeRuleSpec.model_validate({
-        "id": "EMPTY_INIT",
-        "title": "Empty init",
-        "category": "secret",
-        "matcher": {
-            "type": "semantic",
-            "logic": {
-                "any": [
-                    {
-                        "and": [
-                            {
-                                "init_any_of": {
-                                    "any_of": [""],
-                                    "capture_as": "captured",
+    spec = CustomDeclarativeRuleSpec.model_validate(
+        {
+            "id": "EMPTY_INIT",
+            "title": "Empty init",
+            "category": "secret",
+            "matcher": {
+                "type": "semantic",
+                "logic": {
+                    "any": [
+                        {
+                            "and": [
+                                {
+                                    "init_any_of": {
+                                        "any_of": [""],
+                                        "capture_as": "captured",
+                                    }
                                 }
-                            }
-                        ]
-                    }
-                ]
+                            ]
+                        }
+                    ]
+                },
             },
-        },
-        "extract": {
-            "fields": {
-                "value": {"from_capture": "captured"},
-            }
-        },
-    })
+            "extract": {
+                "fields": {
+                    "value": {"from_capture": "captured"},
+                }
+            },
+        }
+    )
     rule = CustomSemanticRule(spec)
 
     findings = list(rule.match(ir, context))
@@ -77,27 +84,29 @@ def test_semantic_value_resolution_preserves_empty_string_literals():
 
 def test_semantic_candidate_types_include_clause_level_or_hints():
     """Clause-level `or`/`not` conditions should contribute candidate node types."""
-    spec = CustomDeclarativeRuleSpec.model_validate({
-        "id": "CANDIDATE_TYPES",
-        "title": "Candidate types",
-        "category": "secret",
-        "matcher": {
-            "type": "semantic",
-            "logic": {
-                "any": [
-                    {
-                        "or": [
-                            {"init_any_of": {"any_of": [""]}},
-                        ],
-                        "not": [
-                            {"value_any_of": {"any_of": ["skip"]}},
-                        ],
-                    }
-                ]
+    spec = CustomDeclarativeRuleSpec.model_validate(
+        {
+            "id": "CANDIDATE_TYPES",
+            "title": "Candidate types",
+            "category": "secret",
+            "matcher": {
+                "type": "semantic",
+                "logic": {
+                    "any": [
+                        {
+                            "or": [
+                                {"init_any_of": {"any_of": [""]}},
+                            ],
+                            "not": [
+                                {"value_any_of": {"any_of": ["skip"]}},
+                            ],
+                        }
+                    ]
+                },
             },
-        },
-        "extract": {"fields": {"value": {"static": "hit"}}},
-    })
+            "extract": {"fields": {"value": {"static": "hit"}}},
+        }
+    )
     rule = CustomSemanticRule(spec)
 
     candidate_types = rule._candidate_node_types()
@@ -108,27 +117,29 @@ def test_semantic_candidate_types_include_clause_level_or_hints():
 
 def test_semantic_candidate_types_union_multiple_hints_from_one_condition():
     """Candidate type inference should not drop secondary hints on composite conditions."""
-    spec = CustomDeclarativeRuleSpec.model_validate({
-        "id": "COMPOSITE_TYPES",
-        "title": "Composite types",
-        "category": "secret",
-        "matcher": {
-            "type": "semantic",
-            "logic": {
-                "any": [
-                    {
-                        "and": [
-                            {
-                                "ast": {"kind": "Property"},
-                                "right_any_of": {"any_of": ["x"]},
-                            }
-                        ]
-                    }
-                ]
+    spec = CustomDeclarativeRuleSpec.model_validate(
+        {
+            "id": "COMPOSITE_TYPES",
+            "title": "Composite types",
+            "category": "secret",
+            "matcher": {
+                "type": "semantic",
+                "logic": {
+                    "any": [
+                        {
+                            "and": [
+                                {
+                                    "ast": {"kind": "Property"},
+                                    "right_any_of": {"any_of": ["x"]},
+                                }
+                            ]
+                        }
+                    ]
+                },
             },
-        },
-        "extract": {"fields": {"value": {"static": "hit"}}},
-    })
+            "extract": {"fields": {"value": {"static": "hit"}}},
+        }
+    )
     rule = CustomSemanticRule(spec)
 
     candidate_types = rule._candidate_node_types()
@@ -388,16 +399,18 @@ rules:
 
 def test_shipped_example_ruleset_pack_matches_documented_examples():
     """The shipped example ruleset pack should load and match its documented endpoint/secret examples."""
-    rule_path = Path(__file__).resolve().parents[2] / "examples" / "yaml-configs" / "rulesets" / "meta.yml"
+    rule_path = (
+        Path(__file__).resolve().parents[2] / "examples" / "yaml-configs" / "rulesets" / "meta.yml"
+    )
 
-    source = '''
+    source = """
 const apiKey = "ABCDEFGHIJKLMNOPQRSTUVWXYZ123456";
 fetch("/api/example?debug=1", {
   headers: {
     Authorization: "Bearer abcdefghijklmnopqrstuvwxyz123456"
   }
 });
-'''.strip()
+""".strip()
     parser = JSParser()
     parse_result = parser.parse(source)
     assert parse_result.success is True
@@ -842,10 +855,10 @@ rules:
         encoding="utf-8",
     )
 
-    source = '''
+    source = """
 const liveKey = "SK_ABC123";
 const note = "this should not match";
-'''.strip()
+""".strip()
     parser = JSParser()
     parse_result = parser.parse(source)
     assert parse_result.success is True
@@ -889,11 +902,11 @@ rules:
         encoding="utf-8",
     )
 
-    source = '''
+    source = """
 const banner = `
 TOKEN: abc123
 `;
-'''.strip()
+""".strip()
     parser = JSParser()
     parse_result = parser.parse(source)
     assert parse_result.success is True
@@ -1093,6 +1106,67 @@ fetch(endpointVar);
     assert finding.extracted_value == "endpointVar"
 
 
+def test_mask_value_suffix_zero_does_not_leak_full_value():
+    """keep_prefix_N_suffix_0 must not append the whole plaintext -- `value[-0:]` is the FULL
+    string in Python, so a suffix of 0 previously leaked the entire captured secret."""
+    from bundleInspector.rules.custom import _mask_value
+
+    secret = "AKIA1234567890SECRET"
+    masked = _mask_value(secret, "keep_prefix_4_suffix_0")
+    assert masked == "AKIA" + "*" * (len(secret) - 4)
+    assert secret[4:] not in masked  # the tail plaintext must not survive
+    # normal prefix+suffix masking is unchanged
+    assert (
+        _mask_value(secret, "keep_prefix_4_suffix_4") == "AKIA" + "*" * (len(secret) - 8) + "CRET"
+    )
+
+
+def test_ast_pattern_any_arg_gate_is_enforced_not_bypassed():
+    """An `Any` argument carrying a value gate (not_contains_any_of) must be ENFORCED -- a removed
+    duplicate fast-path matched gated Any args unconditionally, producing false positives."""
+    rule_path = _make_test_path("ast_rules_any_gate.json")
+    rule_path.write_text(
+        json.dumps(
+            {
+                "rules": [
+                    {
+                        "id": "custom-cookie-insecure",
+                        "title": "insecure cookie",
+                        "category": "debug",
+                        "severity": "low",
+                        "confidence": "medium",
+                        "matcher": {
+                            "type": "ast_pattern",
+                            "pattern": {
+                                "kind": "CallExpression",
+                                "callee_any_of": ["setCookie"],
+                                "args": [
+                                    {"type": "LiteralString", "capture_as": "cookie_name"},
+                                    {"type": "Any", "not_contains_any_of": ["Secure"]},
+                                ],
+                            },
+                        },
+                        "extract": {"fields": {"cookie_name": {"from_capture": "cookie_name"}}},
+                    }
+                ]
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    def _hits(source):
+        ir = IRBuilder().build(JSParser().parse(source).ast, "file:///b.js", "h")
+        ctx = AnalysisContext(file_url="file:///b.js", file_hash="h", source_content=source)
+        engine = RuleEngine(RuleConfig(custom_rules_file=rule_path))
+        engine.register_defaults()
+        return [f for f in engine.analyze(ir, ctx) if f.rule_id == "custom-cookie-insecure"]
+
+    # arg[1] CONTAINS 'Secure' -> gate rejects -> no match (this was a false positive before)
+    assert _hits("setCookie('session', 'Secure; HttpOnly');") == []
+    # arg[1] does NOT contain 'Secure' -> gate passes -> match
+    assert len(_hits("setCookie('session', 'plain');")) == 1
+
+
 def test_ast_pattern_call_expression_supports_member_path_arguments():
     """AST-pattern call rules should match dotted member paths directly."""
     rule_path = _make_test_path("ast_rules_arg_member_path.json")
@@ -1132,7 +1206,7 @@ def test_ast_pattern_call_expression_supports_member_path_arguments():
         encoding="utf-8",
     )
 
-    source = 'client.request(routes.users);'
+    source = "client.request(routes.users);"
     parser = JSParser()
     parse_result = parser.parse(source)
     assert parse_result.success is True
@@ -1255,7 +1329,7 @@ def test_ast_pattern_variable_declarator_supports_member_path_initializers():
         encoding="utf-8",
     )
 
-    source = 'const currentRoute = ROUTES.users;'
+    source = "const currentRoute = ROUTES.users;"
     parser = JSParser()
     parse_result = parser.parse(source)
     assert parse_result.success is True
@@ -1623,7 +1697,9 @@ def test_ast_pattern_property_supports_exact_property_path_match():
         encoding="utf-8",
     )
 
-    source = 'const options = { headers: { Authorization: "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456" } };'
+    source = (
+        'const options = { headers: { Authorization: "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456" } };'
+    )
     parser = JSParser()
     parse_result = parser.parse(source)
     assert parse_result.success is True
@@ -1747,7 +1823,7 @@ def test_ast_pattern_property_supports_regex_property_path_match():
     )
 
     source = (
-        'const options = { request: { headers: { authorization: '
+        "const options = { request: { headers: { authorization: "
         '"Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456" } } };'
     )
     parser = JSParser()
@@ -1814,7 +1890,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-positive",
@@ -1825,7 +1903,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-negative",
@@ -1845,7 +1925,10 @@ rules:
     assert finding.metadata["ast_path"].startswith("Program")
     assert finding.metadata["masked_fields"]["secret_value"].startswith("Bearer")
     assert finding.metadata["masked_fields"]["secret_value"].endswith("3456")
-    assert finding.metadata["extracted_fields"]["secret_value"] == finding.metadata["masked_fields"]["secret_value"]
+    assert (
+        finding.metadata["extracted_fields"]["secret_value"]
+        == finding.metadata["masked_fields"]["secret_value"]
+    )
     assert finding.metadata["extracted_fields"]["secret_value"] != finding.extracted_value
     assert not any(f.rule_id == "SEC_AUTH_HEADER_BEARER" for f in negative_findings)
 
@@ -1960,7 +2043,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-call-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-call-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-call-positive",
@@ -1971,7 +2056,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-call-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-call-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-call-negative",
@@ -2049,7 +2136,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-positive",
@@ -2060,7 +2149,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-negative",
@@ -2123,7 +2214,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-new-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-new-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-new-positive",
@@ -2134,7 +2227,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-new-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-new-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-new-negative",
@@ -2210,7 +2305,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-new-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-new-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-new-object-positive",
@@ -2221,7 +2318,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-new-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-new-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-new-object-negative",
@@ -2301,7 +2400,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-identifier-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-identifier-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-identifier-positive",
@@ -2312,7 +2413,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-identifier-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-identifier-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-identifier-negative",
@@ -2387,7 +2490,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-array-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-array-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-array-positive",
@@ -2398,7 +2503,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-array-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-array-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-array-negative",
@@ -2468,7 +2575,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-arg-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-helper-arg-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-arg-positive",
@@ -2479,7 +2588,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-arg-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-helper-arg-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-arg-negative",
@@ -2555,7 +2666,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-helper-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-object-positive",
@@ -2566,7 +2679,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-helper-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-object-negative",
@@ -2637,7 +2752,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-helper-object-computed-path")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-helper-object-computed-path"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-object-computed-path",
@@ -2649,7 +2766,9 @@ rules:
     engine.register_defaults()
     findings = engine.analyze(ir, context)
 
-    finding = next(f for f in findings if f.rule_id == "SEC_CLIENT_AUTH_HELPER_OBJECT_COMPUTED_PATH")
+    finding = next(
+        f for f in findings if f.rule_id == "SEC_CLIENT_AUTH_HELPER_OBJECT_COMPUTED_PATH"
+    )
     assert finding.extracted_value == "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
     assert finding.metadata["extracted_fields"]["matched_path"] == "headers.Authorization"
 
@@ -2721,7 +2840,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-spread-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-spread-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-spread-positive",
@@ -2732,7 +2853,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-spread-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-spread-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-spread-negative",
@@ -2804,7 +2927,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-path-any-of-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-path-any-of-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-any-of-positive",
@@ -2815,7 +2940,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-path-any-of-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-path-any-of-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-any-of-negative",
@@ -2901,7 +3028,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-path-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-path-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-contains-negative",
@@ -2973,7 +3102,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-any-of-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-any-of-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-not-path-any-of-positive",
@@ -2984,7 +3115,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-any-of-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-any-of-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-not-path-any-of-negative",
@@ -3055,7 +3188,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-not-path-contains-positive",
@@ -3066,7 +3201,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-not-path-contains-negative",
@@ -3138,7 +3275,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-regex-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-regex-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-not-path-regex-positive",
@@ -3149,7 +3288,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-regex-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-not-path-regex-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-not-path-regex-negative",
@@ -3216,7 +3357,9 @@ rules:
     parse_result = parser.parse(source)
     assert parse_result.success is True
     assert parse_result.ast is not None
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-exact")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-exact"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-capture-exact",
@@ -3281,7 +3424,9 @@ rules:
     parse_result = parser.parse(source)
     assert parse_result.success is True
     assert parse_result.ast is not None
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-exact-computed")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-exact-computed"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-capture-exact-computed",
@@ -3293,7 +3438,9 @@ rules:
     engine.register_defaults()
     findings = engine.analyze(ir, context)
 
-    finding = next(f for f in findings if f.rule_id == "SEC_CLIENT_AUTH_PATH_CAPTURE_EXACT_COMPUTED")
+    finding = next(
+        f for f in findings if f.rule_id == "SEC_CLIENT_AUTH_PATH_CAPTURE_EXACT_COMPUTED"
+    )
     assert finding.extracted_value == "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
     assert finding.metadata["extracted_fields"]["matched_path"] == "headers.Authorization"
 
@@ -3345,7 +3492,9 @@ rules:
     parse_result = parser.parse(source)
     assert parse_result.success is True
     assert parse_result.ast is not None
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-contains")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-contains"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-capture-contains",
@@ -3408,7 +3557,9 @@ rules:
     parse_result = parser.parse(source)
     assert parse_result.success is True
     assert parse_result.ast is not None
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-regex")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-capture-regex"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-capture-regex",
@@ -3520,7 +3671,9 @@ rules:
     parse_result = parser.parse(source)
     assert parse_result.success is True
     assert parse_result.ast is not None
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-arg-index-contains")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-arg-index-contains"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-arg-index-contains",
@@ -3632,7 +3785,9 @@ rules:
     parse_result = parser.parse(source)
     assert parse_result.success is True
     assert parse_result.ast is not None
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-arg-index-any-of-regex")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-arg-index-any-of-regex"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-arg-index-any-of-regex",
@@ -3761,7 +3916,9 @@ rules:
     parse_result = parser.parse(source)
     assert parse_result.success is True
     assert parse_result.ast is not None
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-arg-index-any-of")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-arg-index-any-of"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-arg-index-any-of",
@@ -3852,7 +4009,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-spread-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-helper-spread-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-spread-object-positive",
@@ -3863,7 +4022,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-spread-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-helper-spread-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-spread-object-negative",
@@ -3877,7 +4038,9 @@ rules:
     positive_findings = engine.analyze(positive_ir, positive_context)
     negative_findings = engine.analyze(negative_ir, negative_context)
 
-    finding = next(f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_HELPER_SPREAD_OBJECT")
+    finding = next(
+        f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_HELPER_SPREAD_OBJECT"
+    )
     assert finding.extracted_value == "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
     assert not any(f.rule_id == "SEC_CLIENT_AUTH_HELPER_SPREAD_OBJECT" for f in negative_findings)
 
@@ -3938,7 +4101,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-block-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-helper-block-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-block-object-positive",
@@ -3949,7 +4114,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-block-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-helper-block-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-block-object-negative",
@@ -3963,7 +4130,9 @@ rules:
     positive_findings = engine.analyze(positive_ir, positive_context)
     negative_findings = engine.analyze(negative_ir, negative_context)
 
-    finding = next(f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_BLOCK_HELPER_OBJECT")
+    finding = next(
+        f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_BLOCK_HELPER_OBJECT"
+    )
     assert finding.extracted_value == "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
     assert not any(f.rule_id == "SEC_CLIENT_AUTH_BLOCK_HELPER_OBJECT" for f in negative_findings)
 
@@ -4025,7 +4194,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-block-alias-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-helper-block-alias-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-block-alias-positive",
@@ -4036,7 +4207,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-block-alias-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-helper-block-alias-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-block-alias-negative",
@@ -4050,7 +4223,9 @@ rules:
     positive_findings = engine.analyze(positive_ir, positive_context)
     negative_findings = engine.analyze(negative_ir, negative_context)
 
-    finding = next(f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_BLOCK_ALIAS_OBJECT")
+    finding = next(
+        f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_BLOCK_ALIAS_OBJECT"
+    )
     assert finding.extracted_value == "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
     assert not any(f.rule_id == "SEC_CLIENT_AUTH_BLOCK_ALIAS_OBJECT" for f in negative_findings)
 
@@ -4110,7 +4285,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-method-arg-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-helper-method-arg-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-method-arg-positive",
@@ -4121,7 +4298,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-method-arg-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-helper-method-arg-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-method-arg-negative",
@@ -4200,7 +4379,11 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-method-block-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast,
+        "file:///bundle.js",
+        "hash-semantic-helper-method-block-object-positive",
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-method-block-object-positive",
@@ -4211,7 +4394,11 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-method-block-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast,
+        "file:///bundle.js",
+        "hash-semantic-helper-method-block-object-negative",
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-method-block-object-negative",
@@ -4225,9 +4412,13 @@ rules:
     positive_findings = engine.analyze(positive_ir, positive_context)
     negative_findings = engine.analyze(negative_ir, negative_context)
 
-    finding = next(f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_BLOCK_HELPER_METHOD_OBJECT")
+    finding = next(
+        f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_BLOCK_HELPER_METHOD_OBJECT"
+    )
     assert finding.extracted_value == "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
-    assert not any(f.rule_id == "SEC_CLIENT_AUTH_BLOCK_HELPER_METHOD_OBJECT" for f in negative_findings)
+    assert not any(
+        f.rule_id == "SEC_CLIENT_AUTH_BLOCK_HELPER_METHOD_OBJECT" for f in negative_findings
+    )
 
 
 def test_yaml_semantic_call_expression_matches_object_method_returned_object_argument_property():
@@ -4291,7 +4482,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-helper-method-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-helper-method-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-method-object-positive",
@@ -4302,7 +4495,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-helper-method-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-helper-method-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-helper-method-object-negative",
@@ -4316,7 +4511,9 @@ rules:
     positive_findings = engine.analyze(positive_ir, positive_context)
     negative_findings = engine.analyze(negative_ir, negative_context)
 
-    finding = next(f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_HELPER_METHOD_OBJECT")
+    finding = next(
+        f for f in positive_findings if f.rule_id == "SEC_CLIENT_AUTH_HELPER_METHOD_OBJECT"
+    )
     assert finding.extracted_value == "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
     assert not any(f.rule_id == "SEC_CLIENT_AUTH_HELPER_METHOD_OBJECT" for f in negative_findings)
 
@@ -4361,7 +4558,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-not-right-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-not-right-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-not-right-positive",
@@ -4372,7 +4571,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-not-right-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-not-right-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-not-right-negative",
@@ -4434,7 +4635,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-not-arg-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-not-arg-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-not-arg-positive",
@@ -4445,7 +4648,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-not-arg-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-not-arg-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-not-arg-negative",
@@ -4518,7 +4723,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-not-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-not-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-not-object-positive",
@@ -4529,7 +4736,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-not-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-not-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-not-object-negative",
@@ -4659,7 +4868,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-regex-negative")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-path-regex-negative"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-path-regex-negative",
@@ -4764,7 +4975,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-left-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-left-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-left-contains-positive",
@@ -4775,7 +4988,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-left-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-left-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-left-contains-negative",
@@ -4883,13 +5098,17 @@ rules:
     )
 
     positive_source = 'headersClient.set("Authorization", "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456");'
-    negative_source = 'headersClient.append("Authorization", "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456");'
+    negative_source = (
+        'headersClient.append("Authorization", "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456");'
+    )
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-callee-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-callee-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-callee-contains-positive",
@@ -4900,7 +5119,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-callee-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-callee-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-callee-contains-negative",
@@ -4956,7 +5177,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-id-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-id-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-id-contains-positive",
@@ -4967,7 +5190,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-id-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-id-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-id-contains-negative",
@@ -5089,7 +5314,9 @@ rules:
     positive_result = JSParser().parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-property-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-property-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-property-positive",
@@ -5107,7 +5334,9 @@ rules:
     negative_result = JSParser().parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-property-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-property-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-property-negative",
@@ -5174,7 +5403,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-property-path-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-property-path-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-property-path-contains-positive",
@@ -5185,7 +5416,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-property-path-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-property-path-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-property-path-contains-negative",
@@ -5249,7 +5482,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-property-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-property-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-property-exact-positive",
@@ -5260,7 +5495,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-property-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-property-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-property-exact-negative",
@@ -5327,7 +5564,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-arg-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-arg-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-arg-exact-positive",
@@ -5338,7 +5577,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-arg-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-arg-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-arg-exact-negative",
@@ -5394,14 +5635,16 @@ rules:
         encoding="utf-8",
     )
 
-    positive_source = 'client.request(routes.users);'
-    negative_source = 'client.request(assets.logo);'
+    positive_source = "client.request(routes.users);"
+    negative_source = "client.request(assets.logo);"
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-member-path-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-member-path-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-member-path-positive",
@@ -5412,7 +5655,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-member-path-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-member-path-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-member-path-negative",
@@ -5480,7 +5725,9 @@ client.request(ASSETS[key]);
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-computed-member-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-computed-member-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-computed-member-positive",
@@ -5491,7 +5738,9 @@ client.request(ASSETS[key]);
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-computed-member-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-computed-member-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-computed-member-negative",
@@ -5505,9 +5754,13 @@ client.request(ASSETS[key]);
     positive_findings = engine.analyze(positive_ir, positive_context)
     negative_findings = engine.analyze(negative_ir, negative_context)
 
-    finding = next(f for f in positive_findings if f.rule_id == "ENDPOINT_REQUEST_COMPUTED_MEMBER_PATH_ARG")
+    finding = next(
+        f for f in positive_findings if f.rule_id == "ENDPOINT_REQUEST_COMPUTED_MEMBER_PATH_ARG"
+    )
     assert finding.extracted_value == "ROUTES.users"
-    assert not any(f.rule_id == "ENDPOINT_REQUEST_COMPUTED_MEMBER_PATH_ARG" for f in negative_findings)
+    assert not any(
+        f.rule_id == "ENDPOINT_REQUEST_COMPUTED_MEMBER_PATH_ARG" for f in negative_findings
+    )
 
 
 def test_yaml_semantic_call_expression_supports_exact_member_path_object_property_matching():
@@ -5555,7 +5808,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-member-path-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-member-path-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-member-path-object-positive",
@@ -5566,7 +5821,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-member-path-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-member-path-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-member-path-object-negative",
@@ -5636,7 +5893,9 @@ fetch("/api", { headers: { Authorization: ASSETS[kind] } });
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-computed-object-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-computed-object-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-computed-object-positive",
@@ -5647,7 +5906,9 @@ fetch("/api", { headers: { Authorization: ASSETS[kind] } });
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-computed-object-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-computed-object-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-computed-object-negative",
@@ -5661,9 +5922,13 @@ fetch("/api", { headers: { Authorization: ASSETS[kind] } });
     positive_findings = engine.analyze(positive_ir, positive_context)
     negative_findings = engine.analyze(negative_ir, negative_context)
 
-    finding = next(f for f in positive_findings if f.rule_id == "SECRET_FETCH_COMPUTED_MEMBER_PATH_PROPERTY")
+    finding = next(
+        f for f in positive_findings if f.rule_id == "SECRET_FETCH_COMPUTED_MEMBER_PATH_PROPERTY"
+    )
     assert finding.extracted_value == "TOKENS.auth"
-    assert not any(f.rule_id == "SECRET_FETCH_COMPUTED_MEMBER_PATH_PROPERTY" for f in negative_findings)
+    assert not any(
+        f.rule_id == "SECRET_FETCH_COMPUTED_MEMBER_PATH_PROPERTY" for f in negative_findings
+    )
 
 
 def test_yaml_semantic_call_expression_supports_regex_member_path_arg_capture():
@@ -5699,7 +5964,7 @@ rules:
         encoding="utf-8",
     )
 
-    source = 'client.request(routes.users);'
+    source = "client.request(routes.users);"
     parser = JSParser()
     parse_result = parser.parse(source)
     assert parse_result.success is True
@@ -5762,7 +6027,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-member-path-object-regex")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-member-path-object-regex"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-member-path-object-regex",
@@ -5814,14 +6081,16 @@ rules:
         encoding="utf-8",
     )
 
-    positive_source = 'config.headers.Authorization = tokens.auth;'
-    negative_source = 'config.headers.Authorization = assets.logo;'
+    positive_source = "config.headers.Authorization = tokens.auth;"
+    negative_source = "config.headers.Authorization = assets.logo;"
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-right-member-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-right-member-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-right-member-positive",
@@ -5832,7 +6101,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-right-member-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-right-member-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-right-member-negative",
@@ -5885,14 +6156,16 @@ rules:
         encoding="utf-8",
     )
 
-    positive_source = 'const currentRoute = ROUTES.users;'
-    negative_source = 'const currentRoute = ASSETS.logo;'
+    positive_source = "const currentRoute = ROUTES.users;"
+    negative_source = "const currentRoute = ASSETS.logo;"
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-init-member-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-init-member-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-init-member-positive",
@@ -5903,7 +6176,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-init-member-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-init-member-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-init-member-negative",
@@ -5954,14 +6229,16 @@ rules:
         encoding="utf-8",
     )
 
-    positive_source = 'const config = { headers: { Authorization: tokens.auth } };'
-    negative_source = 'const config = { headers: { Authorization: assets.logo } };'
+    positive_source = "const config = { headers: { Authorization: tokens.auth } };"
+    negative_source = "const config = { headers: { Authorization: assets.logo } };"
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-value-member-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-value-member-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-value-member-positive",
@@ -5972,7 +6249,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-value-member-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-value-member-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-value-member-negative",
@@ -6032,7 +6311,9 @@ const config = { headers: { [headerName]: tokens.auth } };
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-computed-property-path")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-computed-property-path"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-computed-property-path",
@@ -6095,7 +6376,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-init-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-init-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-init-exact-positive",
@@ -6106,7 +6389,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-init-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-init-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-init-exact-negative",
@@ -6187,7 +6472,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-exact-positive",
@@ -6198,7 +6485,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-exact-negative",
@@ -6263,7 +6552,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-right-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-right-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-right-contains-positive",
@@ -6274,7 +6565,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-right-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-right-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-right-contains-negative",
@@ -6338,7 +6631,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-init-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-init-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-init-contains-positive",
@@ -6349,7 +6644,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-init-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-init-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-init-contains-negative",
@@ -6413,7 +6710,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-value-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-value-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-value-contains-positive",
@@ -6424,7 +6723,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-value-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-value-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-value-contains-negative",
@@ -6490,7 +6791,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-arg-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-arg-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-arg-contains-positive",
@@ -6501,7 +6804,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-arg-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-arg-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-arg-contains-negative",
@@ -6586,7 +6891,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-object-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-object-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-contains-positive",
@@ -6597,7 +6904,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-object-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-object-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-contains-negative",
@@ -6662,7 +6971,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-destructure-helper")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-destructure-helper"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-destructure-helper",
@@ -6720,7 +7031,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-pattern-param",
@@ -6779,7 +7092,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param-spread")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param-spread"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-pattern-param-spread",
@@ -6842,7 +7157,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param-prop")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param-prop"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-pattern-param-prop",
@@ -6906,7 +7223,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param-prop-spread")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-param-prop-spread"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-pattern-param-prop-spread",
@@ -6964,7 +7283,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-nested-object-pattern-param")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-nested-object-pattern-param"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-nested-object-pattern-param",
@@ -7027,7 +7348,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-nested-object-pattern-param-prop")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-nested-object-pattern-param-prop"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-nested-object-pattern-param-prop",
@@ -7085,7 +7408,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-default-param")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-object-pattern-default-param"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-object-pattern-default-param",
@@ -7143,7 +7468,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-array-pattern-param")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-array-pattern-param"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-array-pattern-param",
@@ -7201,7 +7528,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-array-pattern-default-param")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-array-pattern-default-param"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-array-pattern-default-param",
@@ -7264,7 +7593,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-array-pattern-param-prop")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-array-pattern-param-prop"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-array-pattern-param-prop",
@@ -7319,7 +7650,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-semantic-var-init-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-semantic-var-init-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-var-init-positive",
@@ -7330,7 +7663,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-semantic-var-init-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-semantic-var-init-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-var-init-negative",
@@ -7390,7 +7725,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-assign-not-left-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-assign-not-left-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-assign-not-left-positive",
@@ -7401,7 +7738,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-assign-not-left-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-assign-not-left-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-assign-not-left-negative",
@@ -7456,13 +7795,17 @@ rules:
     )
 
     positive_source = 'headersClient.set("Authorization", "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456");'
-    negative_source = 'headersmocksetter.set("Authorization", "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456");'
+    negative_source = (
+        'headersmocksetter.set("Authorization", "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456");'
+    )
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-call-not-callee-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-call-not-callee-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-call-not-callee-positive",
@@ -7473,7 +7816,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-call-not-callee-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-call-not-callee-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-call-not-callee-negative",
@@ -7531,7 +7876,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-var-not-id-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-var-not-id-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-var-not-id-positive",
@@ -7542,7 +7889,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-var-not-id-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-var-not-id-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-var-not-id-negative",
@@ -7599,7 +7948,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-prop-not-path-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-prop-not-path-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-prop-not-path-positive",
@@ -7610,7 +7961,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-prop-not-path-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-prop-not-path-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-prop-not-path-negative",
@@ -7665,7 +8018,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-call-not-callee-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-call-not-callee-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-not-callee-positive",
@@ -7676,7 +8031,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-call-not-callee-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-call-not-callee-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-not-callee-negative",
@@ -7729,7 +8086,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-var-not-id-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-var-not-id-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-not-id-positive",
@@ -7740,7 +8099,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-var-not-id-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-var-not-id-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-not-id-negative",
@@ -7795,7 +8156,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-assign-not-left-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-assign-not-left-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-not-left-positive",
@@ -7806,7 +8169,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-assign-not-left-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-assign-not-left-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-not-left-negative",
@@ -7861,7 +8226,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-prop-not-path-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-prop-not-path-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-not-path-positive",
@@ -7872,7 +8239,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-prop-not-path-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-prop-not-path-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-not-path-negative",
@@ -7930,7 +8299,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-call-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-call-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-contains-positive",
@@ -7941,7 +8312,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-call-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-call-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-contains-negative",
@@ -7997,7 +8370,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-var-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-var-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-contains-positive",
@@ -8008,7 +8383,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-var-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-var-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-contains-negative",
@@ -8064,7 +8441,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-assign-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-assign-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-contains-positive",
@@ -8075,7 +8454,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-assign-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-assign-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-contains-negative",
@@ -8124,14 +8505,20 @@ rules:
         encoding="utf-8",
     )
 
-    positive_source = 'const requestConfig = { auth_header: "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456" };'
-    negative_source = 'const requestConfig = { mock_auth_header: "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456" };'
+    positive_source = (
+        'const requestConfig = { auth_header: "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456" };'
+    )
+    negative_source = (
+        'const requestConfig = { mock_auth_header: "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456" };'
+    )
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-prop-contains-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-prop-contains-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-contains-positive",
@@ -8142,7 +8529,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-prop-contains-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-prop-contains-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-contains-negative",
@@ -8198,7 +8587,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-call-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-call-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-exact-positive",
@@ -8209,7 +8600,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-call-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-call-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-exact-negative",
@@ -8265,7 +8658,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-var-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-var-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-exact-positive",
@@ -8276,7 +8671,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-var-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-var-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-exact-negative",
@@ -8332,7 +8729,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-assign-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-assign-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-exact-positive",
@@ -8343,7 +8742,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-assign-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-assign-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-exact-negative",
@@ -8392,14 +8793,18 @@ rules:
         encoding="utf-8",
     )
 
-    positive_source = 'const requestConfig = { auth_header: "Bearer REALTOKEN1234567890ABCDEFGHIJKLMNOP" };'
+    positive_source = (
+        'const requestConfig = { auth_header: "Bearer REALTOKEN1234567890ABCDEFGHIJKLMNOP" };'
+    )
     negative_source = 'const requestConfig = { auth_header: "Bearer placeholder" };'
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-prop-exact-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-prop-exact-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-exact-positive",
@@ -8410,7 +8815,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-prop-exact-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-prop-exact-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-exact-negative",
@@ -8465,7 +8872,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-call-not-regex-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-call-not-regex-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-not-regex-positive",
@@ -8476,7 +8885,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-call-not-regex-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-call-not-regex-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-call-not-regex-negative",
@@ -8531,7 +8942,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-var-not-regex-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-var-not-regex-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-not-regex-positive",
@@ -8542,7 +8955,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-var-not-regex-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-var-not-regex-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-var-not-regex-negative",
@@ -8597,7 +9012,9 @@ rules:
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-assign-not-regex-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-assign-not-regex-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-not-regex-positive",
@@ -8608,7 +9025,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-assign-not-regex-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-assign-not-regex-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-assign-not-regex-negative",
@@ -8656,14 +9075,18 @@ rules:
         encoding="utf-8",
     )
 
-    positive_source = 'const requestConfig = { auth_header: "Bearer REALTOKEN1234567890ABCDEFGHIJKLMNOP" };'
+    positive_source = (
+        'const requestConfig = { auth_header: "Bearer REALTOKEN1234567890ABCDEFGHIJKLMNOP" };'
+    )
     negative_source = 'const requestConfig = { auth_header: "Bearer placeholder" };'
     parser = JSParser()
 
     positive_result = parser.parse(positive_source)
     assert positive_result.success is True
     assert positive_result.ast is not None
-    positive_ir = IRBuilder().build(positive_result.ast, "file:///bundle.js", "hash-ast-prop-not-regex-positive")
+    positive_ir = IRBuilder().build(
+        positive_result.ast, "file:///bundle.js", "hash-ast-prop-not-regex-positive"
+    )
     positive_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-not-regex-positive",
@@ -8674,7 +9097,9 @@ rules:
     negative_result = parser.parse(negative_source)
     assert negative_result.success is True
     assert negative_result.ast is not None
-    negative_ir = IRBuilder().build(negative_result.ast, "file:///bundle.js", "hash-ast-prop-not-regex-negative")
+    negative_ir = IRBuilder().build(
+        negative_result.ast, "file:///bundle.js", "hash-ast-prop-not-regex-negative"
+    )
     negative_context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-prop-not-regex-negative",
@@ -9105,7 +9530,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-ast-new-any-arg-index-capture")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-ast-new-any-arg-index-capture"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-new-any-arg-index-capture",
@@ -9218,7 +9645,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-ast-new-any-arg-index-any-of")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-ast-new-any-arg-index-any-of"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-ast-new-any-arg-index-any-of",
@@ -9319,7 +9748,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-logic-all-negative")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-logic-all-negative"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-logic-all-negative",
@@ -9483,7 +9914,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-logic-all-clause-object")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-logic-all-clause-object"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-logic-all-clause-object",
@@ -9544,7 +9977,9 @@ rules:
     assert parse_result.success is True
     assert parse_result.ast is not None
 
-    ir = IRBuilder().build(parse_result.ast, "file:///bundle.js", "hash-semantic-logic-none-clause-object")
+    ir = IRBuilder().build(
+        parse_result.ast, "file:///bundle.js", "hash-semantic-logic-none-clause-object"
+    )
     context = AnalysisContext(
         file_url="file:///bundle.js",
         file_hash="hash-semantic-logic-none-clause-object",
@@ -9671,3 +10106,37 @@ rules:
     finding = next(f for f in findings if f.rule_id == "SEM_CLAUSE_NOT")
     assert finding.extracted_value == "/api/users"
 
+
+def test_custom_regex_rules_reject_unsafe_or_ambiguous_configuration(tmp_path):
+    rule_path = tmp_path / "validation.json"
+    base = {
+        "title": "test",
+        "category": "debug",
+        "pattern": "ok",
+    }
+    rule_path.write_text(
+        json.dumps(
+            {
+                "rules": [
+                    {**base, "id": "valid"},
+                    {**base, "id": "valid", "pattern": "duplicate"},
+                    {**base, "id": "bad-flag", "flags": ["z"]},
+                    {**base, "id": "bad-group", "extract_group": 2, "pattern": "(ok)"},
+                    {**base, "id": "unsafe", "pattern": "(a+)+$"},
+                    {**base, "id": "unknown-field", "typo": True},
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    assert [rule.id for rule in load_custom_rules(rule_path)] == ["valid"]
+
+
+def test_constant_table_does_not_merge_shadowed_bindings_across_functions():
+    parsed = JSParser().parse(
+        'function first(){ const endpoint="/admin"; use(endpoint); } '
+        'function second(){ const endpoint="/public"; use(endpoint); }'
+    )
+    assert parsed.ast is not None
+    assert "endpoint" not in _build_constant_table(parsed.ast)

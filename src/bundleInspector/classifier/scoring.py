@@ -6,7 +6,6 @@ from __future__ import annotations
 
 from bundleInspector.storage.models import Category, Confidence, Finding, Severity
 
-
 # Impact weights by category
 CATEGORY_IMPACT = {
     Category.SECRET: 1.0,
@@ -74,13 +73,21 @@ class ScoreCalculator:
         if finding.metadata.get("is_first_party", False):
             base += 0.1
 
-        # Increase for correlated findings
-        base += min(0.2, correlation_count * 0.05)
+        # DQ-H03/H04: do NOT fold the raw related-finding COUNT into likelihood. get_related counts
+        # every same-file neighbor (create_same_file_edge links any two findings in a file), so a
+        # couple of unrelated INFO findings would inflate the score and flip a confirmed vuln across a
+        # tier boundary (e.g. an AJAX-XSS P2 -> P1). Likelihood must reflect the finding's OWN signals,
+        # not how many neighbors happen to share its file. (correlation_count is still surfaced in the
+        # reasoning text; edge-strength-WEIGHTED correlation is deferred scoring work, P6.)
 
         # Adjust based on value type
         high_likelihood_types = [
-            "aws_access_key", "stripe_secret_key", "github_pat",
-            "jwt_token", "database_url", "private_key",
+            "aws_access_key",
+            "stripe_secret_key",
+            "github_pat",
+            "jwt_token",
+            "database_url",
+            "private_key",
         ]
         if finding.value_type in high_likelihood_types:
             base += 0.2
@@ -130,4 +137,3 @@ class ScoreCalculator:
         score = impact * likelihood * confidence * 10
 
         return round(score, 2)
-

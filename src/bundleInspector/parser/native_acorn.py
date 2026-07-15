@@ -23,13 +23,16 @@ import shutil
 import subprocess
 import tempfile
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 _SCRIPT = Path(__file__).with_name("acorn_parse.js")
 _TIMEOUT_SECONDS = 30
+_PROBE_TIMEOUT_SECONDS = 5
 
 # Cached availability probe (None = not yet probed).
-_available: Optional[bool] = None
+_available: bool | None = None
+_availability_reason = "not_probed"
+_node_executable: str | None = None
 
 
 def native_parser_enabled() -> bool:
@@ -40,17 +43,55 @@ def native_parser_enabled() -> bool:
 
 
 def native_parser_available() -> bool:
-    """True when the flag is set and Node.js + the parse script are usable (probed once)."""
-    global _available
+    """True only when the opt-in backend can actually resolve its Acorn dependency."""
+    global _available, _availability_reason, _node_executable
     if not native_parser_enabled():
+        _availability_reason = "disabled"
         return False
     if _available is not None:
         return _available
-    _available = shutil.which("node") is not None and _SCRIPT.is_file()
+
+    if not _SCRIPT.is_file():
+        _available = False
+        _availability_reason = "sidecar_missing"
+        return False
+    _node_executable = shutil.which("node")
+    if not _node_executable:
+        _available = False
+        _availability_reason = "node_missing"
+        return False
+
+    # The sidecar's existence does not prove `require("acorn")` can resolve. Probe using the
+    # sidecar directory as the Node resolution root, matching how the real script is loaded.
+    try:
+        probe = subprocess.run(
+            [
+                _node_executable,
+                "-e",
+                "require.resolve('acorn', {paths: [process.argv[1]]})",
+                str(_SCRIPT.parent),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            timeout=_PROBE_TIMEOUT_SECONDS,
+        )
+    except Exception as exc:
+        _available = False
+        _availability_reason = f"probe_failed:{type(exc).__name__}"
+        return False
+    _available = probe.returncode == 0
+    _availability_reason = "available" if _available else "acorn_unavailable"
     return _available
 
 
-def parse_source(source: str) -> Optional[dict[str, Any]]:
+def native_parser_availability_reason() -> str:
+    """Return a stable, non-secret reason for backend availability telemetry."""
+    native_parser_available()
+    return _availability_reason
+
+
+def parse_source(source: str, *, temp_dir: Path | None = None) -> dict[str, Any] | None:
     """
     Parse ``source`` with acorn and return an ESTree dict, or None on any failure
     (caller must fall back to the default parser).
@@ -60,13 +101,20 @@ def parse_source(source: str) -> Optional[dict[str, Any]]:
 
     tmp_path = None
     try:
+        if temp_dir is not None:
+            temp_dir.mkdir(parents=True, exist_ok=True)
         # newline="" preserves the source byte-for-byte (no "\n" -> "\r\n" translation on
         # Windows). This keeps acorn's absolute char offsets (node.range) aligned with the
         # in-memory `source` string that downstream consumers index into -- enh1's
         # access-control gating matches endpoint findings against guard `range` offsets, so
         # any newline-induced shift would misattribute guards.
         with tempfile.NamedTemporaryFile(
-            mode="w", suffix=".js", encoding="utf-8", newline="", delete=False
+            mode="w",
+            suffix=".js",
+            encoding="utf-8",
+            newline="",
+            delete=False,
+            dir=temp_dir,
         ) as tmp:
             # Capture the name BEFORE writing: with delete=False, a failing
             # write (e.g. disk full) would otherwise orphan the temp file
@@ -75,7 +123,7 @@ def parse_source(source: str) -> Optional[dict[str, Any]]:
             tmp.write(source)
 
         proc = subprocess.run(
-            ["node", str(_SCRIPT), tmp_path],
+            [_node_executable or "node", str(_SCRIPT), tmp_path],
             capture_output=True,
             text=True,
             encoding="utf-8",

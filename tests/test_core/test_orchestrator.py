@@ -4,14 +4,15 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import os
 import time
 import uuid
 from pathlib import Path
 
 import pytest
 
-from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE
-from bundleInspector.config import Config, CrawlerConfig
+import bundleInspector.storage.finding_store as finding_store_module
+from bundleInspector.config import Config, CrawlerConfig, ThirdPartyPolicy
 from bundleInspector.core.orchestrator import BundleInspector, Orchestrator
 from bundleInspector.core.progress import PipelineStage
 from bundleInspector.core.resume_policy import (
@@ -23,8 +24,26 @@ from bundleInspector.normalizer.line_mapping import LineMapper, LineMapping
 from bundleInspector.normalizer.sourcemap import SourceMapInfo
 from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.storage.artifact_store import ArtifactStore
+from bundleInspector.storage.atomic import UnsafePathError
 from bundleInspector.storage.finding_store import FindingStore
-from bundleInspector.storage.models import Category, Confidence, Evidence, Finding, PipelineCheckpoint, Report, Severity, JSAsset, JSReference, LoadMethod
+from bundleInspector.storage.job_repository import JobAccessError, JobRepository
+from bundleInspector.storage.models import (
+    AnalysisCompleteness,
+    AssetProvenance,
+    Category,
+    CompletenessIssue,
+    CompletenessStatus,
+    Confidence,
+    Evidence,
+    Finding,
+    JSAsset,
+    JSReference,
+    LoadMethod,
+    PipelineCheckpoint,
+    Report,
+    Severity,
+)
+from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
 TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -231,6 +250,73 @@ async def test_crawl_uses_multi_page_collectors_when_depth_enabled(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_collectors_and_sourcemap_resolver_share_orchestrator_rate_limiter(
+    monkeypatch,
+):
+    config = Config(crawler=CrawlerConfig(max_depth=0, use_headless=True))
+    orchestrator = Orchestrator(config)
+    collector_limiters = []
+    resolver_limiters = []
+
+    class _CapturingCollector(_FakeCollector):
+        def __init__(self, *args, **kwargs):
+            collector_limiters.append(kwargs["rate_limiter"])
+            super().__init__(*args, **kwargs)
+
+    class _Diagnostic:
+        status = "not_found"
+
+    class _CapturingSourceMapResolver:
+        last_diagnostic = _Diagnostic()
+
+        def __init__(self, *args, **kwargs):
+            resolver_limiters.append(kwargs["rate_limiter"])
+
+        async def setup(self):
+            return None
+
+        async def teardown(self):
+            return None
+
+        async def resolve(self, source, url):
+            return None
+
+    async def _noop(*args, **kwargs):
+        return None
+
+    monkeypatch.setattr(
+        "bundleInspector.core.orchestrator.is_url_safe",
+        lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"),
+    )
+    monkeypatch.setattr(
+        "bundleInspector.core.orchestrator.StaticCollector",
+        _CapturingCollector,
+    )
+    monkeypatch.setattr(
+        "bundleInspector.core.orchestrator.HeadlessCollector",
+        _CapturingCollector,
+    )
+    monkeypatch.setattr(
+        "bundleInspector.core.orchestrator.ManifestCollector",
+        _CapturingCollector,
+    )
+    monkeypatch.setattr(
+        "bundleInspector.core.orchestrator.SourceMapResolver",
+        _CapturingSourceMapResolver,
+    )
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", _noop)
+
+    await orchestrator._crawl_url("https://example.com")
+    asset = JSAsset(url="https://example.com/app.js", content=b"const value = 1;")
+    asset.compute_hash()
+    await orchestrator._stage_normalize([asset])
+
+    assert len(collector_limiters) == 3
+    assert all(limiter is orchestrator.rate_limiter for limiter in collector_limiters)
+    assert resolver_limiters == [orchestrator.rate_limiter]
+
+
+@pytest.mark.asyncio
 async def test_run_integrates_headless_and_manifest_discovery_into_real_pipeline(monkeypatch):
     """A real pipeline run should process headless and manifest discoveries end-to-end with dedupe and metadata preservation."""
     config = Config(crawler=CrawlerConfig(use_headless=True, max_depth=0))
@@ -247,7 +333,7 @@ async def test_run_integrates_headless_and_manifest_discovery_into_real_pipeline
     async def _fake_download(ref: JSReference):
         content_map = {
             "https://example.com/static-entry.js": b'fetch("/api/static-users");',
-            "https://example.com/dashboard.js": f'const stripeKey = "{FAKE_STRIPE_LIVE}";'.encode("utf-8"),
+            "https://example.com/dashboard.js": f'const stripeKey = "{FAKE_STRIPE_LIVE}";'.encode(),
             "https://example.com/manifest-chunk.js": b'fetch("/api/manifest-users");',
         }
         asset = JSAsset(
@@ -291,11 +377,16 @@ async def test_apply_artifact_mappings_sets_original_positions():
         content_hash="asset-hash",
     )
 
+    # The finding is detected at BEAUTIFIED line 3; the line mapper reconstructs the GENERATED
+    # (minified) coordinate -- line 1 -- which the sourcemap (a single "AAAA" segment on generated
+    # line 1) resolves to src/app.ts line 1. (DQ-P07: the sourcemap must be queried with the restored
+    # generated coord, not the raw beautified finding coord; the previous fixture mapped normalized 1
+    # -> generated 5, a line the sourcemap did not cover, and only "passed" because of that bug.)
     mapper = LineMapper()
     mapper.add_mapping(LineMapping(
-        original_line=5,
-        original_column=2,
-        normalized_line=1,
+        original_line=1,
+        original_column=0,
+        normalized_line=3,
         normalized_column=0,
     ))
     orchestrator._line_mappers[asset.content_hash] = mapper
@@ -317,7 +408,7 @@ async def test_apply_artifact_mappings_sets_original_positions():
         evidence=Evidence(
             file_url=asset.url,
             file_hash=asset.content_hash,
-            line=1,
+            line=3,
             column=0,
         ),
         extracted_value="/api/users",
@@ -1322,8 +1413,8 @@ async def test_run_resumes_from_analyze_checkpoint(monkeypatch):
         "_stage_parse",
         "_stage_analyze",
     ):
-        async def _unexpected(*args, **kwargs):  # pragma: no cover - assertion path
-            raise AssertionError(f"{method_name} should not run during resume")
+        async def _unexpected(*args, _method_name=method_name, **kwargs):  # pragma: no cover - assertion path
+            raise AssertionError(f"{_method_name} should not run during resume")
 
         monkeypatch.setattr(orchestrator, method_name, _unexpected)
 
@@ -1378,8 +1469,8 @@ async def test_run_resumes_partial_parse_checkpoint_without_reparsing(monkeypatc
     orchestrator = Orchestrator(config)
 
     for method_name in ("_stage_crawl", "_stage_download", "_stage_normalize"):
-        async def _unexpected(*args, **kwargs):  # pragma: no cover - assertion path
-            raise AssertionError(f"{method_name} should not run during resume")
+        async def _unexpected(*args, _method_name=method_name, **kwargs):  # pragma: no cover - assertion path
+            raise AssertionError(f"{_method_name} should not run during resume")
         monkeypatch.setattr(orchestrator, method_name, _unexpected)
 
     monkeypatch.setattr(
@@ -1433,6 +1524,35 @@ async def test_stage_parse_persists_ast_with_resume_compatible_hash():
 
     assert restored_asset.content_hash in restored._parse_results
     assert restored._parse_results[restored_asset.content_hash].ast == stored_ast
+
+
+@pytest.mark.asyncio
+async def test_stage_parse_forwards_asset_language_hint(monkeypatch):
+    config = Config()
+    config.cache_dir = _make_test_dir()
+    config.job_id = "parse-language-hint"
+    config.ensure_dirs()
+    orchestrator = Orchestrator(config)
+    original_parse = orchestrator.parser.parse
+    calls: list[str | None] = []
+
+    def _recording_parse(source, *, language_hint=None):
+        calls.append(language_hint)
+        return original_parse(source, language_hint=language_hint)
+
+    monkeypatch.setattr(orchestrator.parser, "parse", _recording_parse)
+    asset = JSAsset(
+        url="file:///Component.tsx",
+        content=b'const Component = () => <div data-api="/api/tsx" />;',
+        content_hash="",
+        language_hint="tsx",
+    )
+    asset.compute_hash()
+
+    await orchestrator._stage_parse([asset])
+
+    assert calls == ["tsx"]
+    assert asset.parse_success is True
 
 
 @pytest.mark.asyncio
@@ -1495,8 +1615,8 @@ async def test_run_resumes_partial_analyze_checkpoint_without_reanalyzing(monkey
     orchestrator = Orchestrator(config)
 
     for method_name in ("_stage_crawl", "_stage_download", "_stage_normalize"):
-        async def _unexpected(*args, **kwargs):  # pragma: no cover - assertion path
-            raise AssertionError(f"{method_name} should not run during resume")
+        async def _unexpected(*args, _method_name=method_name, **kwargs):  # pragma: no cover - assertion path
+            raise AssertionError(f"{_method_name} should not run during resume")
         monkeypatch.setattr(orchestrator, method_name, _unexpected)
 
     monkeypatch.setattr(
@@ -1560,6 +1680,112 @@ async def test_bundleinspector_scan_does_not_reuse_report_when_profile_changes(m
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("resume", [False, True])
+async def test_bundleinspector_rejects_foreign_job_before_storage_access(resume):
+    cache_dir = _make_test_dir()
+    config = Config()
+    config.cache_dir = cache_dir
+    config.job_id = "foreign-python-job"
+    config.resume = resume
+    repository = JobRepository(cache_dir)
+    repository.register_owner(config.job_id, "alice")
+
+    if resume:
+        report = Report(
+            job_id=config.job_id,
+            seed_urls=["https://example.com"],
+            config=embed_report_resume_signature(
+                config.to_dict(),
+                build_remote_resume_signature(config),
+            ),
+        )
+        await FindingStore(cache_dir / config.job_id).store_report(report)
+
+    with pytest.raises(JobAccessError):
+        await BundleInspector(config).scan(["https://example.com"])
+
+    job_root = cache_dir / config.job_id
+    assert (job_root / ".owner").read_text(encoding="utf-8") == "alice"
+    assert not (job_root / "artifacts").exists()
+
+
+def test_orchestrator_rejects_unsafe_owned_storage_before_pipeline_access(tmp_path):
+    config = Config()
+    config.cache_dir = tmp_path / "cache"
+    config.job_id = "unsafe-python-job"
+    repository = JobRepository(config.cache_dir)
+    repository.register_owner(config.job_id, "local")
+    artifacts_path = config.cache_dir / config.job_id / "artifacts"
+    artifacts_path.write_text("not a directory", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="directory"):
+        Orchestrator(config)
+
+    assert artifacts_path.read_text(encoding="utf-8") == "not a directory"
+    assert not (config.cache_dir / config.job_id / "findings").exists()
+
+
+def test_orchestrator_propagates_a_hardlinked_owner_as_unsafe_storage(tmp_path: Path) -> None:
+    config = Config()
+    config.cache_dir = tmp_path / "cache"
+    config.job_id = "hardlinked-owner"
+    job_root = config.cache_dir / config.job_id
+    job_root.mkdir(parents=True)
+    outside_owner = tmp_path / "outside-owner"
+    outside_owner.write_text("local", encoding="utf-8")
+    try:
+        os.link(outside_owner, job_root / ".owner")
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+
+    with pytest.raises(UnsafePathError, match="link count is not one"):
+        Orchestrator(config)
+
+    assert outside_owner.read_text(encoding="utf-8") == "local"
+    assert not (job_root / "artifacts").exists()
+
+
+def test_orchestrator_propagates_finding_store_containment_violations(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    config = Config()
+    config.cache_dir = tmp_path / "cache"
+    config.job_id = "escaped-finding-store"
+    outside_findings = tmp_path / "outside" / "findings"
+    original_ensure = finding_store_module.ensure_safe_directory
+
+    def escape_findings(path: Path) -> Path:
+        if path.name == "findings":
+            outside_findings.mkdir(parents=True, exist_ok=True)
+            return outside_findings.resolve()
+        return original_ensure(path)
+
+    monkeypatch.setattr(finding_store_module, "ensure_safe_directory", escape_findings)
+
+    with pytest.raises(UnsafePathError, match="escaped"):
+        Orchestrator(config)
+
+
+@pytest.mark.asyncio
+async def test_bundleinspector_resume_propagates_an_unsafe_cache_root(tmp_path: Path) -> None:
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    cache_link = tmp_path / "cache-link"
+    try:
+        cache_link.symlink_to(outside, target_is_directory=True)
+    except OSError as exc:
+        pytest.skip(f"symbolic links are unavailable: {exc}")
+    config = Config()
+    config.cache_dir = cache_link
+    config.job_id = "unsafe-resume"
+    config.resume = True
+
+    with pytest.raises(UnsafePathError, match="symbolic link or junction"):
+        await BundleInspector(config).scan(["https://example.com"])
+
+
+@pytest.mark.asyncio
 async def test_load_checkpoint_rejects_checkpoint_from_different_profile():
     """Stored checkpoints should not resume across analysis-affecting config changes."""
     cache_dir = _make_test_dir()
@@ -1594,6 +1820,122 @@ async def test_load_checkpoint_rejects_checkpoint_from_different_profile():
     checkpoint = await Orchestrator(deep)._load_checkpoint(["https://example.com"])
 
     assert checkpoint is None
+
+
+@pytest.mark.asyncio
+async def test_load_checkpoint_rehydrates_completeness_without_duplicate_growth():
+    cache_dir = _make_test_dir()
+    config = Config()
+    config.cache_dir = cache_dir
+    config.job_id = "resume-completeness"
+    config.resume = True
+    config.ensure_dirs()
+    issue = CompletenessIssue(
+        code="prior_truncation",
+        stage="crawl",
+        message="Prior crawl was truncated",
+        affected_count=3,
+        details={"limit": 10},
+    )
+    store = FindingStore(cache_dir / config.job_id)
+    await store.store_checkpoint(PipelineCheckpoint(
+        job_id=config.job_id,
+        seed_urls=["https://example.com"],
+        stage="crawl",
+        stage_state=_resume_stage_state(config),
+        completeness=AnalysisCompleteness(
+            status=CompletenessStatus.PARTIAL,
+            issues=[issue],
+        ),
+    ))
+    orchestrator = Orchestrator(config)
+
+    assert await orchestrator._load_checkpoint(["https://example.com"]) is not None
+    assert await orchestrator._load_checkpoint(["https://example.com"]) is not None
+    assert orchestrator._completeness_issues == [issue]
+
+
+@pytest.mark.asyncio
+async def test_dependency_frontier_resolves_relative_import_for_every_content_provenance(
+    monkeypatch,
+):
+    config = Config()
+    config.scope.allowed_domains = ["example.com"]
+    config.scope.third_party_policy = ThirdPartyPolicy.SKIP
+    orchestrator = Orchestrator(config)
+    orchestrator._seed_urls = ["https://example.com/a/app.js"]
+    asset = JSAsset(
+        url="https://example.com/a/app.js",
+        content=b'import "./chunk.js";',
+        provenance=[
+            AssetProvenance(url="https://example.com/a/app.js"),
+            AssetProvenance(url="https://example.com/b/app.js"),
+        ],
+    )
+    asset.compute_hash()
+    orchestrator._parse_results[asset.content_hash] = parse_js('import "./chunk.js";')
+    seen: list[str] = []
+
+    async def download(refs, assets, _completed):
+        seen.extend(ref.url for ref in refs if ref.url.endswith("chunk.js"))
+        return assets
+
+    async def noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(orchestrator, "_stage_download", download)
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", noop)
+    refs = [JSReference(url=asset.url)]
+    await orchestrator._expand_dependency_frontier(refs, [asset])
+
+    assert sorted(set(seen)) == [
+        "https://example.com/a/chunk.js",
+        "https://example.com/b/chunk.js",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_download_scope_rejection_precedes_dns_validation(monkeypatch):
+    config = Config()
+    config.scope.allowed_domains = ["example.com"]
+    config.scope.third_party_policy = ThirdPartyPolicy.SKIP
+    orchestrator = Orchestrator(config)
+    orchestrator._download_client = object()
+    validated: list[str] = []
+
+    def validate(url: str, *_args) -> tuple[bool, str]:
+        validated.append(url)
+        return True, "OK"
+
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe", validate)
+    result = await orchestrator._download_js(JSReference(
+        url="https://leaked-value.attacker.test/app.js"
+    ))
+
+    assert result is None
+    assert validated == []
+
+
+def test_asset_provenance_merge_preserves_redirect_final_url_as_canonical_base():
+    orchestrator = Orchestrator(Config())
+    existing = JSAsset(
+        url="https://cdn.example.net/a/app.js",
+        provenance=[AssetProvenance(url="https://app.example.com/a/app.js")],
+    )
+    incoming = JSAsset(
+        url="https://cdn.example.net/b/app.js",
+        provenance=[AssetProvenance(url="https://app.example.com/b/app.js")],
+    )
+
+    orchestrator._merge_asset_provenance(existing, incoming)
+
+    assert existing.url == "https://cdn.example.net/a/app.js"
+    assert {item.url for item in existing.provenance} == {
+        "https://app.example.com/a/app.js",
+        "https://app.example.com/b/app.js",
+        "https://cdn.example.net/a/app.js",
+        "https://cdn.example.net/b/app.js",
+    }
 
 
 @pytest.mark.asyncio
@@ -1861,6 +2203,57 @@ async def test_stage_download_skips_completed_urls(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_stage_download_does_not_mark_transient_failures_complete(monkeypatch):
+    """A transient (5xx/network) download failure must NOT be marked complete, so --resume retries
+    it instead of permanently dropping the asset and its findings. Success and permanent skips
+    (SSRF/too-large -> None) ARE marked complete."""
+    import httpx
+    orchestrator = Orchestrator(Config(crawler=CrawlerConfig(max_retries=2, retry_delay=0)))
+    orchestrator._seed_urls = ["https://example.com"]
+
+    async def _fake_download(ref):
+        if "transient" in ref.url:
+            req = httpx.Request("GET", ref.url)
+            raise httpx.HTTPStatusError("503", request=req, response=httpx.Response(503, request=req))
+        if "permanent" in ref.url:
+            return None  # e.g. SSRF-blocked / file-too-large
+        asset = JSAsset(url=ref.url, content=b"x", content_hash="")
+        asset.compute_hash()
+        return asset
+
+    seen_state: dict = {}
+
+    async def _fake_checkpoint(stage, seed_urls, js_refs=None, assets=None, findings=None, stage_state=None):
+        seen_state.update(stage_state or {})
+
+    async def _noop(*a, **k):
+        return None
+
+    monkeypatch.setattr(orchestrator, "_download_js", _fake_download)
+    monkeypatch.setattr(orchestrator, "_persist_asset", _noop)
+    monkeypatch.setattr(orchestrator, "_store_checkpoint", _fake_checkpoint)
+    acquired: list[str] = []
+
+    async def _acquire(url: str) -> None:
+        acquired.append(url)
+
+    monkeypatch.setattr(orchestrator.rate_limiter, "acquire", _acquire)
+
+    refs = [
+        JSReference(url="https://example.com/ok.js"),
+        JSReference(url="https://example.com/transient.js"),
+        JSReference(url="https://example.com/permanent.js"),
+    ]
+    await orchestrator._stage_download(refs, existing_assets=[], completed_urls=set())
+
+    completed = set(seen_state.get("download_complete_urls", []))
+    assert "https://example.com/ok.js" in completed                # success -> done
+    assert "https://example.com/permanent.js" in completed         # permanent skip -> done
+    assert "https://example.com/transient.js" not in completed     # transient -> RETRY on resume
+    assert acquired.count("https://example.com/transient.js") == 3
+
+
+@pytest.mark.asyncio
 async def test_stage_normalize_skips_completed_assets(monkeypatch):
     """Partial normalize resume should skip assets already normalized."""
     config = Config()
@@ -2080,3 +2473,71 @@ async def test_stage_download_propagates_cancelled_error(monkeypatch):
     with pytest.raises(asyncio.CancelledError):
         await orchestrator._stage_download(refs)
 
+
+
+# ---------------------------------------------------------------- DQ-C06: transient phase outcome
+
+class TransientFailStaticCollector(_FakeCollector):
+    """Static collector that swallows a transient 503 (yields nothing) and records it, like the
+    real collectors now do."""
+    instances: list[str] = []
+
+    async def collect(self, url, scope):
+        self.retryable_failures = [
+            {"url": url, "reason": "HTTP 503", "status": 503, "phase": "static"}
+        ]
+        if False:  # pragma: no cover - keep this an async generator
+            yield None
+
+
+@pytest.mark.asyncio
+async def test_crawl_does_not_mark_transient_phase_complete(monkeypatch):
+    """DQ-C06: a transient (503) failure in a crawl phase must NOT be checkpointed as complete
+    (so --resume re-runs it) and the lost coverage must be surfaced in report warnings."""
+    config = Config(crawler=CrawlerConfig(max_depth=0, use_headless=False))
+    orchestrator = Orchestrator(config)
+    TransientFailStaticCollector.instances.clear()
+
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe",
+                        lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.StaticCollector", TransientFailStaticCollector)
+    monkeypatch.setattr("bundleInspector.core.orchestrator.ManifestCollector", _FakeCollector)
+
+    completed_phases: list[str] = []
+
+    async def on_phase_complete(phase, refs, completed):
+        completed_phases.append(phase)
+
+    await orchestrator._crawl_url("https://example.com", on_phase_complete=on_phase_complete)
+
+    # the transient static phase is NOT marked complete -> resume re-runs it
+    assert "static" not in completed_phases
+    # a phase that finished cleanly still completes
+    assert "manifest" in completed_phases
+    # lost coverage is surfaced (not a silent 0)
+    assert any("static" in w and "503" in w for w in orchestrator._crawl_warnings)
+    # the failed phase is tracked so _stage_crawl keeps the seed PARTIAL (resume re-runs only it)
+    assert "static" in orchestrator._incomplete_crawl_phases.get("https://example.com", set())
+
+
+@pytest.mark.asyncio
+async def test_crawl_marks_empty_but_ok_phase_complete(monkeypatch):
+    """Guard against over-correction: a collector that legitimately yields 0 refs WITHOUT a
+    transient failure must still checkpoint the phase as complete."""
+    config = Config(crawler=CrawlerConfig(max_depth=0, use_headless=False))
+    orchestrator = Orchestrator(config)
+
+    monkeypatch.setattr("bundleInspector.core.orchestrator.is_url_safe",
+                        lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"))
+    monkeypatch.setattr("bundleInspector.core.orchestrator.StaticCollector", _FakeCollector)
+    monkeypatch.setattr("bundleInspector.core.orchestrator.ManifestCollector", _FakeCollector)
+
+    completed_phases: list[str] = []
+
+    async def on_phase_complete(phase, refs, completed):
+        completed_phases.append(phase)
+
+    await orchestrator._crawl_url("https://example.com", on_phase_complete=on_phase_complete)
+
+    assert "static" in completed_phases
+    assert not orchestrator._crawl_warnings

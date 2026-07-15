@@ -13,17 +13,37 @@ same Orchestrator.analyze_asset_standalone logic, so findings are byte-identical
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any, TypeAlias
 
 from bundleInspector.config import Config
 from bundleInspector.core.asset_analyzer import AssetAnalyzer
 from bundleInspector.core.dedup import DedupCache
+from bundleInspector.normalizer.line_mapping import LineMapper
+from bundleInspector.normalizer.sourcemap import SourceMapInfo
 from bundleInspector.parser.ir_builder import IRBuilder
 from bundleInspector.parser.js_parser import JSParser
 from bundleInspector.rules.engine import RuleEngine
+from bundleInspector.storage.models import Finding, JSAsset
 
 # Per-worker-process analyzer, built once by the pool initializer.
-_ANALYZER: Optional[Any] = None
+_ANALYZER: AssetAnalyzer | None = None
+
+WorkerPayload: TypeAlias = tuple[
+    int,
+    JSAsset,
+    LineMapper | None,
+    SourceMapInfo | None,
+    Config,
+]
+LegacyWorkerResult: TypeAlias = tuple[int, bool, list[str], str | None, list[Finding]]
+TelemetryWorkerResult: TypeAlias = tuple[
+    int,
+    bool,
+    list[str],
+    str | None,
+    list[Finding],
+    list[dict[str, Any]],
+]
 
 
 def _build_analyzer(config: Config) -> AssetAnalyzer:
@@ -32,8 +52,8 @@ def _build_analyzer(config: Config) -> AssetAnalyzer:
     Imports only the analysis stack (parser/IR/rules) -- deliberately NOT the Orchestrator,
     so a spawned worker never re-imports the collector (playwright) / httpx stack it will
     never use. Findings stay byte-identical to the serial path (same AssetAnalyzer code)."""
-    parser = JSParser(tolerant=config.parser.tolerant)
-    ir_builder = IRBuilder()
+    parser = JSParser.from_parser_config(config.parser, temp_dir=config.temp_dir)
+    ir_builder = IRBuilder.from_parser_config(config.parser)
     rule_engine = RuleEngine(config.rules)
     rule_engine.register_defaults()
     return AssetAnalyzer(parser, ir_builder, rule_engine, DedupCache())
@@ -45,15 +65,39 @@ def init_worker(config: Config) -> None:
     _ANALYZER = _build_analyzer(config)
 
 
-def analyze_asset_task(payload):
+def _analyze_asset_task_with_telemetry(payload: WorkerPayload) -> TelemetryWorkerResult:
     """Worker task.
 
     payload = (index, asset, line_mapper, sourcemap, config)
-    returns = (index, parse_success, parse_errors, ast_hash, findings)
+    returns = (index, parse_success, parse_errors, ast_hash, findings, incomplete_events)
     """
     global _ANALYZER
     index, asset, line_mapper, sourcemap, config = payload
     if _ANALYZER is None:  # defensive: build if the initializer did not run
         _ANALYZER = _build_analyzer(config)
-    findings = _ANALYZER.analyze_asset_standalone(asset, line_mapper, sourcemap)
-    return index, asset.parse_success, asset.parse_errors, asset.ast_hash, findings
+    incomplete_events: list[dict[str, Any]] = []
+    findings = _ANALYZER.analyze_asset_standalone(
+        asset,
+        line_mapper,
+        sourcemap,
+        incomplete_events,
+    )
+    return (
+        index,
+        asset.parse_success,
+        asset.parse_errors,
+        asset.ast_hash,
+        findings,
+        incomplete_events,
+    )
+
+
+def analyze_asset_task(payload: WorkerPayload) -> LegacyWorkerResult:
+    """Compatibility worker contract returning the historical five-tuple."""
+    result = _analyze_asset_task_with_telemetry(payload)
+    return result[:5]
+
+
+def analyze_asset_task_with_telemetry(payload: WorkerPayload) -> TelemetryWorkerResult:
+    """Worker contract including structured partial-analysis telemetry."""
+    return _analyze_asset_task_with_telemetry(payload)

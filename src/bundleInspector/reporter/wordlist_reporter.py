@@ -9,10 +9,10 @@ from __future__ import annotations
 
 import re
 from urllib.parse import parse_qs
-from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 from bundleInspector.reporter.base import BaseReporter
-from bundleInspector.storage.models import Category, Finding, Report
+from bundleInspector.storage.models import Category, Report
 
 
 class WordlistReporter(BaseReporter):
@@ -76,7 +76,7 @@ class WordlistReporter(BaseReporter):
                 if path and path != "/":
                     # Replace template variables with FUZZ
                     if "${" in path:
-                        path = re.sub(r'\$\{[^}]*\}', 'FUZZ', path)
+                        path = re.sub(r'\$\{[^}]{0,1024}\}', 'FUZZ', path)
                     endpoints.append(path)
                 # Also add with query string if present
                 if parsed.query:
@@ -84,7 +84,7 @@ class WordlistReporter(BaseReporter):
                     endpoints.append(f"{query_path}?{parsed.query}")
             elif value.startswith("/"):
                 if "${" in value:
-                    value = re.sub(r'\$\{[^}]*\}', 'FUZZ', value)
+                    value = re.sub(r'\$\{[^}]{0,1024}\}', 'FUZZ', value)
                 # Add path-only entry if query string present
                 if "?" in value:
                     path_only = value.split("?", 1)[0]
@@ -93,7 +93,7 @@ class WordlistReporter(BaseReporter):
                 endpoints.append(value)
             elif "${" in value:
                 # Template literal: /api/v1/${id} ??/api/v1/FUZZ
-                cleaned = re.sub(r'\$\{[^}]*\}', 'FUZZ', value)
+                cleaned = re.sub(r'\$\{[^}]{0,1024}\}', 'FUZZ', value)
                 if cleaned.startswith("/"):
                     endpoints.append(cleaned)
 
@@ -152,7 +152,7 @@ class WordlistReporter(BaseReporter):
 
     def _extract_params(self, report: Report) -> list[str]:
         """Extract query parameter names and header names."""
-        params = set()
+        params: set[str] = set()
 
         for finding in report.findings:
             if finding.category != Category.ENDPOINT:
@@ -216,12 +216,17 @@ class WordlistReporter(BaseReporter):
             if finding.category == Category.ENDPOINT:
                 if value.startswith(("http://", "https://", "//")):
                     parsed = urlparse(value)
-                    if parsed.netloc:
-                        # Add full domain
-                        domains.add(parsed.netloc)
-                        # Add without port
-                        host = parsed.netloc.split(":")[0]
+                    # Use hostname (not netloc): netloc includes userinfo (user:pass@host), so a
+                    # credentialed URL would emit the password into the wordlist, and
+                    # netloc.split(':')[0] would return the USERNAME rather than the host.
+                    host = parsed.hostname
+                    if host:
                         domains.add(host)
+                        try:
+                            if parsed.port:
+                                domains.add(f"{host}:{parsed.port}")
+                        except ValueError:
+                            pass
 
             # From metadata
             meta = finding.metadata or {}
@@ -275,7 +280,9 @@ class WordlistReporter(BaseReporter):
         """Extract domain from various formats."""
         if value.startswith(("http://", "https://", "//")):
             parsed = urlparse(value)
-            return parsed.netloc.split(":")[0]
+            # hostname excludes userinfo (user:pass@) and port -- netloc.split(':')[0] would leak
+            # the username for a credentialed URL.
+            return parsed.hostname or ""
 
         # Check if it looks like a domain
         if re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9-]*\.)+[a-zA-Z]{2,}$', value):
@@ -301,4 +308,3 @@ def generate_wordlists(report: Report) -> dict[str, str]:
             wordlists[mode] = content
 
     return wordlists
-

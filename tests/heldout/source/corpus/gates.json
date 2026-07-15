@@ -1,0 +1,175 @@
+{
+  "gates": [
+    {
+      "hard_zero_fn": true,
+      "key": "secret/aws_access_key",
+      "min_negative_cases": 2,
+      "min_negatives": 600,
+      "min_positive_cases": 2,
+      "min_positives": 150,
+      "name": "known provider secret",
+      "precision": 0.99,
+      "recall": 1.0
+    },
+    {
+      "key": "secret/potential_secret",
+      "min_negative_cases": 2,
+      "min_negatives": 600,
+      "min_positive_cases": 2,
+      "min_positives": 126,
+      "name": "generic secret precision",
+      "precision": 0.95
+    },
+    {
+      "key": "endpoint",
+      "min_negative_cases": 3,
+      "min_negatives": 600,
+      "min_positive_cases": 6,
+      "min_positives": 100,
+      "name": "HTTP endpoint",
+      "precision": 0.97,
+      "recall": 0.95
+    },
+    {
+      "f1": 0.95,
+      "key": "endpoint/api_endpoint",
+      "min_negative_cases": 1,
+      "min_negatives": 500,
+      "min_positive_cases": 3,
+      "min_positives": 125,
+      "name": "request contract"
+    },
+    {
+      "f1": 0.99,
+      "key": "contract/method",
+      "min_positive_cases": 3,
+      "min_positives": 125,
+      "name": "request method accuracy"
+    },
+    {
+      "f1": 0.95,
+      "key": "contract/headers",
+      "min_positive_cases": 2,
+      "min_positives": 125,
+      "name": "request header accuracy"
+    },
+    {
+      "f1": 0.95,
+      "key": "contract/auth",
+      "min_positive_cases": 2,
+      "min_positives": 125,
+      "name": "request auth accuracy"
+    },
+    {
+      "f1": 0.95,
+      "key": "contract/query_params",
+      "min_positive_cases": 2,
+      "min_positives": 125,
+      "name": "request query accuracy"
+    },
+    {
+      "f1": 0.95,
+      "key": "contract/body",
+      "min_positive_cases": 2,
+      "min_positives": 125,
+      "name": "request body accuracy"
+    },
+    {
+      "key": "endpoint/client_route",
+      "min_negative_cases": 3,
+      "min_negatives": 600,
+      "min_positive_cases": 2,
+      "min_positives": 150,
+      "name": "client route",
+      "precision": 0.95,
+      "recall": 0.93
+    },
+    {
+      "hard_zero_fp": true,
+      "key": "sink/taint_flow@confirmed",
+      "min_negative_cases": 5,
+      "min_negatives": 504,
+      "min_positive_cases": 3,
+      "min_positives": 127,
+      "name": "confirmed flow",
+      "precision": 0.99,
+      "recall": 0.9
+    },
+    {
+      "f1": 0.9,
+      "key": "sink/taint_flow@probable",
+      "min_negative_cases": 5,
+      "min_negatives": 504,
+      "min_positive_cases": 2,
+      "min_positives": 126,
+      "name": "probable flow"
+    },
+    {
+      "key": "sink/dom_html_sink",
+      "min_negative_cases": 2,
+      "min_negatives": 600,
+      "min_positive_cases": 10,
+      "min_positives": 757,
+      "name": "DOM HTML sink",
+      "precision": 0.97,
+      "recall": 0.95
+    },
+    {
+      "f1": 0.99,
+      "key": "location",
+      "min_positive_cases": 11,
+      "min_positives": 1900,
+      "name": "evidence location"
+    },
+    {
+      "key": "domain",
+      "min_negative_cases": 2,
+      "min_negatives": 500,
+      "min_positive_cases": 2,
+      "min_positives": 50,
+      "name": "domain family",
+      "precision": 0.95,
+      "recall": 0.95
+    },
+    {
+      "key": "flag",
+      "min_negative_cases": 2,
+      "min_negatives": 500,
+      "min_positive_cases": 2,
+      "min_positives": 50,
+      "name": "feature flag family",
+      "precision": 0.95,
+      "recall": 0.95
+    },
+    {
+      "key": "debug",
+      "min_negative_cases": 2,
+      "min_negatives": 500,
+      "min_positive_cases": 2,
+      "min_positives": 50,
+      "name": "debug family",
+      "precision": 0.95,
+      "recall": 0.95
+    },
+    {
+      "key": "upload",
+      "min_negative_cases": 2,
+      "min_negatives": 500,
+      "min_positive_cases": 2,
+      "min_positives": 50,
+      "name": "upload family",
+      "precision": 0.95,
+      "recall": 0.95
+    },
+    {
+      "key": "endpoint/webpack_named_chunk",
+      "min_negative_cases": 2,
+      "min_negatives": 500,
+      "min_positive_cases": 2,
+      "min_positives": 50,
+      "name": "chunk analyzer",
+      "precision": 0.95,
+      "recall": 0.95
+    }
+  ]
+}

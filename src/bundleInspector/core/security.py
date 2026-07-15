@@ -8,10 +8,8 @@ from __future__ import annotations
 
 import ipaddress
 import os
-import re
 import socket
 from pathlib import Path
-from typing import Optional
 from urllib.parse import urlparse
 
 import structlog
@@ -96,20 +94,34 @@ def is_ip_blocked(ip_str: str, allow_private_ips: bool = False) -> bool:
     Returns:
         True if blocked, False if allowed
     """
+    ip = _parse_ip_literal(ip_str)
+    if ip is None:
+        return False
+    if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
+        ip = ip.ipv4_mapped
+    for network in BLOCKED_NETWORKS:
+        if ip in network:
+            # Networks are disjoint, so a private-range match cannot also be a
+            # loopback/metadata match -- skipping it here safely allows only private IPs.
+            if allow_private_ips and network in PRIVATE_NETWORKS:
+                continue
+            return True
+    return False
+
+
+def _parse_ip_literal(ip_str: str) -> object | None:
+    """Parse an IP literal, tolerating the alternate numeric encodings (decimal 2130706433, hex
+    0x7f000001, octal 0177.0.0.1, short forms) that inet_aton-based HTTP clients dial but
+    ipaddress.ip_address REJECTS -- so a loopback/metadata literal in a non-canonical encoding is
+    still classified as an IP (hence blockable) even without DNS. Returns None for a real hostname."""
     try:
-        ip = ipaddress.ip_address(ip_str)
-        if isinstance(ip, ipaddress.IPv6Address) and ip.ipv4_mapped:
-            ip = ip.ipv4_mapped
-        for network in BLOCKED_NETWORKS:
-            if ip in network:
-                # Networks are disjoint, so a private-range match cannot also be a
-                # loopback/metadata match -- skipping it here safely allows only private IPs.
-                if allow_private_ips and network in PRIVATE_NETWORKS:
-                    continue
-                return True
-        return False
+        return ipaddress.ip_address(ip_str)
     except ValueError:
-        return False
+        pass
+    try:
+        return ipaddress.IPv4Address(socket.inet_aton(ip_str))
+    except (OSError, ValueError):
+        return None
 
 
 def is_host_blocked(hostname: str, allow_private_ips: bool = False) -> bool:
@@ -173,8 +185,8 @@ def resolve_and_validate_host(hostname: str, allow_private_ips: bool = False) ->
         if not results:
             return False
 
-        for family, socktype, proto, canonname, sockaddr in results:
-            ip_str = sockaddr[0]
+        for _family, _socktype, _proto, _canonname, sockaddr in results:
+            ip_str = str(sockaddr[0])
             if is_ip_blocked(ip_str, allow_private_ips):
                 logger.warning(
                     "ssrf_blocked_resolved_ip",
@@ -259,7 +271,7 @@ def ssrf_block_hint(reason: str) -> str:
     return "verify the target is authorized and reachable"
 
 
-def sanitize_url(url: str) -> Optional[str]:
+def sanitize_url(url: str) -> str | None:
     """
     Sanitize and validate a URL.
 
@@ -304,14 +316,21 @@ def is_path_safe(
     try:
         # Resolve to absolute path
         if allow_symlinks:
-            resolved = path.absolute()
+            # Collapse '..'/'.' LEXICALLY (without following symlinks) -- path.absolute() alone
+            # PRESERVES '..', and is_relative_to compares parts positionally, so a traversal like
+            # `base/../../etc/passwd` would read as "inside base". normpath closes that hole while
+            # still not resolving symlinks (the point of allow_symlinks).
+            resolved = Path(os.path.normpath(str(path.absolute())))
         else:
             resolved = path.resolve()  # Resolves symlinks
 
         # Check if resolved path is within any allowed base
         for base in allowed_bases:
             try:
-                base_resolved = base.resolve() if not allow_symlinks else base.absolute()
+                base_resolved = (
+                    base.resolve() if not allow_symlinks
+                    else Path(os.path.normpath(str(base.absolute())))
+                )
 
                 # Normalize case/separators so containment holds on Windows, where
                 # paths are case-insensitive and .absolute() does not canonicalize
@@ -336,7 +355,7 @@ def sanitize_path(
     path: str | Path,
     allowed_bases: list[Path],
     allow_symlinks: bool = False,
-) -> Optional[Path]:
+) -> Path | None:
     """
     Sanitize and validate a file path.
 
@@ -427,9 +446,19 @@ def mask_sensitive_value(
         return ""
 
     length = len(value)
+    visible_start = max(0, visible_start)
+    visible_end = max(0, visible_end)
 
     if length <= visible_start + visible_end:
         return mask_char * length
+
+    # Never reveal more than a quarter of the characters per side: with a fixed 4+4 window a value
+    # just over the threshold (e.g. 9 chars) would otherwise expose almost the whole secret
+    # ('hunter2!!' -> 'hunt*r2!!', 8 of 9). Clamping keeps masking dominant for short values while
+    # long secrets (>=16 chars) still show the full first/last window.
+    cap = length // 4
+    visible_start = min(visible_start, cap)
+    visible_end = min(visible_end, cap)
 
     masked_length = length - visible_start - visible_end
     end_part = value[-visible_end:] if visible_end > 0 else ""
@@ -438,4 +467,3 @@ def mask_sensitive_value(
         mask_char * masked_length +
         end_part
     )
-

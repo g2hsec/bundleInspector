@@ -9,38 +9,39 @@ import functools
 import hashlib
 import json
 import logging
-import re
 import sys
-from time import perf_counter
 from pathlib import Path
-from typing import Optional
+from time import perf_counter
+from typing import Any, cast
 
 import click
 import structlog
 from click.core import ParameterSource
-from rich.console import Console
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
-from rich.table import Table
-from rich.panel import Panel
-from rich.markup import escape
 from rich import box
+from rich.console import Console
+from rich.markup import escape
+from rich.panel import Panel
+from rich.progress import BarColumn, Progress, SpinnerColumn, TextColumn, TimeElapsedColumn
+from rich.table import Table
 
 from bundleInspector import __version__
+from bundleInspector.collector.local import LocalCollector
 from bundleInspector.config import (
     Config,
-    ScopeConfig,
-    AuthConfig,
     CrawlerConfig,
-    OutputConfig,
-    OutputFormat,
     LogLevel,
+    OutputFormat,
 )
-from bundleInspector.core.orchestrator import BundleInspector
 from bundleInspector.core.asset_analysis import _build_analyzer
+from bundleInspector.core.asset_analyzer import _virtual_event_summary
+from bundleInspector.core.download_surface import (
+    annotate_download_surfaces,
+    download_surfaces,
+    risk_label,
+)
 from bundleInspector.core.fp_annotate import annotate_false_positives
-from bundleInspector.core.download_surface import annotate_download_surfaces, download_surfaces, risk_label
-from bundleInspector.core.progress import PipelineStage
-from bundleInspector.core.text_decode import decode_js_bytes
+from bundleInspector.core.orchestrator import BundleInspector
+from bundleInspector.core.progress import PipelineStage, StageProgress
 from bundleInspector.core.resume_policy import (
     build_local_resume_signature,
     build_stage_state_with_resume_signature,
@@ -48,12 +49,19 @@ from bundleInspector.core.resume_policy import (
     embed_report_resume_signature,
     report_matches_resume_signature,
 )
-from bundleInspector.reporter.json_reporter import JSONReporter
+from bundleInspector.core.text_decode import decode_js_bytes
+from bundleInspector.reporter.base import BaseReporter
 from bundleInspector.reporter.html_reporter import HTMLReporter
+from bundleInspector.reporter.json_reporter import JSONReporter
 from bundleInspector.reporter.sarif_reporter import SARIFReporter
-from bundleInspector.storage.models import RiskTier, Severity
-from bundleInspector.collector.local import LocalCollector, is_local_path
-
+from bundleInspector.storage.atomic import AtomicCommitError, UnsafePathError, atomic_publish_text
+from bundleInspector.storage.job_repository import JobAccessError, JobRepository
+from bundleInspector.storage.models import (
+    Finding,
+    JSAsset,
+    PipelineCheckpoint,
+    Report,
+)
 
 console = Console()
 logger = structlog.get_logger()
@@ -62,7 +70,7 @@ logger = structlog.get_logger()
 _SEVERITY_ORDER = ["info", "low", "medium", "high", "critical"]
 
 
-def _apply_fail_on_gate(report, fail_on: Optional[str]) -> None:
+def _apply_fail_on_gate(report: Report, fail_on: str | None) -> None:
     """Exit with code 2 if any finding meets or exceeds the --fail-on severity.
 
     Distinct from exit 1 (tool error / interrupt): exit 2 means the scan ran fine and
@@ -88,6 +96,93 @@ def _apply_fail_on_gate(report, fail_on: Optional[str]) -> None:
         sys.exit(2)
 
 
+# DQ-O04: risk-tier ordering, most severe (P0) to least (P3), for the output.min_risk_tier filter.
+_RISK_TIER_ORDER = ["P0", "P1", "P2", "P3"]
+
+
+def _apply_output_filters(report: Report, config: Config) -> Report:
+    """Return a report for RENDERING with findings dropped below output.min_severity / more lenient
+    than output.min_risk_tier (DQ-O04: these thresholds were declared but never applied). A finding
+    is kept only if it meets BOTH minimums; a finding with no risk_tier bypasses the tier filter.
+    Defaults (info / P3) are the most permissive, so the default run renders the same report.
+
+    IMPORTANT: this does NOT mutate the input report. Output verbosity must not silently weaken the
+    --fail-on CI gate (or the wordlist / api-map), which continue to see EVERY detected finding; only
+    the rendered report file is filtered. Returns the original report when fully permissive."""
+    out = getattr(config, "output", None)
+    if out is None:
+        return report
+    min_sev = str(getattr(out, "min_severity", "info") or "info").lower()
+    min_tier = str(getattr(out, "min_risk_tier", "P3") or "P3").upper()
+    sev_floor = _SEVERITY_ORDER.index(min_sev) if min_sev in _SEVERITY_ORDER else 0
+    tier_ceiling = (
+        _RISK_TIER_ORDER.index(min_tier) if min_tier in _RISK_TIER_ORDER else len(_RISK_TIER_ORDER) - 1
+    )
+    kept = []
+    for f in (report.findings or []):
+        sev = f.severity.value.lower() if f.severity else "info"
+        if sev not in _SEVERITY_ORDER or _SEVERITY_ORDER.index(sev) < sev_floor:
+            continue
+        risk_tier = f.risk_tier
+        tier = risk_tier.value if risk_tier is not None else None
+        if tier in _RISK_TIER_ORDER and _RISK_TIER_ORDER.index(tier) > tier_ceiling:
+            continue
+        kept.append(f)
+    content_transform = (
+        not out.include_snippets
+        or out.snippet_context_lines != 3
+        or not out.include_ast
+    )
+    fully_permissive = sev_floor == 0 and tier_ceiling == len(_RISK_TIER_ORDER) - 1
+    if fully_permissive and not content_transform:
+        return report
+
+    rendered = report.model_copy(deep=True)
+    rendered.findings = [finding.model_copy(deep=True) for finding in kept]
+
+    def crop_snippet(text: str, bounds: tuple[int, int], line: int, context: int) -> tuple[str, tuple[int, int]]:
+        if not text:
+            return "", bounds
+        lines = text.splitlines()
+        first = bounds[0] if bounds and bounds[0] > 0 else max(1, line - (len(lines) // 2))
+        start = max(first, line - context)
+        end = min(first + len(lines) - 1, line + context)
+        return "\n".join(lines[start - first:end - first + 1]), (start, end)
+
+    for finding in rendered.findings:
+        if not out.include_snippets:
+            finding.evidence.snippet = ""
+            finding.evidence.snippet_lines = (0, 0)
+            for key in ("matched_text", "original_snippet", "original_snippet_lines"):
+                finding.metadata.pop(key, None)
+        else:
+            snippet, bounds = crop_snippet(
+                finding.evidence.snippet,
+                finding.evidence.snippet_lines,
+                finding.evidence.line,
+                out.snippet_context_lines,
+            )
+            finding.evidence.snippet = snippet
+            finding.evidence.snippet_lines = bounds
+            original = finding.metadata.get("original_snippet")
+            original_bounds = finding.metadata.get("original_snippet_lines")
+            if isinstance(original, str) and isinstance(original_bounds, (list, tuple)):
+                original_line = finding.evidence.original_line or finding.evidence.line
+                cropped, cropped_bounds = crop_snippet(
+                    original,
+                    (int(original_bounds[0]), int(original_bounds[1])),
+                    original_line,
+                    out.snippet_context_lines,
+                )
+                finding.metadata["original_snippet"] = cropped
+                finding.metadata["original_snippet_lines"] = list(cropped_bounds)
+        if not out.include_ast:
+            finding.evidence.ast_node_type = ""
+            finding.metadata.pop("ast_path", None)
+    rendered.compute_summary()
+    return rendered
+
+
 STAGE_LABELS = {
     PipelineStage.CRAWL: "Crawl",
     PipelineStage.DOWNLOAD: "Download",
@@ -100,7 +195,7 @@ STAGE_LABELS = {
 }
 
 
-def print_banner():
+def print_banner() -> None:
     """Print the banner."""
     banner = r"""
  ____                  _ _      ___                           __                 _
@@ -166,7 +261,7 @@ def _print_runtime_context(
     target_count: int,
     config: Config,
     debug: bool,
-    extra_fields: Optional[dict[str, str]] = None,
+    extra_fields: dict[str, str] | None = None,
 ) -> None:
     """Print a concise runtime header and optional debug details."""
     summary_bits = [f"[bold cyan]{mode}[/bold cyan]", f"targets={target_count}"]
@@ -249,27 +344,27 @@ def _silence_proactor_shutdown_noise() -> None:
     if sys.platform != "win32":
         return
     try:
-        from asyncio.proactor_events import _ProactorBasePipeTransport
         from asyncio.base_subprocess import BaseSubprocessTransport
+        from asyncio.proactor_events import _ProactorBasePipeTransport
     except Exception:
         return
 
     _benign = ("Event loop is closed", "I/O operation on closed pipe")
 
-    def _wrap(cls) -> None:
+    def _wrap(cls: type[Any]) -> None:
         original = getattr(cls, "__del__", None)
         if original is None or getattr(original, "_bi_silenced", False):
             return
 
         @functools.wraps(original)
-        def _quiet_del(self, *args, **kwargs):
+        def _quiet_del(self: Any, *args: Any, **kwargs: Any) -> None:
             try:
                 original(self, *args, **kwargs)
             except (RuntimeError, ValueError) as exc:
                 if str(exc) not in _benign:
                     raise
 
-        _quiet_del._bi_silenced = True
+        cast(Any, _quiet_del)._bi_silenced = True
         cls.__del__ = _quiet_del
 
     _wrap(_ProactorBasePipeTransport)
@@ -278,7 +373,7 @@ def _silence_proactor_shutdown_noise() -> None:
 
 @click.group()
 @click.version_option(version=__version__)
-def main():
+def main() -> None:
     """BundleInspector - JavaScript Security Analysis Tool.
 
     Analyze JavaScript files to find hidden APIs, secrets,
@@ -441,35 +536,35 @@ def main():
 def scan(
     ctx: click.Context,
     urls: tuple[str],
-    config_file: Optional[str],
+    config_file: str | None,
     scope: tuple[str],
     cookie: tuple[str],
     header: tuple[str],
     depth: int,
     rate_limit: float,
     no_headless: bool,
-    output: Optional[str],
+    output: str | None,
     format: str,
     verbose: bool,
     debug: bool,
     quiet: bool,
     no_banner: bool,
-    wordlist: Optional[str],
+    wordlist: str | None,
     api_map: bool,
-    headers_file: Optional[str],
-    bearer_token: Optional[str],
-    basic_auth: Optional[str],
-    user_agent: Optional[str],
-    cookies_file: Optional[str],
-    cookies_from: Optional[str],
+    headers_file: str | None,
+    bearer_token: str | None,
+    basic_auth: str | None,
+    user_agent: str | None,
+    cookies_file: str | None,
+    cookies_from: str | None,
     resume: bool,
-    job_id: Optional[str],
-    rules_file: Optional[str],
-    fail_on: Optional[str],
+    job_id: str | None,
+    rules_file: str | None,
+    fail_on: str | None,
     allow_private_ips: bool,
     chains: bool,
     first_party_only: bool,
-):
+) -> None:
     """Scan URLs for JavaScript security findings.
 
     Examples:
@@ -551,8 +646,8 @@ def scan(
         _tag_vendor_files(report)
         annotate_false_positives(report)
         annotate_download_surfaces(report)
-        content = reporter.generate(report)
-        output_path.write_text(content, encoding="utf-8")
+        content = reporter.generate(_apply_output_filters(report, config))
+        atomic_publish_text(output_path, content)
 
         if not quiet:
             _print_summary(report, show_chains=chains, first_party_only=first_party_only)
@@ -586,7 +681,7 @@ async def _run_scan(
     *,
     verbose: bool = False,
     debug: bool = False,
-):
+) -> Report:
     """Run the scan with progress display."""
     if quiet:
         finder = BundleInspector(config)
@@ -648,7 +743,7 @@ async def _run_scan(
                 return f"{count_detail} | {runtime_detail}"
             return count_detail
 
-        def on_stage_start(stage: PipelineStage):
+        def on_stage_start(stage: PipelineStage) -> None:
             label = _stage_label(stage)
             stage_started_at[stage] = perf_counter()
             stage_runtime_detail[stage] = "starting"
@@ -657,7 +752,7 @@ async def _run_scan(
             if verbose or debug:
                 _emit(f"[cyan]→ {label}[/cyan]")
 
-        def on_stage_complete(stage: PipelineStage, stage_progress):
+        def on_stage_complete(stage: PipelineStage, stage_progress: StageProgress) -> None:
             label = _stage_label(stage)
             duration = perf_counter() - stage_started_at.get(stage, perf_counter())
             completed = stage_progress.completed + stage_progress.failed
@@ -679,7 +774,7 @@ async def _run_scan(
             elif verbose:
                 _emit(f"[green]✓ {label}[/green] {detail}")
 
-        def on_progress(stage: PipelineStage, completed: int, total: int):
+        def on_progress(stage: PipelineStage, completed: int, total: int) -> None:
             stage_counts[stage] = (completed, total)
             base = 0
             for ordered_stage in stage_order:
@@ -696,7 +791,7 @@ async def _run_scan(
                 detail=_compose_detail(stage, default=detail),
             )
 
-        def on_stage_detail(stage: PipelineStage, detail: str):
+        def on_stage_detail(stage: PipelineStage, detail: str) -> None:
             stage_runtime_detail[stage] = detail
             progress.update(
                 task,
@@ -707,7 +802,7 @@ async def _run_scan(
                 last_debug_detail[stage] = detail
                 _emit(f"[dim]{_stage_label(stage)}[/dim] {detail}")
 
-        def on_resume(report) -> None:
+        def on_resume(report: Report) -> None:
             progress.update(
                 task,
                 completed=100,
@@ -747,19 +842,19 @@ def _build_config(
     rate_limit: float,
     headless: bool,
     output_format: str,
-    output_file: Optional[str],
+    output_file: str | None,
     verbose: bool,
     debug: bool,
     quiet: bool,
-    extra_cookies: Optional[dict[str, str]] = None,
-    extra_headers: Optional[dict[str, str]] = None,
-    bearer_token: Optional[str] = None,
-    basic_auth: Optional[str] = None,
-    user_agent: Optional[str] = None,
-    base_config: Optional[Config] = None,
+    extra_cookies: dict[str, str] | None = None,
+    extra_headers: dict[str, str] | None = None,
+    bearer_token: str | None = None,
+    basic_auth: str | None = None,
+    user_agent: str | None = None,
+    base_config: Config | None = None,
     resume: bool = False,
-    job_id: Optional[str] = None,
-    rules_file: Optional[str] = None,
+    job_id: str | None = None,
+    rules_file: str | None = None,
     allow_private_ips: bool = False,
 ) -> Config:
     """Build configuration from CLI options."""
@@ -854,14 +949,14 @@ def _build_local_config(
     recursive: bool,
     include_json: bool,
     output_format: str,
-    output_file: Optional[str],
+    output_file: str | None,
     verbose: bool,
     debug: bool,
     quiet: bool,
-    base_config: Optional[Config] = None,
+    base_config: Config | None = None,
     resume: bool = False,
-    job_id: Optional[str] = None,
-    rules_file: Optional[str] = None,
+    job_id: str | None = None,
+    rules_file: str | None = None,
 ) -> Config:
     """Build local-analysis configuration from CLI options."""
     config = base_config.model_copy(deep=True) if base_config else Config()
@@ -895,7 +990,7 @@ def _param_supplied(ctx: click.Context, name: str) -> bool:
 
 def _resolve_base_flag(
     ctx: click.Context,
-    base_config: Optional[Config],
+    base_config: Config | None,
     name: str,
     value: bool,
 ) -> bool:
@@ -905,14 +1000,14 @@ def _resolve_base_flag(
     return bool(getattr(base_config, name))
 
 
-def _load_cli_config(config_file: Optional[str]) -> Optional[Config]:
+def _load_cli_config(config_file: str | None) -> Config | None:
     """Load a CLI configuration file when provided."""
     if not config_file:
         return None
     return Config.from_file(Path(config_file))
 
 
-def _build_reporter(config: Config):
+def _build_reporter(config: Config) -> BaseReporter:
     """Build a reporter from the effective output configuration."""
     report_format = config.output.format.value
     if report_format == "html":
@@ -928,12 +1023,13 @@ def _build_reporter(config: Config):
     return JSONReporter(
         include_raw=config.output.include_raw_content,
         mask_secrets=config.rules.mask_secrets,
+        secret_visible_chars=config.rules.secret_visible_chars,
     )
 
 
 def _resolve_output_path(
     config: Config,
-    explicit_output: Optional[str],
+    explicit_output: str | None,
     default_basename: str,
 ) -> Path:
     """Resolve the final report output path from CLI/config defaults."""
@@ -950,7 +1046,7 @@ def _resolve_output_path(
     return Path(filename)
 
 
-def _tag_vendor_files(report) -> int:
+def _tag_vendor_files(report: Report) -> int:
     """Tag findings in third-party library files (jquery/swiper/...) with
     metadata['third_party_file']. Non-destructive: labels only; nothing is dropped."""
     try:
@@ -967,11 +1063,15 @@ def _tag_vendor_files(report) -> int:
     return count
 
 
-def _print_summary(report, show_chains: bool = False, first_party_only: bool = False):
+def _print_summary(
+    report: Report,
+    show_chains: bool = False,
+    first_party_only: bool = False,
+) -> None:
     """Print scan summary."""
     console.print()
 
-    def _is_noise(f) -> bool:
+    def _is_noise(f: Finding) -> bool:
         md = f.metadata or {}
         if md.get("confirmed"):
             return False  # a proven source->sink flow is never noise, even in a vendor file
@@ -1104,7 +1204,7 @@ def _print_summary(report, show_chains: bool = False, first_party_only: bool = F
             mark = "●" if confirmed else "[dim]○[/dim]"
             risk = f"{mark} [{clr}]{risk_label(d['primary_risk'])}[/{clr}]" if confirmed \
                 else f"{mark} [dim]{risk_label(d['primary_risk'])}[/dim]"
-            ep = escape((f.extracted_value or "?"))
+            ep = escape(f.extracted_value or "?")
             params = escape(", ".join(p for ps in d.get("params", {}).values() for p in ps) or "—")
             dtable.add_row(risk, ep, params, _HINT.get(d["primary_risk"], ""),
                            style=None if confirmed else "dim")
@@ -1128,7 +1228,7 @@ _SEV_COLOR = {"critical": "red", "high": "yellow", "medium": "cyan", "low": "gre
 _SEV_ABBR = {"critical": "CRIT", "high": "HIGH", "medium": "MED", "low": "LOW", "info": "INFO"}
 
 
-def _finding_row(finding) -> tuple[str, str, str, str]:
+def _finding_row(finding: Finding) -> tuple[str, str, str, str]:
     """Structured, de-duplicated cells for the findings table: (risk, type, finding, location).
 
     Kills the old `title :: value` redundancy (value is shown only when it adds information beyond
@@ -1155,7 +1255,7 @@ def _finding_row(finding) -> tuple[str, str, str, str]:
         if dl.get("certainty") == "confirmed":
             cell += f"  [magenta]▾ download: {escape(risk_label(dl.get('primary_risk', '')))}[/magenta]"
         else:
-            cell += f"  [dim magenta]▾ download? verify[/dim magenta]"
+            cell += "  [dim magenta]▾ download? verify[/dim magenta]"
     if md.get("confirmed"):
         cell = f"[green]✓[/green] {cell}"           # confirmed dataflow -- the crown jewels
     elif md.get("third_party_file"):
@@ -1165,7 +1265,7 @@ def _finding_row(finding) -> tuple[str, str, str, str]:
     return risk, typ, cell, loc
 
 
-def _format_cli_finding_line(finding) -> str:
+def _format_cli_finding_line(finding: Finding) -> str:
     """Render a concise one-line finding summary for terminal output."""
     tier = finding.risk_tier.value if finding.risk_tier else "?"
     sev = finding.severity.value.upper() if finding.severity else "?"
@@ -1300,24 +1400,24 @@ def _format_cli_finding_line(finding) -> str:
 def analyze(
     ctx: click.Context,
     paths: tuple[str],
-    config_file: Optional[str],
+    config_file: str | None,
     recursive: bool,
     include_json: bool,
-    output: Optional[str],
+    output: str | None,
     format: str,
     verbose: bool,
     debug: bool,
     quiet: bool,
     no_banner: bool,
-    wordlist: Optional[str],
+    wordlist: str | None,
     api_map: bool,
     resume: bool,
-    job_id: Optional[str],
-    rules_file: Optional[str],
-    fail_on: Optional[str],
+    job_id: str | None,
+    rules_file: str | None,
+    fail_on: str | None,
     chains: bool,
     first_party_only: bool,
-):
+) -> None:
     """Analyze local JavaScript files (no network traffic).
 
     Supports files, directories, and glob patterns.
@@ -1390,8 +1490,8 @@ def analyze(
         _tag_vendor_files(report)
         annotate_false_positives(report)
         annotate_download_surfaces(report)
-        content = reporter.generate(report)
-        output_path.write_text(content, encoding="utf-8")
+        content = reporter.generate(_apply_output_filters(report, config))
+        atomic_publish_text(output_path, content)
 
         if not quiet:
             _print_summary(report, show_chains=chains, first_party_only=first_party_only)
@@ -1418,6 +1518,29 @@ def analyze(
         sys.exit(1)
 
 
+def _prepare_local_job_storage(
+    cache_dir: Path,
+    job_id: str,
+    *,
+    create: bool,
+) -> tuple[JobRepository, Path | None, bool]:
+    """Validate a local job before constructing any mutating storage object.
+
+    The boolean is true only for repository-owned jobs visible to the `local` MCP principal.
+    Existing ownerless caches retain private legacy compatibility and are never adopted.
+    """
+    repository = JobRepository(cache_dir)
+    job_root, owned = repository.prepare_job(
+        job_id,
+        "local",
+        create=create,
+        allow_legacy=True,
+    )
+    if job_root is not None and not owned:
+        logger.warning("legacy_job_owner_missing", job_id=job_id)
+    return repository, job_root, owned
+
+
 async def _run_local_analysis(
     paths: list[str],
     recursive: bool,
@@ -1425,30 +1548,43 @@ async def _run_local_analysis(
     verbose: bool,
     quiet: bool,
     debug: bool = False,
-    config: Optional[Config] = None,
-):
+    config: Config | None = None,
+) -> Report:
     """Run local file analysis with progress tracking."""
-    from datetime import datetime, timezone
     import uuid
+    from datetime import datetime, timezone
+
+    from bundleInspector.classifier.risk_model import RiskClassifier
+    from bundleInspector.correlator.graph import Correlator
     from bundleInspector.normalizer.beautify import Beautifier, NormalizationLevel
     from bundleInspector.normalizer.line_mapping import LineMapper
-    from bundleInspector.parser.js_parser import JSParser
+    from bundleInspector.normalizer.sourcemap import SourceMapInfo, SourceMapResolver
     from bundleInspector.parser.ir_builder import IRBuilder
+    from bundleInspector.parser.js_parser import JSParser
     from bundleInspector.rules.base import AnalysisContext
-    from bundleInspector.correlator.graph import Correlator
-    from bundleInspector.classifier.risk_model import RiskClassifier
-    from bundleInspector.storage.models import PipelineCheckpoint, Report, ReportSummary
     from bundleInspector.storage.artifact_store import ArtifactStore
     from bundleInspector.storage.finding_store import FindingStore
+    from bundleInspector.storage.models import (
+        AnalysisCompleteness,
+        CompletenessIssue,
+        CompletenessStatus,
+        PipelineCheckpoint,
+        Report,
+        ReportSummary,
+    )
 
     start_time = datetime.now(timezone.utc)
     analysis_config = config or Config()
     analysis_config.ensure_dirs()
     analysis_config.job_id = analysis_config.job_id or str(uuid.uuid4())
+    local_job_id = analysis_config.job_id
+    if local_job_id is None:  # Defensive narrowing for externally supplied Config subclasses.
+        raise ValueError("local analysis job_id is unavailable")
     resume_signature = build_local_resume_signature(
         analysis_config,
         recursive=recursive,
         include_json=include_json,
+        input_paths=list(paths),  # DQ-C05: fold input file content into the signature
     )
 
     if analysis_config.resume and analysis_config.job_id:
@@ -1467,49 +1603,160 @@ async def _run_local_analysis(
 
     artifact_store = None
     finding_store = None
+
+    def _open_local_stores(cache_dir: Path) -> tuple[ArtifactStore, FindingStore]:
+        _, job_root, _ = _prepare_local_job_storage(
+            cache_dir,
+            analysis_config.job_id or "",
+            create=True,
+        )
+        if job_root is None:
+            raise JobAccessError("local job storage is unavailable")
+        return ArtifactStore(job_root / "artifacts"), FindingStore(job_root)
+
     try:
-        job_root = analysis_config.cache_dir / analysis_config.job_id
-        artifact_store = ArtifactStore(job_root / "artifacts")
-        finding_store = FindingStore(job_root)
+        artifact_store, finding_store = _open_local_stores(analysis_config.cache_dir)
+    except (AtomicCommitError, JobAccessError, UnsafePathError, ValueError):
+        raise
     except PermissionError:
         fallback_cache_dir = Path.cwd() / ".bundleInspector" / "cache"
         fallback_cache_dir.mkdir(parents=True, exist_ok=True)
         analysis_config.cache_dir = fallback_cache_dir
         try:
-            job_root = analysis_config.cache_dir / analysis_config.job_id
-            artifact_store = ArtifactStore(job_root / "artifacts")
-            finding_store = FindingStore(job_root)
+            artifact_store, finding_store = _open_local_stores(analysis_config.cache_dir)
+        except (AtomicCommitError, JobAccessError, UnsafePathError, ValueError):
+            raise
         except Exception as e:
             logger.warning("local_storage_init_error", error=str(e))
     except Exception as e:
         logger.warning("local_storage_init_error", error=str(e))
 
     local_stage_order = ["collect", "normalize", "parse", "analyze"]
+    checkpoint_snapshot: PipelineCheckpoint | None = None
+    retry_barriers: set[str] = set()
+    completeness_issues: list[CompletenessIssue] = []
+    rehydrated_issue_keys: set[tuple[str, str, str]] = set()
 
-    async def _store_asset(asset):
+    def _asset_key(asset: JSAsset) -> str:
+        """Stable per-local-source key; content hashes are not unique analysis identities."""
+        return asset.id
+
+    def _add_issue(
+        code: str,
+        stage: str,
+        message: str,
+        *,
+        retryable: bool,
+        affected_count: int = 1,
+        details: dict[str, Any] | None = None,
+    ) -> None:
+        key = (code, stage, message)
+        for issue in completeness_issues:
+            if (issue.code, issue.stage, issue.message) == key:
+                if key in rehydrated_issue_keys:
+                    # A resumed partial stage may observe the same issue again. The checkpoint
+                    # count already includes it, so consume that first replay instead of doubling.
+                    rehydrated_issue_keys.remove(key)
+                    issue.affected_count = max(issue.affected_count, affected_count)
+                    issue.retryable = issue.retryable or retryable
+                    if not issue.details and details:
+                        issue.details = dict(details)
+                    return
+                issue.affected_count += affected_count
+                return
+        completeness_issues.append(CompletenessIssue(
+            code=code,
+            stage=stage,
+            message=message,
+            retryable=retryable,
+            affected_count=affected_count,
+            details=details or {},
+        ))
+
+    def _promote_analysis_events(events: object) -> list[dict[str, Any]]:
+        if not isinstance(events, list):
+            return []
+        normalized = [dict(event) for event in events if isinstance(event, dict)]
+        normalized.sort(
+            key=lambda event: json.dumps(
+                event,
+                sort_keys=True,
+                default=str,
+                separators=(",", ":"),
+            )
+        )
+        for event in normalized:
+            component = str(event.get("component", "rule"))
+            reason = str(event.get("reason", "analysis_cap"))
+            if component == "asset_enrichment":
+                code = "finding_enrichment_failed"
+                message = "Finding source metadata could not be fully enriched"
+            elif component == "intermediate_representation":
+                code = "ir_truncated"
+                message = "Intermediate representation was truncated by an analysis cap"
+            elif component.startswith("custom_rule"):
+                code = "custom_rule_analysis_incomplete"
+                message = f"Rule analysis was incomplete ({component}: {reason})"
+            elif component.startswith("virtual_source"):
+                code = "virtual_source_analysis_incomplete"
+                message = f"Rule analysis was incomplete ({component}: {reason})"
+            else:
+                code = "rule_analysis_incomplete"
+                message = f"Rule analysis was incomplete ({component}: {reason})"
+            _add_issue(
+                code,
+                "analyze",
+                message,
+                retryable=False,
+                details=event,
+            )
+        return normalized
+
+    def _completeness() -> AnalysisCompleteness:
+        return AnalysisCompleteness(
+            status=(CompletenessStatus.PARTIAL if completeness_issues else CompletenessStatus.COMPLETE),
+            issues=list(completeness_issues),
+        )
+
+    def _checkpoint_stage(stage: str) -> str:
+        candidates = [stage, *retry_barriers]
+        return min(candidates, key=local_stage_order.index)
+
+    async def _store_asset(asset: JSAsset) -> None:
         if not artifact_store:
             return
         try:
             await artifact_store.store_js(asset.content, asset.url)
+            if asset.sourcemap_content:
+                asset.sourcemap_hash = await artifact_store.store_sourcemap(
+                    asset.sourcemap_content,
+                    asset.content_hash,
+                )
             await artifact_store.store_asset_meta(asset)
+        except (AtomicCommitError, UnsafePathError):
+            raise
         except Exception as e:
             logger.warning("local_asset_store_error", url=asset.url[:100], error=str(e))
 
-    async def _store_ast(asset, ast):
+    async def _store_ast(asset: JSAsset, ast: dict[str, Any]) -> None:
         if not artifact_store:
             return
         try:
             await artifact_store.store_ast(ast, asset.content_hash)
+        except (AtomicCommitError, UnsafePathError):
+            raise
         except Exception as e:
             logger.warning("local_ast_store_error", url=asset.url[:100], error=str(e))
 
-    async def _store_report(report):
+    async def _store_report(report: Report) -> None:
         if not finding_store:
             return
         try:
             for finding in report.findings:
                 await finding_store.store_finding(finding)
             await finding_store.store_report(report)
+        except (AtomicCommitError, UnsafePathError):
+            raise
         except Exception as e:
             logger.warning("local_report_store_error", report_id=report.id, error=str(e))
 
@@ -1519,79 +1766,175 @@ async def _run_local_analysis(
         except ValueError:
             return False
 
-    async def _load_local_checkpoint():
+    async def _load_local_checkpoint() -> PipelineCheckpoint | None:
+        nonlocal checkpoint_snapshot
         if not analysis_config.resume or not finding_store:
             return None
         try:
             checkpoint = await finding_store.get_checkpoint()
-            if checkpoint_matches_resume_signature(
+            if checkpoint is not None and checkpoint_matches_resume_signature(
                 checkpoint,
+                expected_job_id=local_job_id,
                 seed_urls=paths,
                 expected_signature=resume_signature,
             ):
+                for stored_issue in checkpoint.completeness.issues:
+                    restored = stored_issue.model_copy(deep=True)
+                    key = (restored.code, restored.stage, restored.message)
+                    existing = next(
+                        (
+                            issue
+                            for issue in completeness_issues
+                            if (issue.code, issue.stage, issue.message) == key
+                        ),
+                        None,
+                    )
+                    if existing is None:
+                        completeness_issues.append(restored)
+                    else:
+                        existing.affected_count = max(
+                            existing.affected_count,
+                            restored.affected_count,
+                        )
+                        existing.retryable = existing.retryable or restored.retryable
+                        if not existing.details:
+                            existing.details = dict(restored.details)
+                    rehydrated_issue_keys.add(key)
+                checkpoint_snapshot = checkpoint
                 return checkpoint
             return None
+        except (AtomicCommitError, UnsafePathError):
+            raise
         except Exception as e:
             logger.warning("local_checkpoint_load_error", job_id=analysis_config.job_id, error=str(e))
             return None
 
-    async def _store_local_checkpoint(stage: str, assets=None, findings=None, line_mappers_map=None, stage_state=None):
+    async def _store_local_checkpoint(
+        stage: str,
+        assets: list[JSAsset] | None = None,
+        findings: list[Finding] | None = None,
+        line_mappers_map: dict[str, Any] | None = None,
+        stage_state: dict[str, Any] | None = None,
+    ) -> None:
+        nonlocal checkpoint_snapshot
         if not finding_store:
             return
+        previous = checkpoint_snapshot
+        merged_state = dict(previous.stage_state) if previous else {}
+        merged_state.update(stage_state or {})
+        if assets is not None:
+            merged_state["local_asset_metadata"] = [
+                asset.model_dump(
+                    mode="json",
+                    exclude={"content", "sourcemap_content"},
+                    exclude_computed_fields=True,
+                )
+                for asset in assets
+            ]
         checkpoint = PipelineCheckpoint(
-            job_id=analysis_config.job_id,
+            job_id=analysis_config.job_id or "",
             seed_urls=paths,
-            stage=stage,
-            asset_hashes=[asset.content_hash for asset in assets or [] if asset.content_hash],
+            stage=_checkpoint_stage(stage),
+            asset_hashes=(
+                [asset.content_hash for asset in assets if asset.content_hash]
+                if assets is not None
+                else list(previous.asset_hashes) if previous else []
+            ),
             line_mappers={
                 content_hash: mapper.to_dict()
-                for content_hash, mapper in (line_mappers_map or {}).items()
-            },
-            findings=findings or [],
+                for content_hash, mapper in line_mappers_map.items()
+            } if line_mappers_map is not None else dict(previous.line_mappers) if previous else {},
+            findings=(list(findings) if findings is not None else list(previous.findings) if previous else []),
             stage_state=build_stage_state_with_resume_signature(
-                stage_state,
+                merged_state,
                 resume_signature,
             ),
+            completeness=_completeness(),
         )
         try:
             await finding_store.store_checkpoint(checkpoint)
+            checkpoint_snapshot = checkpoint
+        except (AtomicCommitError, UnsafePathError):
+            raise
         except Exception as e:
             logger.warning("local_checkpoint_store_error", stage=stage, error=str(e))
 
-    async def _restore_assets_from_checkpoint(checkpoint):
-        restored_assets = []
+    async def _restore_assets_from_checkpoint(
+        checkpoint: PipelineCheckpoint,
+    ) -> list[JSAsset] | None:
+        restored_assets: list[JSAsset] = []
         if not artifact_store:
-            return restored_assets
-        for content_hash in checkpoint.asset_hashes:
-            asset = await artifact_store.get_asset_meta(content_hash)
+            return None
+        metadata = checkpoint.stage_state.get("local_asset_metadata")
+        candidates: list[JSAsset | None]
+        if isinstance(metadata, list):
+            if (
+                len(metadata) != len(checkpoint.asset_hashes)
+                or any(not isinstance(item, dict) for item in metadata)
+            ):
+                return None
+            try:
+                candidates = [JSAsset.model_validate(item) for item in metadata]
+            except (TypeError, ValueError):
+                return None
+        else:
+            # Compatibility with checkpoints written earlier in the same schema generation.
+            try:
+                candidates = [
+                    await artifact_store.get_asset_meta(content_hash)
+                    for content_hash in checkpoint.asset_hashes
+                ]
+            except (AtomicCommitError, UnsafePathError):
+                raise
+            except Exception:
+                return None
+        for asset in candidates:
             if not asset:
-                continue
+                return None
             # Restore the NORMALIZED (beautified) content, matching the stored AST/line maps;
             # restoring the raw download would run analyze against mismatched source (wrong
             # evidence positions / dropped findings on --resume).
-            content = None
-            if asset.normalized_hash and asset.normalized_hash != content_hash:
-                content = await artifact_store.get_js(asset.normalized_hash)
+            storage_hash = asset.normalized_hash or asset.content_hash
+            try:
+                content = await artifact_store.get_js(storage_hash)
+            except (AtomicCommitError, UnsafePathError):
+                raise
+            except Exception:
+                return None
             if content is None:
-                content = await artifact_store.get_js(content_hash)
-            if content is not None:
-                asset.content = content
+                return None
+            asset.content = content
+            if asset.sourcemap_hash:
+                try:
+                    asset.sourcemap_content = await artifact_store.get_sourcemap(
+                        asset.content_hash,
+                        asset.sourcemap_hash,
+                    )
+                except (AtomicCommitError, UnsafePathError):
+                    raise
+                except Exception:
+                    return None
+                if asset.sourcemap_content is None:
+                    return None
             restored_assets.append(asset)
         return restored_assets
 
-    async def _restore_irs_from_assets(assets, allowed_hashes=None):
-        irs = []
+    async def _restore_irs_from_assets(
+        assets: list[JSAsset],
+        allowed_asset_keys: set[str] | None = None,
+    ) -> list[Any]:
+        irs: list[Any] = []
         if not artifact_store:
             return irs
         for asset in assets:
-            if allowed_hashes is not None and asset.content_hash not in allowed_hashes:
+            if allowed_asset_keys is not None and _asset_key(asset) not in allowed_asset_keys:
                 continue
             if not asset.ast_hash:
                 continue
             ast = await artifact_store.get_ast(asset.content_hash, asset.ast_hash)
             if not ast:
                 continue
-            irs.append(IRBuilder().build(ast, asset.url, asset.content_hash))
+            irs.append(IRBuilder.from_parser_config(analysis_config.parser).build(ast, asset.url, asset.content_hash))
         return irs
 
     checkpoint = await _load_local_checkpoint()
@@ -1600,19 +1943,105 @@ async def _run_local_analysis(
     collector = LocalCollector(
         recursive=recursive,
         include_json=include_json,
+        max_file_size_mb=analysis_config.crawler.max_file_size / (1024 * 1024),
     )
 
     line_mappers = {}
+    sourcemaps: dict[str, SourceMapInfo] = {}
+    assets: list[JSAsset] | None = None
     if checkpoint and _local_stage_at_least(checkpoint.stage, "collect"):
         assets = await _restore_assets_from_checkpoint(checkpoint)
-    else:
+        if assets is None:
+            logger.warning(
+                "local_checkpoint_artifact_restore_failed",
+                job_id=analysis_config.job_id,
+            )
+            checkpoint = None
+            checkpoint_snapshot = None
+            completeness_issues.clear()
+            rehydrated_issue_keys.clear()
+            retry_barriers.clear()
+    if assets is None:
         assets = []
-        async for asset in collector.collect(paths):
+        local_paths: list[str | Path] = list(paths)
+        async for asset in collector.collect(local_paths):
             assets.append(asset)
             if verbose and not quiet:
                 console.print(f"  Found: {asset.url}")
             await _store_asset(asset)
+
+    for diagnostic in collector.diagnostics:
+        _add_issue(
+            diagnostic.code,
+            "collect",
+            f"Local collection coverage degraded ({diagnostic.reason})",
+            retryable=False,
+            affected_count=diagnostic.affected_count,
+        )
+
+    if checkpoint is None or not _local_stage_at_least(checkpoint.stage, "collect"):
         await _store_local_checkpoint("collect", assets=assets)
+
+    async def _parse_local_sourcemap(asset: JSAsset) -> None:
+        if not analysis_config.parser.resolve_sourcemaps:
+            return
+
+        resolver = SourceMapResolver()
+        source = decode_js_bytes(asset.content)
+        sourcemap = None
+        failure_reason: str | None = None
+        if asset.sourcemap_content is not None:
+            try:
+                map_text = decode_js_bytes(asset.sourcemap_content)
+                sourcemap = resolver.parse_content(
+                    map_text,
+                    url=asset.sourcemap_url,
+                    is_inline=False,
+                )
+            except (UnicodeError, ValueError):
+                failure_reason = "invalid_map_encoding"
+        else:
+            reference = resolver.find_sourcemap_url(source)
+            if reference and reference.lower().startswith("data:"):
+                sourcemap = await resolver.resolve(source, asset.url)
+            elif reference:
+                failure_reason = "local_external_map_unavailable"
+            elif asset.has_sourcemap or asset.sourcemap_hash:
+                failure_reason = "local_map_artifact_unavailable"
+
+        if sourcemap is not None:
+            asset.has_sourcemap = True
+            asset.sourcemap_url = sourcemap.url or asset.sourcemap_url
+            if asset.sourcemap_content is None and sourcemap.content is not None:
+                asset.sourcemap_content = sourcemap.content.encode()
+                asset.sourcemap_hash = hashlib.sha256(asset.sourcemap_content).hexdigest()
+            sourcemaps[_asset_key(asset)] = sourcemap
+            if sourcemap.diagnostics:
+                _add_issue(
+                    "sourcemap_mapping_truncated",
+                    "normalize",
+                    "A source map contained mappings beyond the decode budget",
+                    retryable=False,
+                    details={"diagnostics": sorted(set(sourcemap.diagnostics))},
+                )
+            return
+
+        if failure_reason is None and resolver.last_diagnostic.status == "failed":
+            failure_reason = resolver.last_diagnostic.reason or "malformed_sourcemap"
+        if failure_reason is None:
+            return
+        summary = f"sourcemap:{failure_reason}"
+        if summary not in asset.parse_errors:
+            asset.parse_errors.append(summary)
+        _add_issue(
+            "sourcemap_resolution_failed",
+            "normalize",
+            f"A local source map could not be resolved ({failure_reason})",
+            retryable=False,
+        )
+
+    for asset in assets:
+        await _parse_local_sourcemap(asset)
 
     if not assets:
         if not quiet:
@@ -1620,6 +2049,7 @@ async def _run_local_analysis(
         return Report(
             seed_urls=paths,
             summary=ReportSummary(total_js_files=0, total_findings=0),
+            completeness=_completeness(),
         )
 
     if not quiet:
@@ -1656,14 +2086,18 @@ async def _run_local_analysis(
             suffix = f" {detail}" if detail else ""
             console.print(f"[green]✓ {label}[/green]{suffix}")
 
-    def _update(completed, stage_label=None, detail=None):
+    def _update(
+        completed: float,
+        stage_label: str | None = None,
+        detail: str | None = None,
+    ) -> None:
         if progress_bar is not None and task is not None:
-            kwargs = {"completed": completed}
-            if stage_label:
-                kwargs["stage_label"] = stage_label
-            if detail:
-                kwargs["detail"] = detail
-            progress_bar.update(task, **kwargs)
+            progress_bar.update(
+                task,
+                completed=completed,
+                stage_label=stage_label or "",
+                detail=detail or "",
+            )
 
     try:
         # Normalize
@@ -1677,22 +2111,36 @@ async def _run_local_analysis(
             }
             _complete_stage("Normalize", "(restored from checkpoint)")
         else:
-            partial_normalized_hashes = set((checkpoint.stage_state or {}).get("normalize_complete_hashes", [])) if checkpoint else set()
-            if checkpoint and partial_normalized_hashes:
+            checkpoint_state = checkpoint.stage_state if checkpoint else {}
+            partial_normalized_keys = set(checkpoint_state.get("normalize_complete_assets", []))
+            legacy_normalized_hashes = set(checkpoint_state.get("normalize_complete_hashes", []))
+            partial_normalized_keys.update(
+                _asset_key(asset)
+                for asset in assets
+                if asset.content_hash in legacy_normalized_hashes
+            )
+            if checkpoint and partial_normalized_keys:
                 line_mappers = {
-                    content_hash: LineMapper.from_dict(data)
-                    for content_hash, data in checkpoint.line_mappers.items()
+                    asset_key: LineMapper.from_dict(data)
+                    for asset_key, data in checkpoint.line_mappers.items()
                 }
-            processed_normalized_hashes = set(partial_normalized_hashes)
+            processed_normalized_keys = set(partial_normalized_keys)
             for i, asset in enumerate(assets):
-                if asset.content_hash in processed_normalized_hashes:
+                asset_key = _asset_key(asset)
+                if asset_key in processed_normalized_keys:
                     _update(10 + (i + 1) / len(assets) * 15, "Normalize", f"{i + 1}/{len(assets)} assets")
                     continue
+                normalized = False
                 try:
                     if analysis_config.parser.beautify:
                         original_hash = asset.content_hash or hashlib.sha256(asset.content).hexdigest()
                         content_str = decode_js_bytes(asset.content)
-                        if (
+                        if asset.language_hint in {"jsx", "typescript", "tsx"}:
+                            result = beautifier.beautify(
+                                content_str,
+                                level=NormalizationLevel.NONE,
+                            )
+                        elif (
                             analysis_config.parser.beautify_max_bytes > 0
                             and len(asset.content) > analysis_config.parser.beautify_max_bytes
                         ):
@@ -1711,16 +2159,35 @@ async def _run_local_analysis(
                             asset.size = len(normalized_content)
                             asset.content_hash = original_hash
                             asset.normalized_hash = hashlib.sha256(normalized_content).hexdigest()
-                            line_mappers[original_hash] = result.line_mapper
+                            line_mappers[asset_key] = result.line_mapper
+                            normalized = True
+                        else:
+                            _add_issue(
+                                "normalization_failed",
+                                "normalize",
+                                f"Normalization failed for {asset.url}",
+                                retryable=True,
+                            )
+                    else:
+                        normalized = True
                 except Exception as e:
                     logger.warning("normalization_error", url=asset.url[:100], error=str(e))
+                    _add_issue(
+                        "normalization_exception",
+                        "normalize",
+                        f"Normalization failed for {asset.url}: {e}",
+                        retryable=True,
+                    )
+                if not normalized:
+                    retry_barriers.add("collect")
                 await _store_asset(asset)
-                processed_normalized_hashes.add(asset.content_hash)
+                if normalized:
+                    processed_normalized_keys.add(asset_key)
                 await _store_local_checkpoint(
                     "collect",
                     assets=assets,
                     line_mappers_map=line_mappers,
-                    stage_state={"normalize_complete_hashes": sorted(processed_normalized_hashes)},
+                    stage_state={"normalize_complete_assets": sorted(processed_normalized_keys)},
                 )
                 _update(10 + (i + 1) / len(assets) * 15, "Normalize", f"{i + 1}/{len(assets)} assets")
             await _store_local_checkpoint("normalize", assets=assets, line_mappers_map=line_mappers)
@@ -1729,26 +2196,54 @@ async def _run_local_analysis(
         # Parse
         _announce_stage("Parse", f"({len(assets)} assets)")
         _update(25, "Parse", f"0/{len(assets)} assets")
-        parser = JSParser(tolerant=analysis_config.parser.tolerant)
-        ir_builder = IRBuilder()
+        parser = JSParser.from_parser_config(
+            analysis_config.parser,
+            temp_dir=analysis_config.temp_dir,
+        )
+        ir_builder = IRBuilder.from_parser_config(analysis_config.parser)
         if checkpoint and _local_stage_at_least(checkpoint.stage, "parse"):
             ir_list = await _restore_irs_from_assets(assets)
             _complete_stage("Parse", "(restored from checkpoint)")
         else:
-            partial_parse_hashes = set((checkpoint.stage_state or {}).get("parse_complete_hashes", [])) if checkpoint else set()
-            ir_list = await _restore_irs_from_assets(assets, partial_parse_hashes) if partial_parse_hashes else []
-            processed_parse_hashes = set(partial_parse_hashes)
+            checkpoint_state = checkpoint.stage_state if checkpoint else {}
+            partial_parse_keys = set(checkpoint_state.get("parse_complete_assets", []))
+            legacy_parse_hashes = set(checkpoint_state.get("parse_complete_hashes", []))
+            partial_parse_keys.update(
+                _asset_key(asset)
+                for asset in assets
+                if asset.content_hash in legacy_parse_hashes
+            )
+            ir_list = (
+                await _restore_irs_from_assets(assets, partial_parse_keys)
+                if partial_parse_keys
+                else []
+            )
+            processed_parse_keys = set(partial_parse_keys)
             for i, asset in enumerate(assets):
-                if asset.content_hash in processed_parse_hashes and asset.ast_hash:
+                asset_key = _asset_key(asset)
+                if asset_key in processed_parse_keys and asset.ast_hash:
                     _update(25 + (i + 1) / len(assets) * 20, "Parse", f"{i + 1}/{len(assets)} assets")
                     continue
+                parsed = False
                 try:
                     content_str = decode_js_bytes(asset.content)
-                    parse_result = parser.parse(content_str)
+                    parse_result = parser.parse(
+                        content_str,
+                        language_hint=asset.language_hint,
+                    )
                     if parse_result.success and parse_result.ast:
                         ir = ir_builder.build(parse_result.ast, asset.url, asset.content_hash)
                         ir_list.append(ir)
                         asset.parse_success = True
+                        # Preserve the degraded-parse detail (regex fallback / partial-esprima /
+                        # string-cap notes) so the local path reports the same completeness signal as
+                        # the canonical scan path (AssetAnalyzer.analyze_asset_standalone). A clean
+                        # parse has parse_result.errors == [], so this is a no-op then (DQ-P06).
+                        asset.parse_errors.extend(parse_result.errors)
+                        # Surface IR-level truncation (AST depth / unique-identifier caps) so an
+                        # incomplete analysis is not reported as a clean parse (DQ-C04).
+                        if getattr(ir, "partial", False) and ir.errors:
+                            asset.parse_errors.extend(ir.errors)
                         # Must match ArtifactStore.store_ast's key (canonical json.dumps),
                         # otherwise get_ast() on --resume never finds the file and every
                         # restored IR is dropped -> resumed report has 0 findings.
@@ -1757,16 +2252,40 @@ async def _run_local_analysis(
                         ).hexdigest()[:16]
                         await _store_ast(asset, parse_result.ast)
                         await _store_asset(asset)
+                        parsed = True
+                        if asset.parse_errors:
+                            _add_issue(
+                                "degraded_parse",
+                                "parse",
+                                f"Parser reported degraded coverage for {asset.url}",
+                                retryable=False,
+                                affected_count=len(asset.parse_errors),
+                            )
                     else:
                         asset.parse_errors.extend(parse_result.errors)
+                        _add_issue(
+                            "parse_failed",
+                            "parse",
+                            f"Parsing failed for {asset.url}",
+                            retryable=True,
+                        )
                 except Exception as e:
                     asset.parse_errors.append(str(e))
-                processed_parse_hashes.add(asset.content_hash)
+                    _add_issue(
+                        "parse_exception",
+                        "parse",
+                        f"Parsing failed for {asset.url}: {e}",
+                        retryable=True,
+                    )
+                if parsed:
+                    processed_parse_keys.add(asset_key)
+                else:
+                    retry_barriers.add("normalize")
                 await _store_local_checkpoint(
                     "normalize",
                     assets=assets,
                     line_mappers_map=line_mappers,
-                    stage_state={"parse_complete_hashes": sorted(processed_parse_hashes)},
+                    stage_state={"parse_complete_assets": sorted(processed_parse_keys)},
                 )
                 _update(25 + (i + 1) / len(assets) * 20, "Parse", f"{i + 1}/{len(assets)} assets")
             await _store_local_checkpoint("parse", assets=assets, line_mappers_map=line_mappers)
@@ -1778,6 +2297,10 @@ async def _run_local_analysis(
         analyzer = _build_analyzer(analysis_config)
 
         content_map = {}
+        asset_by_identity = {
+            (asset.content_hash, asset.url): asset
+            for asset in assets
+        }
         for asset in assets:
             content_map[asset.url] = decode_js_bytes(asset.content)
 
@@ -1786,12 +2309,26 @@ async def _run_local_analysis(
             _complete_stage("Analyze", "(restored from checkpoint)")
         else:
             findings = list(checkpoint.findings) if checkpoint else []
-            analyzed_hashes = set((checkpoint.stage_state or {}).get("analyze_complete_hashes", [])) if checkpoint else set()
+            checkpoint_state = checkpoint.stage_state if checkpoint else {}
+            analyzed_asset_keys = set(checkpoint_state.get("analyze_complete_assets", []))
+            legacy_analyzed_hashes = set(checkpoint_state.get("analyze_complete_hashes", []))
+            analyzed_asset_keys.update(
+                _asset_key(asset)
+                for asset in assets
+                if asset.content_hash in legacy_analyzed_hashes
+            )
             for i, ir in enumerate(ir_list):
-                if ir.file_hash in analyzed_hashes:
+                analyzed_asset = asset_by_identity.get((ir.file_hash, ir.file_url))
+                analyzed_asset_key = (
+                    _asset_key(analyzed_asset)
+                    if analyzed_asset is not None
+                    else f"{ir.file_hash}:{ir.file_url}"
+                )
+                if analyzed_asset_key in analyzed_asset_keys:
                     _update(45 + (i + 1) / max(len(ir_list), 1) * 40, "Analyze", f"{i + 1}/{max(len(ir_list), 1)} assets")
                     continue
                 file_findings = []
+                analyzed = False
                 try:
                     context = AnalysisContext(
                         file_url=ir.file_url,
@@ -1804,21 +2341,61 @@ async def _run_local_analysis(
                     # local-vs-orchestrator drift. Enrichment failures degrade metadata but
                     # never drop findings (secured inside analyze_prebuilt_ir).
                     file_findings = analyzer.analyze_prebuilt_ir(
-                        ir, context, line_mapper=line_mappers.get(ir.file_hash)
+                        ir,
+                        context,
+                        line_mapper=(
+                            line_mappers.get(analyzed_asset_key)
+                            or line_mappers.get(ir.file_hash)
+                        ),
+                        sourcemap=sourcemaps.get(analyzed_asset_key),
                     )
+                    asset_errors_added = False
+                    for event in _promote_analysis_events(
+                        context.metadata.get("analysis_incomplete", [])
+                    ):
+                        summary = _virtual_event_summary(event)
+                        if (
+                            analyzed_asset is not None
+                            and summary
+                            and summary not in analyzed_asset.parse_errors
+                        ):
+                            analyzed_asset.parse_errors.append(summary)
+                            asset_errors_added = True
+                    if analyzed_asset is not None and getattr(ir, "partial", False):
+                        for error in getattr(ir, "errors", ()) or ():
+                            if error not in analyzed_asset.parse_errors:
+                                analyzed_asset.parse_errors.append(error)
+                                asset_errors_added = True
+                    if asset_errors_added:
+                        _add_issue(
+                            "asset_analysis_incomplete",
+                            "analyze",
+                            "A JavaScript asset was not fully analyzed",
+                            retryable=False,
+                        )
+                    analyzed = True
                 except Exception as e:
                     if verbose and not quiet:
                         console.print(f"[yellow]Analysis error: {e}[/yellow]")
                     else:
                         logger.warning("analysis_error", error=str(e))
+                    _add_issue(
+                        "analysis_exception",
+                        "analyze",
+                        f"Analysis failed for {ir.file_url}: {e}",
+                        retryable=True,
+                    )
                 findings.extend(file_findings)
-                analyzed_hashes.add(ir.file_hash)
+                if analyzed:
+                    analyzed_asset_keys.add(analyzed_asset_key)
+                else:
+                    retry_barriers.add("parse")
                 await _store_local_checkpoint(
                     "parse",
                     assets=assets,
                     findings=findings,
                     line_mappers_map=line_mappers,
-                    stage_state={"analyze_complete_hashes": sorted(analyzed_hashes)},
+                    stage_state={"analyze_complete_assets": sorted(analyzed_asset_keys)},
                 )
                 _update(45 + (i + 1) / max(len(ir_list), 1) * 40, "Analyze", f"{i + 1}/{max(len(ir_list), 1)} assets")
             await _store_local_checkpoint("analyze", assets=assets, findings=findings, line_mappers_map=line_mappers)
@@ -1848,12 +2425,38 @@ async def _run_local_analysis(
         end_time = datetime.now(timezone.utc)
         duration = (end_time - start_time).total_seconds()
 
+        report_assets: list[JSAsset] = []
+        for asset in assets:
+            provenance_by_url = {
+                item.url: item
+                for item in asset.provenance
+                if item.url
+            }
+            # Collection intentionally analyzes byte-identical local files once. Direct-file
+            # reports still expose every input path; virtual component assets are excluded because
+            # their provenance URL is the parent component rather than the virtual script URL.
+            if len(provenance_by_url) > 1 and asset.url in provenance_by_url:
+                for provenance_url in sorted(provenance_by_url):
+                    provenance = provenance_by_url[provenance_url]
+                    projected = asset.model_copy(deep=True)
+                    projected.url = provenance_url
+                    projected.id = (
+                        f"local_{asset.content_hash[:12]}_"
+                        f"{hashlib.sha256(provenance_url.encode()).hexdigest()[:16]}"
+                    )
+                    projected.initiator = provenance.initiator
+                    projected.load_context = provenance.load_context
+                    projected.provenance = [provenance]
+                    report_assets.append(projected)
+            else:
+                report_assets.append(asset)
+
         report = Report(
             job_id=analysis_config.job_id,
             seed_urls=paths,
             config=embed_report_resume_signature(
                 {
-                    **analysis_config.to_dict(),
+                    **analysis_config.to_report_dict(),
                     "mode": "local_analysis",
                     "paths": paths,
                     "recursive": recursive,
@@ -1861,12 +2464,13 @@ async def _run_local_analysis(
                 },
                 resume_signature,
             ),
-            assets=assets,
+            assets=report_assets,
             findings=findings,
             correlations=correlations,
             clusters=clusters,
             duration_seconds=duration,
             completed_at=end_time,
+            completeness=_completeness(),
         )
         report.compute_summary()
         await _store_report(report)
@@ -1888,25 +2492,39 @@ async def _try_resume_local_report(
     config: Config,
     recursive: bool,
     include_json: bool,
-):
+) -> Report | None:
     """Resume local analysis from the latest stored report when available."""
-    from bundleInspector.storage.finding_store import FindingStore
-
     try:
-        store = FindingStore(cache_dir / job_id)
-        report = await store.get_latest_report()
+        repository, job_root, owned = _prepare_local_job_storage(
+            cache_dir,
+            job_id,
+            create=False,
+        )
+        if job_root is None:
+            return None
+        if owned:
+            report = await repository.get_report(job_id, "local")
+        else:
+            # Explicitly private compatibility: no owner is created, so MCP cannot enumerate it.
+            from bundleInspector.storage.finding_store import FindingStore
+
+            report = await FindingStore(job_root).get_latest_report()
         expected_signature = build_local_resume_signature(
             config,
             recursive=recursive,
             include_json=include_json,
+            input_paths=list(paths),  # DQ-C05: same content-aware signature as the write path
         )
         if report_matches_resume_signature(
             report,
+            expected_job_id=job_id,
             seed_urls=paths,
             expected_signature=expected_signature,
         ):
             return report
         return None
+    except (AtomicCommitError, JobAccessError, UnsafePathError):
+        raise
     except Exception as e:
         logger.warning("local_resume_report_load_error", job_id=job_id, error=str(e))
         return None
@@ -1925,7 +2543,7 @@ async def _try_resume_local_report(
     type=click.Path(),
     help="Output file path",
 )
-def convert(report_file: str, format: str, output: Optional[str]):
+def convert(report_file: str, format: str, output: str | None) -> None:
     """Convert report between formats.
 
     Example:
@@ -1941,6 +2559,7 @@ def convert(report_file: str, format: str, output: Optional[str]):
     annotate_download_surfaces(report)
 
     # Generate output
+    reporter: BaseReporter
     if format == "html":
         reporter = HTMLReporter()
     else:
@@ -1948,27 +2567,27 @@ def convert(report_file: str, format: str, output: Optional[str]):
 
     output_path = Path(output) if output else Path(f"report.{format}")
     content = reporter.generate(report)
-    output_path.write_text(content, encoding="utf-8")
+    atomic_publish_text(output_path, content)
 
     console.print(f"[green]Converted to: {output_path}[/green]")
 
 
 @main.command()
-def version():
+def version() -> None:
     """Show version information."""
     console.print(f"BundleInspector version {__version__}")
 
 
-def _load_report_for_convert(report_file: str):
+def _load_report_for_convert(report_file: str) -> Report:
     """Load a report from JSON or from BundleInspector-generated HTML."""
     content = Path(report_file).read_text(encoding="utf-8-sig")  # tolerate a BOM
     return _parse_report_content_for_convert(content)
 
 
-def _parse_report_content_for_convert(content: str):
+def _parse_report_content_for_convert(content: str) -> Report:
     """Parse report content from JSON or from embedded HTML report data."""
     import json
-    import re
+
     from bundleInspector.storage.models import Report
 
     stripped = content.lstrip()
@@ -1977,19 +2596,20 @@ def _parse_report_content_for_convert(content: str):
         data = json.loads(content)
         return Report.model_validate(data)
 
-    html_match = re.search(
-        r'<script id="bundleInspector-report-data" type="application/json">(.*?)</script>',
-        content,
-        re.DOTALL,
-    )
-    if not html_match:
+    # Locate the embedded report JSON with str.find (linear) rather than a lazy `(.*?)</script>`
+    # regex, which is O(n^2) on content with many marker prefixes but no closing tag. Same semantics:
+    # the first marker paired with the next </script>.
+    _marker = '<script id="bundleInspector-report-data" type="application/json">'
+    _start = content.find(_marker)
+    _end = content.find("</script>", _start + len(_marker)) if _start != -1 else -1
+    if _start == -1 or _end == -1:
         raise click.ClickException(
             "HTML report does not contain embedded report data. "
             "Only BundleInspector-generated HTML reports can be converted back to JSON."
         )
 
     try:
-        data = json.loads(html_match.group(1))
+        data = json.loads(content[_start + len(_marker):_end])
     except json.JSONDecodeError as exc:
         raise click.ClickException(f"Embedded report data is invalid JSON: {exc}") from exc
 
@@ -2022,7 +2642,7 @@ def _load_headers_file(path: str) -> dict[str, str]:
             raise click.BadParameter(
                 f"Invalid JSON in headers file: {e}",
                 param_hint="'--headers-file'",
-            )
+            ) from e
 
     # Parse as text: "Name: Value" per line
     headers: dict[str, str] = {}
@@ -2076,10 +2696,10 @@ def _display_auth_info(config: Config, con: Console) -> None:
 
 
 def _import_cookies(
-    cookies_file: Optional[str],
-    cookies_from: Optional[str],
+    cookies_file: str | None,
+    cookies_from: str | None,
     quiet: bool,
-    target_urls: Optional[list[str]] = None,
+    target_urls: list[str] | None = None,
 ) -> dict[str, str]:
     """Import cookies from file or browser."""
     cookies: dict[str, str] = {}
@@ -2091,6 +2711,7 @@ def _import_cookies(
         from bundleInspector.core.cookie_import import import_cookies
 
         source = cookies_file or cookies_from
+        assert source is not None
 
         # Extract domain from target URLs for browser cookie filtering
         domain = ""
@@ -2116,7 +2737,7 @@ def _import_cookies(
 
 
 def _generate_wordlist(
-    report,
+    report: Report,
     mode: str,
     report_path: Path,
     quiet: bool,
@@ -2128,7 +2749,7 @@ def _generate_wordlist(
         wordlists = generate_wordlists(report)
         for wl_mode, content in wordlists.items():
             wl_path = report_path.parent / f"wordlist_{wl_mode}.txt"
-            wl_path.write_text(content, encoding="utf-8")
+            atomic_publish_text(wl_path, content)
             lines = len(content.strip().split("\n")) if content.strip() else 0
             if not quiet:
                 console.print(f"  [green]Wordlist ({wl_mode}): {wl_path} ({lines} entries)[/green]")
@@ -2136,13 +2757,13 @@ def _generate_wordlist(
         reporter = WordlistReporter(mode=mode)
         content = reporter.generate(report)
         wl_path = report_path.parent / f"wordlist_{mode}.txt"
-        wl_path.write_text(content, encoding="utf-8")
+        atomic_publish_text(wl_path, content)
         lines = len(content.strip().split("\n")) if content.strip() else 0
         if not quiet:
             console.print(f"  [green]Wordlist ({mode}): {wl_path} ({lines} entries)[/green]")
 
 
-def _generate_api_map(report, report_path: Path, quiet: bool) -> None:
+def _generate_api_map(report: Report, report_path: Path, quiet: bool) -> None:
     """Generate API map from report findings."""
     from bundleInspector.correlator.api_map import build_api_map
 
@@ -2150,12 +2771,12 @@ def _generate_api_map(report, report_path: Path, quiet: bool) -> None:
 
     # Save JSON API map
     json_path = report_path.parent / "api_map.json"
-    json_path.write_text(builder.to_json(), encoding="utf-8")
+    atomic_publish_text(json_path, builder.to_json())
 
     # Save ASCII tree
     tree_path = report_path.parent / "api_map.txt"
     tree_content = builder.to_tree_string()
-    tree_path.write_text(tree_content, encoding="utf-8")
+    atomic_publish_text(tree_path, tree_content)
 
     if not quiet:
         # Print tree summary to console

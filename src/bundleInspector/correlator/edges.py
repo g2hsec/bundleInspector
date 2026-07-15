@@ -4,7 +4,7 @@ Edge types for correlation graph.
 
 from __future__ import annotations
 
-from bundleInspector.storage.models import Edge, EdgeType, Confidence
+from bundleInspector.storage.models import Confidence, Edge, EdgeType
 
 
 def create_same_file_edge(
@@ -118,6 +118,9 @@ def create_taint_edge(
         edge_type=EdgeType.TAINT,
         confidence=Confidence.MEDIUM,
         reasoning=reasoning,
-        metadata={"sink_source": sink_source, "sink_attr": sink_attr, "chain": "upload_to_dom_sink"},
+        metadata={
+            "sink_source": sink_source,
+            "sink_attr": sink_attr,
+            "chain": "upload_to_dom_sink",
+        },
     )
-

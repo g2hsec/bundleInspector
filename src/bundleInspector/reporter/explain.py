@@ -14,13 +14,12 @@ Everything is defensive: rendering a report must never raise on odd/missing data
 from __future__ import annotations
 
 import html as _html
-import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
 from bundleInspector.storage.models import Finding
 
 # value_type -> (why, impact, fix). Most specific; falls back to _CATEGORY_EXPLAIN by category.
-_EXPLAIN: Dict[str, tuple[str, str, str]] = {
+_EXPLAIN: dict[str, tuple[str, str, str]] = {
     # --- sinks / dataflow (XSS) ---
     "taint_flow": (
         "An attacker-influenceable value reaches a dangerous DOM sink WITHOUT being encoded or sanitized "
@@ -111,7 +110,7 @@ _EXPLAIN: Dict[str, tuple[str, str, str]] = {
 }
 
 # Coarser fallback by category name (finding.category.value).
-_CATEGORY_EXPLAIN: Dict[str, tuple[str, str, str]] = {
+_CATEGORY_EXPLAIN: dict[str, tuple[str, str, str]] = {
     "sink": (
         "Dynamic data flows into a potentially dangerous browser sink.",
         "Depending on the source, this can lead to XSS or client-side code execution.",
@@ -173,7 +172,7 @@ _SOURCE_LABEL = {
 }
 
 
-def explain_finding(finding: Finding) -> Dict[str, str]:
+def explain_finding(finding: Finding) -> dict[str, str]:
     """Return {why, impact, fix} plain-language risk explanation for a finding."""
     try:
         vt = getattr(finding, "value_type", "") or ""
@@ -193,7 +192,7 @@ def explain_finding(finding: Finding) -> Dict[str, str]:
         return {"why": _GENERIC[0], "impact": _GENERIC[1], "fix": _GENERIC[2]}
 
 
-def flow_steps(finding: Finding) -> List[Dict[str, Any]]:
+def flow_steps(finding: Finding) -> list[dict[str, Any]]:
     """Structured SOURCE -> value -> SINK steps for a taint_flow finding (else [])."""
     try:
         if getattr(finding, "value_type", "") != "taint_flow":
@@ -206,7 +205,7 @@ def flow_steps(finding: Finding) -> List[Dict[str, Any]]:
         if sink_attr:
             sink = f"{sink} (attr '{sink_attr}')"
         value = str(m.get("sink_source", "") or "")
-        steps: List[Dict[str, Any]] = [
+        steps: list[dict[str, Any]] = [
             {"kind": "source", "label": src_label, "line": m.get("source_line")},
         ]
         if value:
@@ -217,9 +216,9 @@ def flow_steps(finding: Finding) -> List[Dict[str, Any]]:
         return []
 
 
-def _iter_tokens(finding: Finding) -> List[str]:
+def _iter_tokens(finding: Finding) -> list[str]:
     """Tokens worth highlighting inside the snippet (tainted value, matched text, value)."""
-    out: List[str] = []
+    out: list[str] = []
     try:
         m = getattr(finding, "metadata", {}) or {}
         for t in (m.get("sink_source"), m.get("matched_text"),
@@ -248,12 +247,12 @@ def highlight_snippet(finding: Finding) -> str:
             start = getattr(ev, "line", 1) or 1
         tokens = _iter_tokens(finding)
         width = len(str(start + len(lines) - 1))
-        rows: List[str] = []
+        rows: list[str] = []
         for i, raw in enumerate(lines):
             n = start + i
             esc = _html.escape(raw)
             hit = False
-            applied: List[str] = []
+            applied: list[str] = []
             for tok in tokens:
                 etok = _html.escape(tok)
                 if not etok or etok not in esc:

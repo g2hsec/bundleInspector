@@ -7,14 +7,13 @@ Any token-like literals here are fake sample values, not real secrets.
 from __future__ import annotations
 
 import sqlite3
-import sys
 from types import SimpleNamespace
 
 import pytest
 
 from bundleInspector.config import Config
-from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.rules.engine import RuleEngine
 from bundleInspector.storage.models import Category
@@ -136,6 +135,7 @@ def test_headless_websocket_capture():
 def test_chromium_v10_decrypt_roundtrip():
     pytest.importorskip("cryptography")
     from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+
     from bundleInspector.core.cookie_import import _decrypt_chromium_value
 
     key = bytes(range(32))

@@ -22,12 +22,18 @@ Design guarantees:
 from __future__ import annotations
 
 import re
-from bundleInspector.core.url_utils import safe_urlsplit as urlsplit
+from collections.abc import Iterable
+from typing import Any
 
-from bundleInspector.storage.models import Category, Severity
+from bundleInspector.core.url_utils import safe_urlsplit as urlsplit
+from bundleInspector.storage.models import Category, Finding, Severity
 
 _SEVERITY_RANK = {
-    Severity.INFO: 0, Severity.LOW: 1, Severity.MEDIUM: 2, Severity.HIGH: 3, Severity.CRITICAL: 4,
+    Severity.INFO: 0,
+    Severity.LOW: 1,
+    Severity.MEDIUM: 2,
+    Severity.HIGH: 3,
+    Severity.CRITICAL: 4,
 }
 
 # Endpoint value_types that represent a replayable HTTP request (dormancy applies). GraphQL
@@ -60,8 +66,13 @@ def _norm_segment(seg: str) -> str:
 def _split(value: str) -> tuple[str, str]:
     """Return (host, normalized_path) for an endpoint value or observed URL; host='' if relative."""
     value = (value or "").strip()
-    # Collapse template expressions so ${id} and {param} match a concrete observed id.
-    value = re.sub(r"\$\{[^}]*\}", "/{id}/", value)
+    # Collapse a template expression to a NON-slash placeholder so it stays within its path segment.
+    # A slash-wrapped `/{id}/` would split a PARTIAL-segment template (`${API_BASE}/x` -> `/{id}//x`,
+    # or `v${version}` -> `v/{id}/`), keying the declared path differently from the concrete observed
+    # one -- which falsely tagged a LIVE endpoint dormant AND re-surfaced it as a duplicate runtime
+    # finding. `{id}` keeps the segment whole (matches api_map's `{param}`); a whole-segment
+    # `/x/${id}` -> `/x/{id}` still matches a concrete id.
+    value = re.sub(r"\$\{[^}]{0,1024}\}", "{id}", value)
     if value.startswith(("http://", "https://", "ws://", "wss://")):
         parts = urlsplit(value)
         host = parts.netloc.lower()
@@ -79,7 +90,10 @@ def _split(value: str) -> tuple[str, str]:
     return host, norm
 
 
-def build_observed_index(observed, primary_hosts=None) -> dict:
+def build_observed_index(
+    observed: Iterable[Any] | None,
+    primary_hosts: Iterable[str] | None = None,
+) -> dict[str, Any]:
     """
     Build a lookup index from raw observations.
 
@@ -97,22 +111,56 @@ def build_observed_index(observed, primary_hosts=None) -> dict:
     hosts: set[str] = set()
     rel_paths: set[str] = set()
     host_paths: set[tuple[str, str]] = set()
+    # DQ-H01: method-aware sets so an observed GET does not mark a declared DELETE on the same path
+    # exercised. A verbless observation (bare-string, method unknown) can be any verb, so it credits
+    # every method (kept separately and OR'd in).
+    rel_method_paths: set[tuple[str, str]] = set()  # (METHOD, path)
+    host_method_paths: set[tuple[str, str, str]] = set()  # (host, METHOD, path)
+    verbless_rel_paths: set[str] = set()
+    verbless_host_paths: set[tuple[str, str]] = set()
     for item in observed or []:
-        url = item[1] if isinstance(item, (tuple, list)) and len(item) >= 2 else item
+        if isinstance(item, (tuple, list)) and len(item) >= 2:
+            method = str(item[0]).upper() if item[0] else ""
+            url = item[1]
+        else:
+            method = ""
+            url = item
         if not isinstance(url, str) or not url.strip():
             continue
         host, path = _split(url)
+        first_party = primary is None or not host or host in primary
         if host:
             hosts.add(host)
             host_paths.add((host, path))
+            if method:
+                host_method_paths.add((host, method, path))
+            else:
+                verbless_host_paths.add((host, path))
         # A relative declaration resolves against the app's own origin, so only credit
         # the host-agnostic path when the request was first-party (or host-less).
-        if primary is None or not host or host in primary:
+        if first_party:
             rel_paths.add(path)
-    return {"hosts": hosts, "rel_paths": rel_paths, "host_paths": host_paths}
+            if method:
+                rel_method_paths.add((method, path))
+            else:
+                verbless_rel_paths.add(path)
+    return {
+        "hosts": hosts,
+        "rel_paths": rel_paths,
+        "host_paths": host_paths,
+        "rel_method_paths": rel_method_paths,
+        "host_method_paths": host_method_paths,
+        "verbless_rel_paths": verbless_rel_paths,
+        "verbless_host_paths": verbless_host_paths,
+    }
 
 
-def _is_exercised(host: str, path: str, index: dict) -> tuple[bool, bool]:
+def _is_exercised(
+    host: str,
+    path: str,
+    index: dict[str, Any],
+    method: str = "",
+) -> tuple[bool, bool]:
     """
     Returns (exercised, in_scope).
 
@@ -120,15 +168,37 @@ def _is_exercised(host: str, path: str, index: dict) -> tuple[bool, bool]:
       normalized path was requested against any host.
     * absolute endpoint  -> in scope only if its host was contacted at all (otherwise we have
       no baseline and must not guess); exercised if (host, path) was requested.
+
+    DQ-H01: when the declared endpoint carries a CONFIDENT HTTP verb, exercised requires the SAME verb
+    was observed (or a verbless observation, whose method is unknown). Only a NON-GET verb is
+    confident: EndpointDetector defaults an unresolvable verb to 'GET', so a declared 'GET' may
+    actually be POST/PUT/DELETE at runtime -- matching it method-exact would falsely mark a live
+    endpoint dormant, so 'GET' (and a verbless declaration) fall back to path-only matching.
     """
+    confident = method if method and method != "GET" else ""
     if not host:
-        return (path in index["rel_paths"], True)
+        if not confident:
+            return (path in index["rel_paths"], True)
+        exercised = (confident, path) in index["rel_method_paths"] or path in index[
+            "verbless_rel_paths"
+        ]
+        return (exercised, True)
     if host not in index["hosts"]:
         return (True, False)  # no baseline for this host -> treat as "not hidden"
-    return ((host, path) in index["host_paths"], True)
+    if not confident:
+        return ((host, path) in index["host_paths"], True)
+    exercised = (host, confident, path) in index["host_method_paths"] or (host, path) in index[
+        "verbless_host_paths"
+    ]
+    return (exercised, True)
 
 
-def annotate_dormant_endpoints(findings, observed, config=None, primary_hosts=None) -> int:
+def annotate_dormant_endpoints(
+    findings: list[Finding],
+    observed: Iterable[Any] | None,
+    config: Any | None = None,
+    primary_hosts: Iterable[str] | None = None,
+) -> int:
     """
     Tag endpoint findings that were declared in JS but never called during the crawl.
 
@@ -136,7 +206,9 @@ def annotate_dormant_endpoints(findings, observed, config=None, primary_hosts=No
     feature is disabled or there is no observation baseline. ``primary_hosts`` (the app's
     first-party origins) scopes relative-path matching -- see ``build_observed_index``.
     """
-    enabled = getattr(config, "dormant_endpoint_detection_enabled", True) if config is not None else True
+    enabled = (
+        getattr(config, "dormant_endpoint_detection_enabled", True) if config is not None else True
+    )
     if not enabled or not findings:
         return 0
     index = build_observed_index(observed, primary_hosts=primary_hosts)
@@ -162,7 +234,10 @@ def annotate_dormant_endpoints(findings, observed, config=None, primary_hosts=No
         host, path = _split(value)
         if path in ("", "/"):
             continue
-        exercised, in_scope = _is_exercised(host, path, index)
+        # DQ-H01: match on the declared HTTP verb when known, so a runtime GET does not clear a
+        # declared DELETE on the same path.
+        method = str(md.get("method") or "").upper()
+        exercised, in_scope = _is_exercised(host, path, index, method)
         if exercised or not in_scope:
             continue
 

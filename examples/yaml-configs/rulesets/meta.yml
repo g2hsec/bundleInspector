@@ -3,14 +3,8 @@ ruleset:
   version: "1.0.0"
   description: "Default JS intel extraction rules"
   author: "jsintel"
-  requires:
-    ast: true
-    sourcemap: optional
-
-defaults:
-  evidence_snippet_context_lines: 2
-  masking:
-    enabled: true
-    patterns:
-      - kind: "token_like"
-        mask: "keep_prefix_4_suffix_4"
+# NOTE (DQ-R07): pack-level `requires`, `defaults.masking`, and
+# `defaults.evidence_snippet_context_lines` are intentionally not declared here -- the custom-rule
+# loader does not yet enforce/apply them, so advertising them would be a false contract. Per-field
+# masking (extract.fields.<f>.mask) IS honored. Wiring pack-level masking/requires and the per-rule
+# evidence.snippet_from (raw vs normalized) is deferred feature work (see the plan Follow-ups).

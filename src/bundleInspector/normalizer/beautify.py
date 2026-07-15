@@ -7,13 +7,115 @@ maintaining line mapping for evidence.
 
 from __future__ import annotations
 
+import re
+from collections import Counter
 from dataclasses import dataclass
 from enum import Enum
-from typing import Optional
 
 import jsbeautifier
 
 from bundleInspector.normalizer.line_mapping import LineMapper, LineMapping
+from bundleInspector.parser.lexical_context import (
+    LexicalGoal,
+    is_line_terminator,
+    line_comment_end,
+)
+
+# Markers that indicate TypeScript or JSX/TSX source. jsbeautifier is a plain JS/HTML/CSS
+# beautifier with NO TS/JSX support: on such input it mis-tokenizes JSX element syntax and injects
+# whitespace INTO the following string literal (e.g. `fetch("/api/admin")` -> `fetch("/api / admin ")`),
+# corrupting the analysis input and silently dropping endpoints/secrets/sinks (DQ-C02). When any of
+# these markers is present we skip beautification entirely and keep the RAW source as the (immutable)
+# analysis input. Trade-off is deliberately safe: missing a case only forgoes cosmetic reflow, and a
+# false match only skips beautify -- both harmless -- whereas beautifying TS/JSX is a correctness loss.
+_TS_JSX_MARKERS = re.compile(
+    r"""
+      \binterface\s+[A-Za-z_$]                              # TS: interface Foo
+    | \bnamespace\s+[A-Za-z_$]                              # TS: namespace X
+    | \benum\s+[A-Za-z_$]                                   # TS: enum E
+    | \bdeclare\s+[A-Za-z_$]                                # TS: declare ...
+    | \bimplements\s+[A-Za-z_$]                             # TS: class C implements I
+    | \babstract\s+class\b                                  # TS: abstract class
+    | \btype\s+[A-Za-z_$][\w$]*\s*(?:<[^=;{}()]*>)?\s*=     # TS: type Alias = ...
+    | :\s*(?:string|number|boolean|void|unknown|never|any|object|symbol|bigint)\b  # TS primitive annotation
+    | =>\s*<[A-Za-z]                                        # JSX: () => <Tag ...
+    | \breturn\s*<[A-Za-z]                                  # JSX: return <Tag ...
+    | (?:\A|[;\r\n])[\t ]*<(?:[A-Za-z][\w.:-]*(?:[\t />]|$)|>)  # bare JSX stmt
+    | [\[=(,?:]\s*<[A-Za-z]                                 # JSX in expression position / array item
+    | (?:&&|\|\|)\s*<[A-Za-z]                               # JSX: cond && <Tag
+    | <[A-Za-z][\w.]*\s+[^<>]*?/>                           # JSX self-closing element with attributes
+    | (?:=>|\breturn|[=(,?:]|&&|\|\|)\s*<>                  # JSX fragment in expression position: => <>
+    | </>                                                  # JSX closing fragment
+    """,
+    re.VERBOSE,
+)
+
+
+def _static_literal_multiset(source: str) -> Counter[str]:
+    """Collect lexical quoted/static-template tokens for the normalization safety invariant."""
+    literals: Counter[str] = Counter()
+    cursor = 0
+    length = len(source)
+    lexical_goal = LexicalGoal()
+    while cursor < length:
+        if source.startswith("//", cursor):
+            cursor = line_comment_end(source, cursor + 2)
+            continue
+        if source.startswith("/*", cursor):
+            close = source.find("*/", cursor + 2)
+            cursor = length if close < 0 else close + 2
+            continue
+        char = source[cursor]
+        if char == "/" and lexical_goal.can_start_regex(source, cursor):
+            cursor += 1
+            in_class = False
+            while cursor < length:
+                current = source[cursor]
+                if (
+                    current == "\\"
+                    and cursor + 1 < length
+                    and not is_line_terminator(source[cursor + 1])
+                ):
+                    cursor += 2
+                    continue
+                if is_line_terminator(current):
+                    lexical_goal.note_operand()
+                    break
+                if current == "[":
+                    in_class = True
+                elif current == "]":
+                    in_class = False
+                elif current == "/" and not in_class:
+                    cursor += 1
+                    while cursor < length and source[cursor].isalpha():
+                        cursor += 1
+                    lexical_goal.note_operand()
+                    break
+                cursor += 1
+            continue
+        if char not in "'\"`":
+            lexical_goal.observe_code_char(source, cursor)
+            cursor += 1
+            continue
+        quote = char
+        start = cursor
+        cursor += 1
+        dynamic_template = False
+        while cursor < length:
+            current = source[cursor]
+            if current == "\\" and cursor + 1 < length:
+                cursor += 2
+                continue
+            if quote == "`" and current == "$" and cursor + 1 < length and source[cursor + 1] == "{":
+                dynamic_template = True
+            if current == quote:
+                cursor += 1
+                if quote != "`" or not dynamic_template:
+                    literals[source[start:cursor]] += 1
+                lexical_goal.note_operand()
+                break
+            cursor += 1
+    return literals
 
 
 class NormalizationLevel(Enum):
@@ -66,7 +168,7 @@ class Beautifier:
     def beautify(
         self,
         content: str,
-        level: Optional[NormalizationLevel] = None,
+        level: NormalizationLevel | None = None,
     ) -> NormalizationResult:
         """
         Beautify JavaScript content.
@@ -91,17 +193,49 @@ class Beautifier:
                 errors=[],
             )
 
+        # DQ-C02 containment: jsbeautifier corrupts TS/JSX (injects whitespace into string literals),
+        # so skip it for such input and analyze the RAW source unchanged. Identity mapping keeps
+        # evidence lines 1:1 with the raw source.
+        if _TS_JSX_MARKERS.search(content):
+            return NormalizationResult(
+                content=content,
+                original_content=content,
+                level=NormalizationLevel.NONE,
+                line_mapper=LineMapper.identity(content),
+                success=True,
+                errors=[],
+            )
+
         try:
             # Beautify
             beautified = jsbeautifier.beautify(content, self.options)
 
-            # Apply light deobfuscation if requested (before creating line mapping)
+            # Raw-vs-normalized monotonicity: formatting is allowed to move tokens, never to alter or
+            # drop literal evidence. jsbeautifier has corrupted unsupported JSX shapes even when a
+            # syntax marker was missed. Reject that output and preserve the raw analysis input.
+            missing_literals = _static_literal_multiset(content) - _static_literal_multiset(beautified)
+            if missing_literals:
+                return NormalizationResult(
+                    content=content,
+                    original_content=content,
+                    level=NormalizationLevel.NONE,
+                    line_mapper=LineMapper.identity(content),
+                    success=True,
+                    errors=[
+                        "Beautification rejected: normalized output did not preserve raw literals"
+                    ],
+                )
+
+            # Build the line mapping against the beautified text BEFORE any content-changing
+            # deobfuscation: _create_line_mapping aligns NON-whitespace characters and assumes
+            # beautify only reflowed WHITESPACE. LIGHT deobfuscation changes non-whitespace
+            # (e.g. `\x41` -> `A`, folded string concats), which would drift the alignment -- so map
+            # first (correct line mapping), then deobfuscate the returned content.
+            line_mapper = self._create_line_mapping(content, beautified)
+
             if level == NormalizationLevel.LIGHT:
                 beautified, extra_errors = self._light_deobfuscate(beautified)
                 errors.extend(extra_errors)
-
-            # Create line mapping after all content transforms are done
-            line_mapper = self._create_line_mapping(content, beautified)
 
             return NormalizationResult(
                 content=beautified,
@@ -157,15 +291,18 @@ class Beautifier:
         original_column = 0
 
         beautified_line = 1
+        beautified_column = 0
         at_line_start = True
 
         for ch in beautified:
             if ch == "\n":
                 beautified_line += 1
+                beautified_column = 0
                 at_line_start = True
                 continue
             if ch in inline_ws:
-                continue
+                beautified_column += 1     # DQ-P07: count leading whitespace so the mapping records
+                continue                    # the first token's real (indented) normalized column.
 
             # Non-whitespace token char: advance original past any whitespace to
             # reach the corresponding token character.
@@ -182,7 +319,10 @@ class Beautifier:
                     original_line=original_line,
                     original_column=original_column,
                     normalized_line=beautified_line,
-                    normalized_column=0,
+                    # DQ-P07: the beautified column of the line's first token (its indentation), NOT a
+                    # 0 sentinel -- so LineMapper.get_original subtracts the beautify indentation when
+                    # reconstructing the generated column instead of folding it in.
+                    normalized_column=beautified_column,
                 ))
                 at_line_start = False
 
@@ -205,8 +345,8 @@ class Beautifier:
         # "a" + "b" -> "ab"
         import re
 
-        def fold_string_concat(match: re.Match) -> str:
-            parts = match.group(0)
+        def fold_string_concat(match: re.Match[str]) -> str:
+            parts = str(match.group(0))
             # Extract strings and concatenate (handle escaped quotes)
             strings = re.findall(r""""((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)'""", parts)
             if strings:
@@ -219,7 +359,7 @@ class Beautifier:
                         # From single-quoted source ??escape unescaped double quotes
                         pieces.append(s2.replace('"', '\\"'))
                 return f'"{("").join(pieces)}"'
-            return match.group(0)
+            return str(match.group(0))
 
         try:
             # Pattern for simple string concatenation (handle escaped quotes)
@@ -234,12 +374,12 @@ class Beautifier:
 
         # Decode simple hex/unicode escapes in strings
         try:
-            def decode_escapes(match: re.Match) -> str:
-                s = match.group(1)
+            def decode_escapes(match: re.Match[str]) -> str:
+                s = str(match.group(1))
                 try:
                     return f'"{self._decode_hex_escapes(s)}"'
                 except Exception:
-                    return match.group(0)
+                    return str(match.group(0))
 
             # Hex escapes: \x41 (handle escaped quotes and skip \\x sequences)
             content = re.sub(
@@ -248,12 +388,12 @@ class Beautifier:
                 content
             )
 
-            def decode_escapes_single(match: re.Match) -> str:
-                s = match.group(1)
+            def decode_escapes_single(match: re.Match[str]) -> str:
+                s = str(match.group(1))
                 try:
                     return f"'{self._decode_hex_escapes(s)}'"
                 except Exception:
-                    return match.group(0)
+                    return str(match.group(0))
 
             content = re.sub(
                 r"'((?:[^'\\]|\\.)*\\x[0-9a-fA-F]{2}(?:[^'\\]|\\.)*)'",
@@ -330,4 +470,3 @@ def beautify_js(content: str) -> str:
     beautifier = Beautifier()
     result = beautifier.beautify(content)
     return result.content
-

@@ -3,11 +3,17 @@ Pure presentation over a Finding -- must be accurate per category and never rais
 
 from __future__ import annotations
 
-from bundleInspector.storage.models import (
-    Finding, Evidence, Category, Severity, Confidence,
-)
 from bundleInspector.reporter.explain import (
-    explain_finding, flow_steps, highlight_snippet,
+    explain_finding,
+    flow_steps,
+    highlight_snippet,
+)
+from bundleInspector.storage.models import (
+    Category,
+    Confidence,
+    Evidence,
+    Finding,
+    Severity,
 )
 
 

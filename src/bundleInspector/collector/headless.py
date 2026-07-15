@@ -7,28 +7,46 @@ Uses Playwright to render pages and capture network requests.
 from __future__ import annotations
 
 import asyncio
+import base64
+import ipaddress
 import logging
+from collections.abc import AsyncIterator, Awaitable, Callable
 from inspect import isawaitable
-from typing import Any, AsyncIterator, Awaitable, Callable
-from bundleInspector.core.url_utils import safe_urlparse as urlparse
+from typing import Any
+from urllib.parse import urlunsplit
 
 from bs4 import BeautifulSoup
 
 from bundleInspector.collector.base import BaseCollector
-from bundleInspector.collector.scope import ScopePolicy, normalize_url, is_js_url
-from bundleInspector.config import CrawlerConfig, AuthConfig
+from bundleInspector.collector.scope import ScopePolicy, is_js_url, normalize_url
+from bundleInspector.config import AuthConfig, CrawlerConfig
+from bundleInspector.core.rate_limiter import RateLimiter
+from bundleInspector.core.safe_http import normalized_origin
+from bundleInspector.core.safe_socks import ValidatingSocksProxy
+from bundleInspector.core.security import is_url_safe
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 from bundleInspector.storage.models import JSReference, LoadMethod
 
 logger = logging.getLogger(__name__)
 
+
+class _RequestPolicyBlock(Exception):
+    """Expected browser request rejection with a telemetry-safe reason."""
+
+
 try:
+    from playwright._impl._api_structures import SetCookieParam
     from playwright.async_api import (
-        async_playwright,
         Browser,
         BrowserContext,
         Page,
+        Playwright,
         Request,
         Response,
+        Route,
+        StorageState,
+        WebSocket,
+        async_playwright,
     )
     PLAYWRIGHT_AVAILABLE = True
 except ImportError:
@@ -46,6 +64,9 @@ def _serialize_reference(ref: JSReference) -> dict[str, Any]:
         payload["method"] = ref.method.value
     if ref.headers:
         payload["headers"] = dict(ref.headers)
+    if ref.captured_content is not None:
+        payload["captured_content"] = base64.b64encode(ref.captured_content).decode("ascii")
+        payload["captured_status_code"] = ref.captured_status_code
     return payload
 
 
@@ -62,12 +83,25 @@ def _deserialize_reference(payload: Any) -> JSReference | None:
     except ValueError:
         method = LoadMethod.SCRIPT_TAG
     headers = payload.get("headers")
+    captured_content: bytes | None = None
+    encoded_content = payload.get("captured_content")
+    if isinstance(encoded_content, str):
+        try:
+            captured_content = base64.b64decode(encoded_content, validate=True)
+        except ValueError:
+            captured_content = None
+    try:
+        captured_status_code = int(payload.get("captured_status_code", 200))
+    except (TypeError, ValueError):
+        captured_status_code = 200
     return JSReference(
         url=url.strip(),
         initiator=payload.get("initiator", "") if isinstance(payload.get("initiator"), str) else "",
         load_context=payload.get("load_context", "") if isinstance(payload.get("load_context"), str) else "",
         method=method,
         headers=dict(headers) if isinstance(headers, dict) else {},
+        captured_content=captured_content,
+        captured_status_code=captured_status_code,
     )
 
 
@@ -91,12 +125,17 @@ class HeadlessCollector(BaseCollector):
     # induced by interactive clicking are blocked (or confirmed) so a scan never changes the
     # target's state.
     _MUTATING_HTTP_METHODS = frozenset({"POST", "PUT", "PATCH", "DELETE"})
+    _LOCAL_SCHEMES = frozenset({"about", "blob", "data"})
+    _MAX_BLOCKED_REQUESTS = 100
 
     def __init__(
         self,
         crawler_config: CrawlerConfig,
         auth_config: AuthConfig | None = None,
-    ):
+        *,
+        allow_private_ips: bool = False,
+        rate_limiter: RateLimiter | None = None,
+    ) -> None:
         if not PLAYWRIGHT_AVAILABLE:
             raise ImportError(
                 "Playwright is required for headless collection. "
@@ -105,8 +144,14 @@ class HeadlessCollector(BaseCollector):
 
         self.config = crawler_config
         self.auth = auth_config or AuthConfig()
-        self._playwright = None
+        self.allow_private_ips = allow_private_ips
+        self.rate_limiter = rate_limiter
+        self._playwright: Playwright | None = None
         self._browser: Browser | None = None
+        self._socks_proxy: ValidatingSocksProxy | None = None
+        self._proxy_lock = asyncio.Lock()
+        self._request_semaphore = asyncio.Semaphore(max(1, self.config.max_concurrent))
+        self._body_capture_semaphore = asyncio.Semaphore(max(1, self.config.max_concurrent))
         self.on_progress: Callable[[dict[str, Any]], Awaitable[None] | None] | None = None
         self._discovered_refs: list[JSReference] = []
         self._discovered_ref_index: int = 0
@@ -122,13 +167,15 @@ class HeadlessCollector(BaseCollector):
         self._interactive_pending_selector_index: int | None = None
         self._interactive_pending_element_index: int | None = None
         self._interactive_complete: bool = False
-        self._browser_storage_state: dict[str, Any] = {}
+        self._browser_storage_state: StorageState | None = None
         self._current_page_url: str = ""
         self._active_context: BrowserContext | None = None
         self._active_page: Page | None = None
         self._resume_loaded: bool = False
         self._collection_finished: bool = False
         self._progress_tasks: set[asyncio.Task[None]] = set()
+        self._response_body_tasks: set[asyncio.Task[None]] = set()
+        self._logged_progress_task_ids: set[int] = set()
         # enh2: URLs the running app actually requested (xhr/fetch), as (METHOD, url).
         # Accumulates for the collector's lifetime -- deliberately NOT cleared by
         # reset_resume_state so observations survive per-page route exploration.
@@ -140,15 +187,21 @@ class HeadlessCollector(BaseCollector):
         # allowing one; otherwise it is blocked. _blocked_state_changes records what was stopped.
         self._suppress_mutations: bool = False
         self._blocked_state_changes: list[dict[str, Any]] = []
+        self._blocked_requests: list[dict[str, Any]] = []
+        self._blocked_request_count = 0
+        self._blocked_requests_dropped = 0
+        self._terminal_failures: list[dict[str, Any]] = []
+        self._terminal_navigation_block: str | None = None
         self.on_state_change_attempt: (
             Callable[[dict[str, Any]], Awaitable[bool] | bool] | None
         ) = None
 
     async def setup(self) -> None:
         """Initialize browser."""
-        self._playwright = await async_playwright().start()
+        playwright = await async_playwright().start()
+        self._playwright = playwright
         try:
-            self._browser = await self._playwright.chromium.launch(
+            self._browser = await playwright.chromium.launch(
                 headless=True,
             )
         except Exception:
@@ -158,7 +211,7 @@ class HeadlessCollector(BaseCollector):
             # Windows' Proactor loop prints "I/O operation on closed pipe" from transport
             # __del__ at interpreter shutdown.
             try:
-                await self._playwright.stop()
+                await playwright.stop()
             finally:
                 self._playwright = None
             raise
@@ -169,11 +222,18 @@ class HeadlessCollector(BaseCollector):
             if self._browser:
                 await self._browser.close()
         finally:
-            # Always stop the Playwright driver even if browser.close() raised
-            # (e.g. the browser already crashed) -- otherwise the driver
-            # subprocess leaks.
-            if self._playwright:
-                await self._playwright.stop()
+            try:
+                await self._close_socks_proxy()
+            finally:
+                # Always stop the Playwright driver even if browser.close() raised
+                # (e.g. the browser already crashed) -- otherwise the driver
+                # subprocess leaks.
+                try:
+                    if self._playwright:
+                        await self._playwright.stop()
+                finally:
+                    self._browser = None
+                    self._playwright = None
 
     async def collect(
         self,
@@ -199,7 +259,7 @@ class HeadlessCollector(BaseCollector):
             await self.setup()
 
         # Create browser context with auth
-        context = await self._create_context(url)
+        context = await self._create_context(url, scope)
         self._active_context = context
 
         try:
@@ -215,30 +275,57 @@ class HeadlessCollector(BaseCollector):
             async for ref in self._drain_discovered_refs(scope, seen_urls):
                 yield ref
 
-            # Navigate to page
+            # Navigate to page. Each configured retry gets both wait strategies; policy blocks are
+            # terminal and never retried because no amount of backoff can make them permissible.
             navigation_succeeded = False
             resume_url = self._current_page_url or url
-            try:
-                await page.goto(
-                    resume_url,
-                    wait_until="networkidle",
-                    timeout=int(self.config.page_timeout * 1000),
-                )
-                navigation_succeeded = True
-            except Exception as e:
-                logger.debug(f"networkidle timeout for {resume_url}, trying domcontentloaded: {e}")
-                # Try with domcontentloaded if networkidle times out
+            self._terminal_navigation_block = None
+            attempts = max(0, self.config.max_retries) + 1
+            for attempt in range(attempts):
                 try:
                     await page.goto(
                         resume_url,
-                        wait_until="domcontentloaded",
+                        wait_until="networkidle",
                         timeout=int(self.config.page_timeout * 1000),
                     )
                     navigation_succeeded = True
-                except Exception as e2:
-                    logger.warning(f"Failed to navigate to {resume_url}: {e2}")
+                    break
+                except Exception as e:
+                    if self._terminal_navigation_block is not None:
+                        break
+                    logger.debug(
+                        f"networkidle timeout for {resume_url}, trying domcontentloaded: {e}"
+                    )
+                    try:
+                        await page.goto(
+                            resume_url,
+                            wait_until="domcontentloaded",
+                            timeout=int(self.config.page_timeout * 1000),
+                        )
+                        navigation_succeeded = True
+                        break
+                    except Exception as e2:
+                        if self._terminal_navigation_block is not None:
+                            break
+                        if attempt + 1 >= attempts:
+                            logger.warning(f"Failed to navigate to {resume_url}: {e2}")
+                        else:
+                            await asyncio.sleep(max(0.0, self.config.retry_delay))
 
             if not navigation_succeeded:
+                # A timed-out/aborted navigation may still have delivered executable responses.
+                # Preserve that monotonic evidence before surfacing the incomplete navigation.
+                await self._wait_for_response_bodies()
+                async for ref in self._drain_discovered_refs(scope, seen_urls):
+                    yield ref
+                if self._terminal_navigation_block is not None:
+                    self._record_terminal_failure(
+                        resume_url,
+                        self._terminal_navigation_block,
+                        "navigation_policy_blocked",
+                    )
+                else:
+                    self._record_retryable_failure(resume_url, "navigation failed")
                 return
 
             self._current_page_url = str(getattr(page, "url", "") or resume_url)
@@ -251,6 +338,7 @@ class HeadlessCollector(BaseCollector):
                 await self._explore_routes(page, url, scope)
 
             self._discovered_refs_complete = True
+            await self._wait_for_response_bodies()
             await self._notify_progress()
 
             async for ref in self._drain_discovered_refs(scope, seen_urls):
@@ -258,13 +346,14 @@ class HeadlessCollector(BaseCollector):
 
         finally:
             self._collection_finished = True
+            await self._wait_for_response_bodies()
             await self._wait_for_progress_notifications()
             self.reset_resume_state()
             self._active_page = None
             self._active_context = None
             await context.close()
 
-    def _on_websocket(self, ws) -> None:
+    def _on_websocket(self, ws: WebSocket) -> None:
         """enh7: record a WebSocket URL the app opened at runtime. Best-effort, read-only."""
         if self._collection_finished:
             return
@@ -301,8 +390,14 @@ class HeadlessCollector(BaseCollector):
         self._interactive_pending_selector_index = None
         self._interactive_pending_element_index = None
         self._interactive_complete = False
-        self._browser_storage_state = {}
+        self._browser_storage_state = None
         self._current_page_url = ""
+
+    async def _wait_for_response_bodies(self) -> None:
+        """Drain browser-body captures so yielded references can avoid an unsafe refetch."""
+        while self._response_body_tasks:
+            pending = list(self._response_body_tasks)
+            await asyncio.gather(*pending, return_exceptions=True)
 
     def load_resume_state(self, state: dict[str, Any]) -> None:
         """Load persisted route-exploration progress for a partial headless page."""
@@ -375,9 +470,9 @@ class HeadlessCollector(BaseCollector):
             except (TypeError, ValueError):
                 self._interactive_pending_element_index = None
         self._interactive_complete = bool(state.get("interactive_complete"))
-        browser_storage_state = state.get("browser_storage_state")
-        if isinstance(browser_storage_state, dict):
-            self._browser_storage_state = dict(browser_storage_state)
+        # Browser cookies and local/session storage values are credentials, not resumable progress.
+        # Older checkpoints may contain a plaintext `browser_storage_state`; deliberately ignore it
+        # so loading and re-exporting a legacy file cannot perpetuate that secret-bearing contract.
         self._current_page_url = (
             state.get("current_page_url", "").strip()
             if isinstance(state.get("current_page_url"), str)
@@ -424,7 +519,9 @@ class HeadlessCollector(BaseCollector):
                 state["interactive_pending_element_index"] = self._interactive_pending_element_index
             state["interactive_complete"] = self._interactive_complete
         if self._browser_storage_state:
-            state["browser_storage_state"] = dict(self._browser_storage_state)
+            state["browser_storage_state_redacted"] = self._storage_state_summary(
+                self._browser_storage_state
+            )
         if self._current_page_url:
             state["current_page_url"] = self._current_page_url
         return state
@@ -443,7 +540,7 @@ class HeadlessCollector(BaseCollector):
             await result
 
     async def _capture_runtime_state(self) -> None:
-        """Best-effort snapshot of practical browser/page state for resume checkpoints."""
+        """Capture page progress and keep browser credentials in memory only."""
         if self._active_page is not None:
             page_url = str(getattr(self._active_page, "url", "") or "").strip()
             if page_url:
@@ -455,68 +552,305 @@ class HeadlessCollector(BaseCollector):
                 logger.debug(f"Failed to snapshot browser storage state: {e}")
             else:
                 if isinstance(storage_state, dict):
-                    self._browser_storage_state = dict(storage_state)
+                    self._browser_storage_state = storage_state
 
-    async def _create_context(self, target_url: str) -> BrowserContext:
-        """Create browser context with auth settings."""
-        context_options = {
+    @staticmethod
+    def _storage_state_summary(storage_state: StorageState) -> dict[str, Any]:
+        """Describe omitted browser state without exposing names, origins, or values."""
+        cookies = storage_state.get("cookies")
+        origins = storage_state.get("origins")
+        cookie_count = len(cookies) if isinstance(cookies, list) else 0
+        origin_count = len(origins) if isinstance(origins, list) else 0
+        local_storage_entry_count = 0
+        if isinstance(origins, list):
+            for origin in origins:
+                if not isinstance(origin, dict):
+                    continue
+                entries = origin.get("localStorage")
+                if isinstance(entries, list):
+                    local_storage_entry_count += len(entries)
+        return {
+            "persisted": False,
+            "cookie_count": cookie_count,
+            "origin_count": origin_count,
+            "local_storage_entry_count": local_storage_entry_count,
+        }
+
+    @property
+    def blocked_requests(self) -> list[dict[str, Any]]:
+        """Return bounded, credential-free telemetry for browser requests blocked by policy."""
+        return [dict(item) for item in self._blocked_requests]
+
+    @property
+    def blocked_request_count(self) -> int:
+        """Return the total number of blocked browser requests, including telemetry overflow."""
+        return self._blocked_request_count
+
+    @property
+    def blocked_requests_dropped(self) -> int:
+        """Return the number of blocked requests omitted from the bounded telemetry list."""
+        return self._blocked_requests_dropped
+
+    @property
+    def terminal_failures(self) -> list[dict[str, Any]]:
+        """Return terminal collection losses that must not trigger futile retries."""
+        return [dict(item) for item in self._terminal_failures]
+
+    def _record_terminal_failure(self, url: str, reason: str, code: str) -> None:
+        record = {"url": url, "reason": reason[:160], "code": code, "phase": self.name}
+        if record not in self._terminal_failures:
+            self._terminal_failures.append(record)
+
+    @staticmethod
+    def _origin_url(origin: tuple[str, str, int]) -> str:
+        scheme, host, port = origin
+        try:
+            is_ipv6 = ipaddress.ip_address(host).version == 6
+        except ValueError:
+            is_ipv6 = False
+        authority = f"[{host}]" if is_ipv6 else host
+        default_port = 443 if scheme == "https" else 80
+        if port != default_port:
+            authority = f"{authority}:{port}"
+        return f"{scheme}://{authority}/"
+
+    @staticmethod
+    def _mapped_network_url(url: str) -> str | None:
+        """Map WebSocket schemes to their HTTP equivalents for shared SSRF/origin policy."""
+        parsed = urlparse(url)
+        scheme = (parsed.scheme or "").lower()
+        mapped_scheme = {"http": "http", "https": "https", "ws": "http", "wss": "https"}.get(
+            scheme
+        )
+        if mapped_scheme is None or not parsed.netloc:
+            return None
+        return urlunsplit((mapped_scheme, parsed.netloc, parsed.path, parsed.query, ""))
+
+    @staticmethod
+    def _redirect_hops(request: Request, limit: int) -> int:
+        """Count a Playwright redirect chain with cycle and traversal bounds."""
+        current = getattr(request, "redirected_from", None)
+        seen: set[int] = set()
+        hops = 0
+        traversal_limit = max(0, limit) + 1
+        while current is not None:
+            marker = id(current)
+            if marker in seen:
+                raise ValueError("cyclic redirect chain")
+            seen.add(marker)
+            hops += 1
+            if hops > traversal_limit:
+                return hops
+            current = getattr(current, "redirected_from", None)
+        return hops
+
+    @staticmethod
+    def _telemetry_url(url: str) -> str:
+        """Project a URL without userinfo, query, or fragment into bounded telemetry."""
+        mapped = HeadlessCollector._mapped_network_url(url)
+        if mapped is None:
+            scheme = (urlparse(url).scheme or "invalid").lower()
+            return f"{scheme}:<redacted>"
+        origin = normalized_origin(mapped)
+        if origin is None:
+            return "invalid:<redacted>"
+        return HeadlessCollector._origin_url(origin).rstrip("/")
+
+    def _record_blocked_request(self, request: Request, reason: str) -> None:
+        self._blocked_request_count += 1
+        if len(self._blocked_requests) >= self._MAX_BLOCKED_REQUESTS:
+            self._blocked_requests_dropped += 1
+            return
+        self._blocked_requests.append({
+            "method": str(getattr(request, "method", "") or "").upper()[:16],
+            "resource_type": str(getattr(request, "resource_type", "") or "")[:32],
+            "url": self._telemetry_url(str(getattr(request, "url", "") or "")),
+            "reason": reason[:160],
+        })
+
+    async def _ensure_socks_proxy(self) -> ValidatingSocksProxy:
+        async with self._proxy_lock:
+            if self._socks_proxy is not None:
+                return self._socks_proxy
+            proxy = ValidatingSocksProxy(
+                allow_private_ips=self.allow_private_ips,
+                connect_timeout=max(0.1, self.config.request_timeout),
+                max_clients=self.config.max_concurrent,
+            )
+            try:
+                await proxy.start()
+            except BaseException:
+                try:
+                    await proxy.close()
+                except Exception:
+                    logger.debug("Failed to close an unstarted SOCKS proxy", exc_info=True)
+                raise
+            self._socks_proxy = proxy
+            return proxy
+
+    async def _close_socks_proxy(self) -> None:
+        async with self._proxy_lock:
+            proxy = self._socks_proxy
+            self._socks_proxy = None
+            if proxy is not None:
+                await proxy.close()
+
+    async def _create_context(
+        self,
+        target_url: str,
+        scope: ScopePolicy,
+    ) -> BrowserContext:
+        """Create a TLS-verifying, DNS-pinned browser context with exact-origin auth."""
+        # Fresh page: start with the mutation guard DISARMED so this page's initial load renders
+        # normally; _explore_routes re-arms it and deliberately leaves it armed for the rest of the
+        # page's lifetime to catch click-scheduled deferred mutations.
+        self._suppress_mutations = False
+        browser = self._browser
+        if browser is None:
+            raise RuntimeError("Headless browser is not initialized")
+        target_origin = normalized_origin(target_url)
+        if target_origin is None:
+            raise ValueError("headless target must be an absolute HTTP(S) origin")
+        proxy = await self._ensure_socks_proxy()
+        context_options: dict[str, Any] = {
             "user_agent": self.config.user_agent,
             "viewport": {"width": 1920, "height": 1080},
-            "ignore_https_errors": True,
+            "ignore_https_errors": False,
+            # Playwright routes do not see requests intercepted by service workers.
+            "service_workers": "block",
+            "proxy": {"server": proxy.url, "bypass": "<-loopback>"},
         }
-        # Block service workers while the state-change guard is on so no request can bypass
-        # the "**/*" route interception via a SW-originated fetch.
-        if self.config.block_state_changing_requests:
-            context_options["service_workers"] = "block"
-        if self._browser_storage_state:
-            context_options["storage_state"] = dict(self._browser_storage_state)
+        if self._browser_storage_state is not None:
+            context_options["storage_state"] = self._browser_storage_state
+        try:
+            context = await browser.new_context(**context_options)
+        except BaseException:
+            try:
+                await self._close_socks_proxy()
+            except Exception:
+                logger.debug("Failed to close SOCKS proxy after context failure", exc_info=True)
+            raise
 
-        context = await self._browser.new_context(**context_options)
-
-        # Add cookies with domain extracted from target URL
-        if self.auth.cookies:
-            parsed = urlparse(target_url)
-            domain = parsed.hostname or parsed.netloc
-            cookies = []
-            for name, value in self.auth.cookies.items():
-                cookies.append({
-                    "name": name,
-                    "value": value,
-                    "domain": domain,
-                    "path": "/",
-                })
-            await context.add_cookies(cookies)
-
-        # Network route handler: (1) inject auth headers, and (2) enforce the state-change
-        # guard so the tool's UI driving never mutates the target. Installed whenever the
-        # guard is on (default) or auth is configured; controlled by block_state_changing_
-        # requests ALONE (not coupled to interactive_clicking), so route-link exploration is
-        # covered too. While _suppress_mutations is armed (whole exploration phase), any
-        # non-idempotent request is recorded and then blocked/confirmed rather than sent.
-        has_auth = bool(self.auth.headers or self.auth.bearer_token or self.auth.basic_auth)
+        configured_auth_headers = self.auth.get_auth_headers()
+        auth_by_lower: dict[str, tuple[str, str]] = {}
+        for name, value in configured_auth_headers.items():
+            lowered = name.lower()
+            if lowered not in {"host", "content-length", "transfer-encoding", "cookie"}:
+                auth_by_lower[lowered] = (name, value)
+        configured_header_names = {
+            name.lower()
+            for name in configured_auth_headers
+        }
         guard_state_changes = bool(self.config.block_state_changing_requests)
-        if has_auth or guard_state_changes:
-            auth_headers = self.auth.get_auth_headers() if has_auth else {}
 
-            async def _route_handler(route, request):
-                if (
-                    guard_state_changes
-                    and self._suppress_mutations
-                    and request.method.upper() in self._MUTATING_HTTP_METHODS
-                ):
-                    if not await self._confirm_state_change(request):
-                        await route.abort()
-                        return
-                if auth_headers:
-                    await route.continue_(headers={**request.headers, **auth_headers})
-                else:
-                    await route.continue_()
+        def _is_main_document_request(request: Request) -> bool:
+            if str(getattr(request, "resource_type", "")) != "document":
+                return False
+            navigation_marker = getattr(request, "is_navigation_request", None)
+            try:
+                if callable(navigation_marker) and not navigation_marker():
+                    return False
+                frame = getattr(request, "frame", None)
+                return frame is None or getattr(frame, "parent_frame", None) is None
+            except Exception:
+                return False
 
+        async def _route_handler(route: Route, request: Request) -> None:
+            request_url = str(getattr(request, "url", "") or "")
+            request_headers = {
+                name: value
+                for name, value in dict(getattr(request, "headers", {}) or {}).items()
+                if name.lower() not in configured_header_names
+            }
+            scheme = (urlparse(request_url).scheme or "").lower()
+            if scheme in self._LOCAL_SCHEMES:
+                await route.continue_(headers=request_headers)
+                return
+            mapped_url = self._mapped_network_url(request_url)
+            if mapped_url is None:
+                self._record_blocked_request(request, "unsupported network scheme")
+                await route.abort()
+                return
+            try:
+                redirect_hops = self._redirect_hops(request, self.config.max_redirects)
+                if redirect_hops and not self.config.follow_redirects:
+                    raise _RequestPolicyBlock("redirects are disabled")
+                if redirect_hops > self.config.max_redirects:
+                    raise _RequestPolicyBlock("redirect limit exceeded")
+                is_safe, _ = is_url_safe(
+                    mapped_url,
+                    resolve_dns=False,
+                    allow_private_ips=self.allow_private_ips,
+                )
+                if not is_safe:
+                    raise _RequestPolicyBlock("SSRF policy rejected request")
+                if not scope.is_allowed(mapped_url):
+                    raise _RequestPolicyBlock("URL is outside configured scope")
+            except asyncio.CancelledError:
+                raise
+            except _RequestPolicyBlock as exc:
+                self._record_blocked_request(request, str(exc))
+                if _is_main_document_request(request):
+                    self._terminal_navigation_block = str(exc)
+                await route.abort()
+                return
+            except Exception as exc:
+                self._record_blocked_request(
+                    request,
+                    f"request validation failed: {type(exc).__name__}",
+                )
+                await route.abort()
+                return
+
+            if (
+                guard_state_changes
+                and self._suppress_mutations
+                and request.method.upper() in self._MUTATING_HTTP_METHODS
+                and not await self._confirm_state_change(request)
+            ):
+                await route.abort()
+                return
+
+            if normalized_origin(mapped_url) == target_origin:
+                for _, (name, value) in auth_by_lower.items():
+                    request_headers[name] = value
+            try:
+                async with self._request_semaphore:
+                    if self.rate_limiter is not None:
+                        await self.rate_limiter.acquire(mapped_url)
+                    await route.continue_(headers=request_headers)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                self._record_blocked_request(
+                    request,
+                    f"request dispatch failed: {type(exc).__name__}",
+                )
+                await route.abort()
+
+        try:
+            if self.auth.cookies:
+                cookie_url = self._origin_url(target_origin)
+                cookies: list[SetCookieParam] = [
+                    {
+                        "name": name,
+                        "value": value,
+                        "url": cookie_url,
+                        "secure": target_origin[0] == "https",
+                    }
+                    for name, value in self.auth.cookies.items()
+                ]
+                await context.add_cookies(cookies)
             await context.route("**/*", _route_handler)
-
+        except BaseException:
+            try:
+                await context.close()
+            finally:
+                await self._close_socks_proxy()
+            raise
         return context
 
-    async def _confirm_state_change(self, request) -> bool:
+    async def _confirm_state_change(self, request: Request) -> bool:
         """Decide whether a state-changing request induced by UI driving may proceed.
 
         The endpoint is ALWAYS recorded first (as an observed request + a blocked entry) so
@@ -576,9 +910,17 @@ class HeadlessCollector(BaseCollector):
 
         # Check if it's a JS response
         content_type = response.headers.get("content-type", "")
+        # Honor the browser's own classification: a resource the engine fetched AS a <script>
+        # (resource_type == "script") is executable JS even when the URL is extensionless and the
+        # content-type is generic (text/plain, application/octet-stream). Best-effort read.
+        try:
+            resource_type = response.request.resource_type
+        except Exception:
+            resource_type = ""
         is_js = (
             "javascript" in content_type.lower() or
             "ecmascript" in content_type.lower() or
+            resource_type == "script" or
             is_js_url(url)
         )
 
@@ -590,7 +932,14 @@ class HeadlessCollector(BaseCollector):
 
         # Get initiator info from request
         request = response.request
-        frame = request.frame
+        # Request.frame RAISES for a service-worker / pre-navigation request that has no frame
+        # (real Playwright: "Service Worker requests do not have an associated frame."). Honoring
+        # resource_type==script above widened which such requests reach here, so guard the access
+        # (mirrors the resource_type read) -- a sync page.on("response") handler must not throw.
+        try:
+            frame = request.frame
+        except Exception:
+            frame = None
         initiator = initiator_url
         load_context = initiator_url
 
@@ -612,7 +961,39 @@ class HeadlessCollector(BaseCollector):
             return
         self._discovered_ref_keys.add(ref_key)
         self._discovered_refs.append(ref)
+        body_method = getattr(response, "body", None)
+        if callable(body_method):
+            task = asyncio.create_task(self._capture_response_body(response, ref))
+            self._response_body_tasks.add(task)
+            task.add_done_callback(self._response_body_tasks.discard)
         self._schedule_progress_notification()
+
+    async def _capture_response_body(self, response: Response, ref: JSReference) -> None:
+        """Reuse the browser-authenticated JS body without persisting browser credentials."""
+        try:
+            content_length = response.headers.get("content-length")
+            if content_length and int(content_length) > self.config.max_file_size:
+                self._record_terminal_failure(
+                    ref.url,
+                    "browser response exceeded body limit",
+                    "browser_response_too_large",
+                )
+                return
+            async with self._body_capture_semaphore:
+                body = await response.body()
+            if len(body) <= self.config.max_file_size:
+                ref.captured_content = body
+                ref.captured_status_code = int(getattr(response, "status", 200) or 200)
+            else:
+                self._record_terminal_failure(
+                    ref.url,
+                    "browser response exceeded body limit",
+                    "browser_response_too_large",
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(f"browser response body capture failed for {ref.url}: {exc}")
 
     async def _drain_discovered_refs(
         self,
@@ -648,7 +1029,7 @@ class HeadlessCollector(BaseCollector):
             return
         exc = task.exception()
         if exc is not None:
-            setattr(task, "_bundleInspector_progress_logged", True)
+            self._logged_progress_task_ids.add(id(task))
             logger.warning("headless progress notification error: %s", exc)
 
     async def _wait_for_progress_notifications(self) -> None:
@@ -657,10 +1038,11 @@ class HeadlessCollector(BaseCollector):
             return
         tasks = list(self._progress_tasks)
         results = await asyncio.gather(*tasks, return_exceptions=True)
-        for task, result in zip(tasks, results):
-            if isinstance(result, Exception) and not getattr(task, "_bundleInspector_progress_logged", False):
-                setattr(task, "_bundleInspector_progress_logged", True)
+        for task, result in zip(tasks, results, strict=True):
+            if isinstance(result, Exception) and id(task) not in self._logged_progress_task_ids:
+                self._logged_progress_task_ids.add(id(task))
                 logger.warning("headless progress notification error: %s", result)
+        self._logged_progress_task_ids.difference_update(id(task) for task in tasks)
 
     async def _explore_routes(
         self,
@@ -677,12 +1059,13 @@ class HeadlessCollector(BaseCollector):
         disarming. Requests the app fires OUTSIDE this phase (initial page load) are not
         touched, preserving normal rendering and detection.
         """
+        # Arm the guard for the REST of this page's lifetime, not just the exploration phase: a
+        # click handler can schedule a state-changing request via setTimeout that fires AFTER the
+        # settle below, so disarming here would let that deferred mutation through. It is reset at
+        # the start of each new page's _create_context, so the next page's initial load is unaffected.
         self._suppress_mutations = True
-        try:
-            await self._explore_routes_impl(page, base_url, scope)
-            await asyncio.sleep(0.5)  # settle: catch late click-induced requests
-        finally:
-            self._suppress_mutations = False
+        await self._explore_routes_impl(page, base_url, scope)
+        await asyncio.sleep(0.5)  # settle: catch promptly-deferred click-induced requests
 
     async def _explore_routes_impl(
         self,
@@ -907,10 +1290,18 @@ class HeadlessMultiPageCollector(BaseCollector):
         self,
         crawler_config: CrawlerConfig,
         auth_config: AuthConfig | None = None,
-    ):
+        *,
+        allow_private_ips: bool = False,
+        rate_limiter: RateLimiter | None = None,
+    ) -> None:
         self.config = crawler_config
         self.auth = auth_config or AuthConfig()
-        self._collector = HeadlessCollector(crawler_config, auth_config)
+        self._collector = HeadlessCollector(
+            crawler_config,
+            auth_config,
+            allow_private_ips=allow_private_ips,
+            rate_limiter=rate_limiter,
+        )
         self._visited_urls: set[str] = set()
         self._collected_js: set[str] = set()
         self._pending_pages: list[tuple[str, int]] = []
@@ -941,11 +1332,29 @@ class HeadlessMultiPageCollector(BaseCollector):
         return self._collector._blocked_state_changes
 
     @property
-    def on_state_change_attempt(self):
+    def blocked_requests(self) -> list[dict[str, Any]]:
+        """Browser requests blocked by network, redirect, scope, or limiter policy."""
+        return self._collector.blocked_requests
+
+    @property
+    def blocked_request_count(self) -> int:
+        return self._collector.blocked_request_count
+
+    @property
+    def blocked_requests_dropped(self) -> int:
+        return self._collector.blocked_requests_dropped
+
+    @property
+    def on_state_change_attempt(
+        self,
+    ) -> Callable[[dict[str, Any]], Awaitable[bool] | bool] | None:
         return self._collector.on_state_change_attempt
 
     @on_state_change_attempt.setter
-    def on_state_change_attempt(self, handler) -> None:
+    def on_state_change_attempt(
+        self,
+        handler: Callable[[dict[str, Any]], Awaitable[bool] | bool] | None,
+    ) -> None:
         self._collector.on_state_change_attempt = handler
 
     async def setup(self) -> None:
@@ -1229,7 +1638,7 @@ class HeadlessMultiPageCollector(BaseCollector):
             return []
 
         # Use the collector's context creation to include auth settings
-        context = await self._collector._create_context(url)
+        context = await self._collector._create_context(url, scope)
         try:
             page = await context.new_page()
             try:
@@ -1311,5 +1720,7 @@ class HeadlessMultiPageCollector(BaseCollector):
             if any(link_parsed.path.endswith(ext) for ext in resource_exts):
                 continue
             result.append(link)
-        return list(set(result))
-
+        # dict.fromkeys dedups while PRESERVING document order; list(set(...)) randomized it
+        # (PYTHONHASHSEED-dependent), so which pages the caller's "[:20]" cap kept -- and thus
+        # which JS was discovered -- differed every run. Mirrors static.py _extract_page_links.
+        return list(dict.fromkeys(result))

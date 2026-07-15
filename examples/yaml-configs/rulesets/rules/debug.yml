@@ -6,7 +6,7 @@ rules:
     confidence: medium
     matcher:
       type: regex
-      pattern: "(?i)\\b(/debug|/health|/metrics|/internal|/admin|/actuator)\\b"
+      pattern: "(?i)(?<![\\w/])(/debug|/health|/metrics|/internal|/admin|/actuator)\\b"
       capture_as: path
     extract:
       fields:

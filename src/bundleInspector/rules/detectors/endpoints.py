@@ -6,8 +6,10 @@ Extracts API paths, methods, and parameters from JS.
 
 from __future__ import annotations
 
+import json
 import re
-from typing import Any, Iterator, Optional
+from collections.abc import Iterator
+from typing import Any
 from urllib.parse import urljoin
 
 import structlog
@@ -17,8 +19,10 @@ from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
 from bundleInspector.storage.models import (
     Category,
     Confidence,
+    FunctionCall,
     IntermediateRepresentation,
     Severity,
+    StringLiteral,
 )
 
 _BLOCKED_STRING = "__JSFINDER_BLOCKED__"
@@ -33,6 +37,11 @@ logger = structlog.get_logger(__name__)
 # any real expression depth, so it never perturbs normal output, but well below the
 # interpreter limit so it degrades to "unresolved" instead of raising RecursionError.
 _MAX_RESOLVE_DEPTH = 250
+
+# String-literal mask for the doc-context heuristic (compiled once). The non-escape branch is
+# `(?!\1)[^\\]` -- DISJOINT from the `\\.` escape branch -- so it is linear, not the exponential
+# Fibonacci backtracking an overlapping bare `.` causes on an unterminated quote + backslash run.
+_DOC_MASK_RE = re.compile(r"""(["\'`])(?:\\.|(?!\1)[^\\])*\1""")
 
 
 class EndpointDetector(BaseRule):
@@ -54,18 +63,80 @@ class EndpointDetector(BaseRule):
 
     # HTTP client function names (exact match for short names)
     HTTP_FUNCTIONS_EXACT = {
-        "fetch", "axios", "request", "ajax",
+        "fetch",
+        "axios",
+        "request",
+        "ajax",
     }
 
     # HTTP method-named functions (only match as obj.method patterns)
     HTTP_METHOD_FUNCTIONS = {
-        "get", "post", "put", "patch", "delete", "head", "options",
+        "get",
+        "post",
+        "put",
+        "patch",
+        "delete",
+        "head",
+        "options",
     }
+
+    HTTP_RECEIVER_HINTS = frozenset(
+        {
+            "api",
+            "http",
+            "https",
+            "httpclient",
+            "client",
+            "request",
+            "requester",
+            "rest",
+            "restclient",
+            "transport",
+            "network",
+            "net",
+        }
+    )
+
+    # Receivers whose `.get/.post/.set/...` are NOT HTTP calls -- so `cache.get("/api/x")`,
+    # `map.get(...)`, `store.set(...)` are not reported as HIGH-confidence HTTP endpoints without any
+    # client provenance (DQ-E03). Kept to clearly-non-client data structures/stores to avoid FNs.
+    NON_HTTP_RECEIVERS = frozenset(
+        {
+            "cache",
+            "map",
+            "store",
+            "storage",
+            "localstorage",
+            "sessionstorage",
+            "params",
+            "searchparams",
+            "urlsearchparams",
+            "headers",
+            "formdata",
+            "set",
+            "weakmap",
+            "weakset",
+            "query",
+            "cookies",
+            "registry",
+            "collection",
+            "db",
+            "database",
+            "redis",
+            "memcache",
+            "lru",
+        }
+    )
 
     # axios statics that are not HTTP requests (client factories/helpers).
     # `axios.create` is a client factory handled by _build_client_base_urls, not a request.
     AXIOS_NON_REQUEST_MEMBERS = {
-        "create", "all", "spread", "iscancel", "canceltoken", "getadapter",
+        "create",
+        "all",
+        "spread",
+        "iscancel",
+        "canceltoken",
+        "getadapter",
     }
 
     # URL patterns
@@ -81,20 +152,46 @@ class EndpointDetector(BaseRule):
     ]
 
     STATIC_ASSET_EXTENSIONS = {
-        ".js", ".mjs", ".cjs", ".css", ".png", ".jpg", ".jpeg",
-        ".gif", ".svg", ".ico", ".woff", ".woff2", ".ttf",
-        ".eot", ".map",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".css",
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".svg",
+        ".ico",
+        ".woff",
+        ".woff2",
+        ".ttf",
+        ".eot",
+        ".map",
     }
 
     DOC_CONTEXT_HINTS = {
-        "example", "sample", "demo", "readme", "docs", "documentation",
-        "guide", "guides", "tutorial", "snippet", "reference",
+        "example",
+        "sample",
+        "demo",
+        "readme",
+        "docs",
+        "documentation",
+        "guide",
+        "guides",
+        "tutorial",
+        "snippet",
+        "reference",
     }
 
     API_HOST_LABELS = {"api", "graphql", "rpc", "rest", "webhook", "socket", "ws"}
 
     API_QUERY_HINTS = (
-        "api_key=", "apikey=", "token=", "access_token=", "auth=", "graphql",
+        "api_key=",
+        "apikey=",
+        "token=",
+        "access_token=",
+        "auth=",
+        "graphql",
     )
 
     # enh6: GraphQL + WebSocket message surface extraction.
@@ -109,7 +206,9 @@ class EndpointDetector(BaseRule):
 
     # enh4: method-flip advisory verbs + IDOR path-parameter recognition.
     STANDARD_HTTP_VERBS = ("GET", "POST", "PUT", "PATCH", "DELETE")
-    _RE_TEMPLATE = re.compile(r"\$\{([^}]*)\}")
+    _RE_TEMPLATE = re.compile(
+        r"\$\{([^}]{0,1024})\}"
+    )  # bounded: unbounded [^}]* was O(n^2) on `${`+long
     _RE_EXPRESS = re.compile(r"^:[A-Za-z_]\w*$")
     _RE_UUID = re.compile(
         r"^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$"
@@ -134,6 +233,45 @@ class EndpointDetector(BaseRule):
         re.IGNORECASE,
     )
 
+    def __init__(self, config: Any | None = None) -> None:
+        # DQ-O05: honor rules.extract_headers / extract_parameters (default True). When False, the
+        # corresponding request-contract fields are left empty instead of being extracted
+        # unconditionally. Endpoint discovery itself is unaffected -- only the contract detail.
+        self.extract_headers = (
+            bool(getattr(config, "extract_headers", True)) if config is not None else True
+        )
+        self.extract_parameters = (
+            bool(getattr(config, "extract_parameters", True)) if config is not None else True
+        )
+
+    @staticmethod
+    def _contract_richness(result: RuleResult) -> int:
+        """DQ-E01: score how much replayable detail a finding's request_contract carries, so the
+        dedup keeps the most-informative callsite for a (method, url) instead of the first in source
+        order. Auth presence dominates (it is the security-relevant field)."""
+        c = (result.metadata or {}).get("request_contract") or {}
+        score = 0
+        if c.get("auth"):
+            score += 4
+        if c.get("headers"):
+            score += 2
+        if (c.get("body") or {}).get("kind") not in (None, "none", "unknown"):
+            score += 2
+        if c.get("query_params"):
+            score += 1
+        return score
+
+    @classmethod
+    def _contract_selection_key(cls, result: RuleResult) -> tuple[Any, ...]:
+        contract = (result.metadata or {}).get("request_contract") or {}
+        canonical = json.dumps(contract, sort_keys=True, separators=(",", ":"), default=str)
+        return (
+            cls._contract_richness(result),
+            canonical,
+            -int(result.line or 0),
+            -int(result.column or 0),
+        )
+
     def _is_placeholder_value(self, value: Any) -> bool:
         """Return True for placeholder strings used only for partial URL assembly."""
         return isinstance(value, str) and value.startswith("${") and value.endswith("}")
@@ -150,6 +288,7 @@ class EndpointDetector(BaseRule):
         """Match endpoints in IR."""
         # Per-call memo so the ~14 AST passes below walk the tree once, not ~14x.
         self._node_cache: dict[int, list] = {}
+        self._named_object_nodes = self._build_named_object_nodes(ir.raw_ast or {})
         # Per-call recursion budget shared by the string-resolution helpers.
         self._resolve_depth = 0
         function_returns = self._build_function_return_table(
@@ -178,7 +317,18 @@ class EndpointDetector(BaseRule):
 
         # HTTP pass -- buffered so methods can be aggregated per path for method-flip hints.
         http_results = []
-        for call in ir.function_calls:
+        calls = list(ir.function_calls)
+        calls.extend(
+            self._computed_http_calls(
+                ir.raw_ast or {},
+                constants,
+                bool_constants,
+                function_returns,
+                client_base_urls,
+                client_headers,
+            )
+        )
+        for call in calls:
             # Safety net: a pathological single call that still exhausts the recursion
             # budget must not discard the HTTP results already collected from other calls.
             try:
@@ -197,16 +347,51 @@ class EndpointDetector(BaseRule):
             except RecursionError:
                 logger.debug("endpoint_http_call_recursion_skipped")
                 continue
+
         methods_by_path: dict[str, set[str]] = {}
         for result in http_results:
-            methods_by_path.setdefault(
-                self._endpoint_path(result.extracted_value), set()
-            ).add(result.metadata.get("method", "GET"))
+            methods_by_path.setdefault(self._endpoint_path(result.extracted_value), set()).add(
+                result.metadata.get("method", "GET")
+            )
+        # DQ-E01: preserve each distinct replayable contract for a method+URL. Exact duplicate
+        # contracts collapse with all occurrence locations retained in `call_sites`; differing
+        # headers/auth/query/body remain separate findings so no callsite contract is lost.
+        grouped_by_key: dict[tuple[str, str], list[RuleResult]] = {}
         for result in http_results:
             key = (result.metadata.get("method", "GET"), result.extracted_value)
-            if key in seen_http_keys:
-                continue
-            seen_http_keys.add(key)
+            grouped_by_key.setdefault(key, []).append(result)
+        selected_results: list[tuple[str, RuleResult]] = []
+        for _key, variants in grouped_by_key.items():
+            contracts: dict[str, dict[str, Any]] = {}
+            variants_by_contract: dict[str, list[RuleResult]] = {}
+            for variant in variants:
+                contract = (variant.metadata or {}).get("request_contract")
+                if isinstance(contract, dict):
+                    canonical = json.dumps(
+                        contract, sort_keys=True, separators=(",", ":"), default=str
+                    )
+                    contracts.setdefault(canonical, contract)
+                else:
+                    canonical = "{}"
+                    contracts.setdefault(canonical, {})
+                variants_by_contract.setdefault(canonical, []).append(variant)
+            all_contracts = [contracts[canonical] for canonical in sorted(contracts)]
+            for canonical in sorted(variants_by_contract):
+                contract_variants = variants_by_contract[canonical]
+                result = max(contract_variants, key=self._contract_selection_key)
+                result.metadata["request_contract_variants"] = all_contracts
+                result.metadata["call_sites"] = sorted(
+                    {
+                        (int(variant.line or 0), int(variant.column or 0))
+                        for variant in contract_variants
+                    }
+                )
+                selected_results.append((canonical, result))
+        for _, result in sorted(
+            selected_results,
+            key=lambda item: (item[1].line, item[1].column, item[0]),
+        ):
+            seen_http_keys.add((result.metadata.get("method", "GET"), result.extracted_value))
             seen_urls.add(result.extracted_value)
             observed = methods_by_path.get(self._endpoint_path(result.extracted_value), set())
             flip = self._method_flip_candidates(observed)
@@ -239,7 +424,9 @@ class EndpointDetector(BaseRule):
         # enh6: GraphQL operations + WebSocket message surface (after http/ws so existing
         # endpoints claim their extracted_value first in the shared dedup set).
         try:
-            for result in self._check_graphql_operations(ir.raw_ast or {}, context, constants, bool_constants, function_returns):
+            for result in self._check_graphql_operations(
+                ir.raw_ast or {}, context, constants, bool_constants, function_returns
+            ):
                 if result.extracted_value in seen_urls:
                     continue
                 seen_urls.add(result.extracted_value)
@@ -247,7 +434,9 @@ class EndpointDetector(BaseRule):
         except RecursionError:
             logger.debug("endpoint_graphql_recursion_skipped")
         try:
-            for result in self._check_ws_messages(ir, ir.raw_ast or {}, context, constants, bool_constants, function_returns):
+            for result in self._check_ws_messages(
+                ir, ir.raw_ast or {}, context, constants, bool_constants, function_returns
+            ):
                 if result.extracted_value in seen_urls:
                     continue
                 seen_urls.add(result.extracted_value)
@@ -268,12 +457,66 @@ class EndpointDetector(BaseRule):
                 logger.debug("endpoint_url_pattern_recursion_skipped")
                 continue
 
+    def _computed_http_calls(
+        self,
+        ast: dict[str, Any],
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+        client_base_urls: dict[str, str],
+        client_headers: dict[str, dict[str, str]],
+    ) -> list[FunctionCall]:
+        calls: list[FunctionCall] = []
+        for node in self._iter_nodes(ast):
+            if node.get("type") != "CallExpression":
+                continue
+            callee = node.get("callee") or {}
+            if callee.get("type") != "MemberExpression" or not callee.get("computed"):
+                continue
+            prop = callee.get("property") or {}
+            method = self._resolve_string_expr(
+                prop, constants, bool_constants, function_returns, allow_placeholders=False
+            )
+            if not method:
+                continue
+            method_lower = method.lower()
+            receiver = self._extract_member_path(callee.get("object") or {})
+            receiver_root = receiver.split(".", 1)[0] if receiver else ""
+            is_global_fetch = (
+                method_lower in self.HTTP_FUNCTIONS_EXACT
+                and receiver_root.lower()
+                in {
+                    "window",
+                    "self",
+                    "globalthis",
+                }
+            )
+            is_client_method = method_lower in self.HTTP_METHOD_FUNCTIONS and (
+                receiver_root in client_base_urls
+                or receiver_root in (client_headers or {})
+                or receiver_root.lower() in self.HTTP_RECEIVER_HINTS
+                or receiver_root.lower().endswith(("httpclient", "apiclient", "restclient"))
+            )
+            if not (is_global_fetch or is_client_method):
+                continue
+            start = (node.get("loc") or {}).get("start") or {}
+            calls.append(
+                FunctionCall(
+                    name=method_lower,
+                    full_name=f"{receiver}.{method_lower}" if receiver else method_lower,
+                    arguments=node.get("arguments") or [],
+                    line=int(start.get("line") or 0),
+                    column=int(start.get("column") or 0),
+                )
+            )
+        return calls
+
     def _endpoint_path(self, url: str) -> str:
         """Path portion of an endpoint url (query/fragment stripped)."""
         if url.startswith(("http://", "https://", "ws://", "wss://")):
-            return urlsplit(url).path
+            return str(urlsplit(url).path)
         if url.startswith("//"):
-            return urlsplit("https:" + url).path
+            return str(urlsplit("https:" + url).path)
         return url.split("?", 1)[0].split("#", 1)[0]
 
     def _method_flip_candidates(self, observed: set) -> list[str]:
@@ -287,7 +530,14 @@ class EndpointDetector(BaseRule):
             return "uuid"
         if "email" in n or "mail" in n:
             return "email"
-        if n == "id" or n.endswith("id") or n.endswith("_id") or "num" in n or "count" in n or "index" in n:
+        if (
+            n == "id"
+            or n.endswith("id")
+            or n.endswith("_id")
+            or "num" in n
+            or "count" in n
+            or "index" in n
+        ):
             return "numeric"
         return "dynamic"
 
@@ -326,7 +576,7 @@ class EndpointDetector(BaseRule):
                 return kind
         return "dynamic"
 
-    def _apply_idor(self, result: "RuleResult") -> None:
+    def _apply_idor(self, result: RuleResult) -> None:
         """Tag an endpoint that carries IDOR/enumeration path params + raise INFO -> LOW."""
         params = self._detect_path_params(result.extracted_value)
         if not params:
@@ -351,7 +601,11 @@ class EndpointDetector(BaseRule):
 
     def _parse_graphql_document(self, doc: str) -> list[dict]:
         doc = re.sub(r"(?m)#.*$", "", doc or "")[:20000]
-        tokens = re.findall(r'\.\.\.|[{}():]|"(?:\\.|[^"])*"|[A-Za-z_][A-Za-z0-9_]*', doc)
+        # `@` is emitted (not dropped) so a field-level directive name (`@include`) is not mistaken
+        # for a sibling field once "field" is an accepted prev-state (DQ-E07).
+        # `[^"\\]` (not `[^"]`) keeps the string-literal token DISJOINT from its `\\.` escape branch
+        # -> linear; an overlapping `[^"]` (which includes `\`) is exponential on a backslash run.
+        tokens = re.findall(r'\.\.\.|[{}():@]|"(?:\\.|[^"\\])*"|[A-Za-z_][A-Za-z0-9_]*', doc)
         ops: list[dict] = []
         brace = paren = 0
         op = None
@@ -359,68 +613,113 @@ class EndpointDetector(BaseRule):
         expect_name = False
         prev = None
         i, n = 0, len(tokens)
-        while i < n and len(ops) < 16:
-            t = tokens[i]; i += 1
+        while i < n and len(ops) < 64:  # DQ-E07: was 16, dropping ops 17+ of a large document
+            t = tokens[i]
+            i += 1
             if t == "(":
-                paren += 1; prev = t; continue
+                paren += 1
+                prev = t
+                continue
             if t == ")":
-                paren = max(0, paren - 1); prev = t; continue
+                paren = max(0, paren - 1)
+                prev = t
+                continue
+            if t == "@":
+                # a directive follows -> its NAME must not be captured as a field (DQ-E07)
+                prev = "@"
+                continue
             if t == "{":
                 if op is not None and op.get("open_at") is None:
                     op["open_at"] = brace
                 elif op is None and brace == 0 and skip_frag_until is None:
                     op = {"type": "query", "name": None, "open_at": 0, "fields": []}
-                brace += 1; prev = "{"; continue
+                brace += 1
+                prev = "{"
+                continue
             if t == "}":
                 brace = max(0, brace - 1)
                 if skip_frag_until is not None and brace < skip_frag_until:
                     skip_frag_until = None
                 elif op is not None and op.get("open_at") is not None and brace == op["open_at"]:
-                    ops.append({"type": op["type"], "name": op["name"], "fields": op["fields"][:32]})
+                    ops.append(
+                        {"type": op["type"], "name": op["name"], "fields": op["fields"][:32]}
+                    )
                     op = None
-                prev = "}"; continue
+                prev = "}"
+                continue
             if t == "...":
                 if i < n and tokens[i] == "on":
                     i += 2
                 elif i < n and re.match(r"[A-Za-z_]", tokens[i] or ""):
                     i += 1
-                prev = "..."; continue
+                prev = "..."
+                continue
             if t == ":" or t.startswith('"'):
-                prev = ":" if t == ":" else "str"; continue
+                prev = ":" if t == ":" else "str"
+                continue
             # NAME token
             if skip_frag_until is not None or paren > 0:
-                prev = t; continue
+                prev = t
+                continue
             if brace == 0:
                 if expect_name and op is not None:
-                    op["name"] = t; expect_name = False; prev = t; continue
+                    op["name"] = t
+                    expect_name = False
+                    prev = t
+                    continue
                 if t in self.GRAPHQL_OP_KEYWORDS:
                     op = {"type": t, "name": None, "open_at": None, "fields": []}
-                    expect_name = True; prev = t; continue
+                    expect_name = True
+                    prev = t
+                    continue
                 if t == "fragment":
-                    skip_frag_until = 1; prev = t; continue
-                prev = t; continue
-            if op is not None and op.get("open_at") is not None and brace == op["open_at"] + 1 and prev in ("{", "}", ")"):
-                if i < n and tokens[i] == ":":       # alias -> real field follows ':'
+                    skip_frag_until = 1
+                    prev = t
+                    continue
+                prev = t
+                continue
+            if (
+                op is not None
+                and op.get("open_at") is not None
+                and brace == op["open_at"] + 1
+                and prev in ("{", "}", ")", "field")
+            ):
+                if i < n and tokens[i] == ":":  # alias -> real field follows ':'
                     i += 1
                     if i < n and re.match(r"[A-Za-z_]", tokens[i] or ""):
-                        field = tokens[i]; i += 1
+                        field = tokens[i]
+                        i += 1
                         if field not in op["fields"] and len(op["fields"]) < 32:
                             op["fields"].append(field)
-                    prev = "field"; continue
+                    prev = "field"
+                    continue
                 if t not in op["fields"] and len(op["fields"]) < 32:
                     op["fields"].append(t)
-                prev = "field"; continue
-            prev = t; continue
+                prev = "field"
+                continue
+            prev = t
+            continue
         return ops
 
-    def _check_graphql_operations(self, ast, context, constants, bool_constants, function_returns):
+    def _check_graphql_operations(
+        self,
+        ast: dict[str, Any],
+        context: AnalysisContext,
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+    ) -> Iterator[RuleResult]:
         seen = set()
         for node in self._iter_nodes(ast):
             t = node.get("type")
             doc = source = None
             if t == "TaggedTemplateExpression":
                 tag = node.get("tag", {})
-                tagname = tag.get("name") if tag.get("type") == "Identifier" else (tag.get("property") or {}).get("name")
+                tagname = (
+                    tag.get("name")
+                    if tag.get("type") == "Identifier"
+                    else (tag.get("property") or {}).get("name")
+                )
                 if tagname in self.GQL_TAG_NAMES:
                     quasis = (node.get("quasi") or {}).get("quasis", [])
                     doc = " ".join(((q.get("value") or {}).get("cooked") or "") for q in quasis)
@@ -429,12 +728,28 @@ class EndpointDetector(BaseRule):
                 callee = node.get("callee", {})
                 if callee.get("type") == "Identifier" and callee.get("name") in self.GQL_TAG_NAMES:
                     arg = (node.get("arguments") or [None])[0]
-                    r = self._resolve_string_expr(arg, constants, bool_constants, function_returns, allow_placeholders=False) if isinstance(arg, dict) else ""
+                    r = (
+                        self._resolve_string_expr(
+                            arg,
+                            constants,
+                            bool_constants,
+                            function_returns,
+                            allow_placeholders=False,
+                        )
+                        if isinstance(arg, dict)
+                        else ""
+                    )
                     if r and r != _BLOCKED_STRING:
                         doc, source = r, "gql_call"
             elif t == "Property":
                 if self._extract_property_name(node.get("key", {})) in self.GRAPHQL_QUERY_KEYS:
-                    r = self._resolve_string_expr(node.get("value", {}), constants, bool_constants, function_returns, allow_placeholders=False)
+                    r = self._resolve_string_expr(
+                        node.get("value", {}),
+                        constants,
+                        bool_constants,
+                        function_returns,
+                        allow_placeholders=False,
+                    )
                     if r and r != _BLOCKED_STRING:
                         doc, source = r, "query_property"
             if not doc or not self._is_graphql_document(doc):
@@ -447,19 +762,29 @@ class EndpointDetector(BaseRule):
                     continue
                 seen.add(sig)
                 yield RuleResult(
-                    rule_id=self.id, category=self.category, severity=Severity.INFO,
+                    rule_id=self.id,
+                    category=self.category,
+                    severity=Severity.INFO,
                     confidence=Confidence.HIGH if name else Confidence.MEDIUM,
                     title=f"GraphQL {typ}: {name or '(anonymous)'}",
                     description=f"GraphQL {typ} '{name or '(anonymous)'}' selecting fields: {', '.join(fields[:8])}",
-                    extracted_value=sig, value_type="graphql_operation",
-                    line=start.get("line", 0), column=start.get("column", 0),
-                    ast_node_type=t, tags=["graphql", typ],
-                    metadata={"operation_type": typ, "operation_name": name or "", "fields": fields, "source": source},
+                    extracted_value=sig,
+                    value_type="graphql_operation",
+                    line=start.get("line", 0),
+                    column=start.get("column", 0),
+                    ast_node_type=str(t or ""),
+                    tags=["graphql", typ],
+                    metadata={
+                        "operation_type": typ,
+                        "operation_name": name or "",
+                        "fields": fields,
+                        "source": source,
+                    },
                 )
 
     # ---- enh6: WebSocket messages ----
-    def _build_ws_client_names(self, ast) -> set:
-        names = set()
+    def _build_ws_client_names(self, ast: dict[str, Any]) -> set[str]:
+        names: set[str] = set()
         for node in self._iter_nodes(ast):
             if node.get("type") != "VariableDeclarator":
                 continue
@@ -478,7 +803,15 @@ class EndpointDetector(BaseRule):
                     names.add(name)
         return names
 
-    def _check_ws_messages(self, ir, ast, context, constants, bool_constants, function_returns):
+    def _check_ws_messages(
+        self,
+        ir: IntermediateRepresentation,
+        ast: dict[str, Any],
+        context: AnalysisContext,
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+    ) -> Iterator[RuleResult]:
         ws_clients = self._build_ws_client_names(ast)
         seen = set()
         for call in ir.function_calls:
@@ -486,69 +819,165 @@ class EndpointDetector(BaseRule):
             if name_lower not in self.WS_SEND_METHODS or "." not in call.full_name:
                 continue
             object_name = call.full_name.split(".", 1)[0]
-            onl = object_name.lower()
-            if not (object_name in ws_clients or onl in self.WS_RECEIVER_HINTS
-                    or any(hint in onl for hint in self.WS_RECEIVER_HINTS)):
-                continue   # primary FP guard: exclude res.send / EventEmitter.emit / etc.
+            if object_name not in ws_clients:
+                continue  # `.emit/.send` alone is EventEmitter-like, not socket provenance.
             transport = "socketio" if name_lower == "emit" else "websocket"
             results = []
             args = call.arguments or []
             if name_lower == "emit":
-                ev = self._resolve_string_expr(args[0] if args else {}, constants, bool_constants, function_returns, allow_placeholders=False)
+                ev = self._resolve_string_expr(
+                    args[0] if args else {},
+                    constants,
+                    bool_constants,
+                    function_returns,
+                    allow_placeholders=False,
+                )
                 if ev and ev != _BLOCKED_STRING and not ev.startswith("${"):
                     results.append(("event", ev))
             else:
                 arg0 = args[0] if args else {}
                 payload = arg0
-                if isinstance(arg0, dict) and arg0.get("type") == "CallExpression" \
-                        and self._extract_member_path(arg0.get("callee", {})).endswith("JSON.stringify"):
+                if (
+                    isinstance(arg0, dict)
+                    and arg0.get("type") == "CallExpression"
+                    and self._extract_member_path(arg0.get("callee", {})).endswith("JSON.stringify")
+                ):
                     payload = (arg0.get("arguments") or [None])[0] or {}
-                obj = self._resolve_object_expr(payload, constants, bool_constants, function_returns, allow_placeholders=False) if isinstance(payload, dict) else None
+                obj = (
+                    self._resolve_object_expr(
+                        payload,
+                        constants,
+                        bool_constants,
+                        function_returns,
+                        allow_placeholders=False,
+                    )
+                    if isinstance(payload, dict)
+                    else None
+                )
                 emitted = False
                 if isinstance(obj, dict):
                     for key in self.WS_MESSAGE_KEYS:
                         v = obj.get(key)
                         if isinstance(v, str) and v:
-                            results.append((key, v)); emitted = True; break
+                            results.append((key, v))
+                            emitted = True
+                            break
                 if not emitted and object_name in ws_clients:
-                    raw = self._resolve_string_expr(arg0 if isinstance(arg0, dict) else {}, constants, bool_constants, function_returns, allow_placeholders=False)
+                    raw = self._resolve_string_expr(
+                        arg0 if isinstance(arg0, dict) else {},
+                        constants,
+                        bool_constants,
+                        function_returns,
+                        allow_placeholders=False,
+                    )
                     if raw and raw != _BLOCKED_STRING and not raw.startswith("${"):
                         results.append(("raw", raw))
+            # DQ-E08: HIGH confidence only with VERIFIED socket-client provenance (a declared
+            # `new WebSocket`/`io()`/`io.connect`); a name-hint-only receiver (channel.emit,
+            # connection.emit) is downgraded to MEDIUM so it is not asserted as a real socket surface.
+            verified_client = True
             for message_key, msgname in results:
                 dedup = (transport, message_key, msgname)
                 if dedup in seen:
                     continue
                 seen.add(dedup)
                 yield RuleResult(
-                    rule_id=self.id, category=self.category, severity=Severity.INFO,
-                    confidence=Confidence.HIGH if message_key != "raw" else Confidence.MEDIUM,
+                    rule_id=self.id,
+                    category=self.category,
+                    severity=Severity.INFO,
+                    confidence=(
+                        Confidence.HIGH
+                        if (verified_client and message_key != "raw")
+                        else Confidence.MEDIUM
+                    ),
                     title=f"WS Message: {msgname}",
                     description=f"WebSocket {transport} message '{msgname}' sent via {call.full_name}",
-                    extracted_value=msgname, value_type="ws_message", line=call.line, column=call.column,
-                    ast_node_type="CallExpression", tags=["websocket", "ws_message", transport],
-                    metadata={"message_key": message_key, "transport": transport, "method": name_lower, "receiver": object_name},
+                    extracted_value=msgname,
+                    value_type="ws_message",
+                    line=call.line,
+                    column=call.column,
+                    ast_node_type="CallExpression",
+                    tags=["websocket", "ws_message", transport],
+                    metadata={
+                        "message_key": message_key,
+                        "transport": transport,
+                        "method": name_lower,
+                        "receiver": object_name,
+                    },
                 )
 
     # enh3: header/body/query names that carry credentials (for auth classification + redaction).
-    _AUTH_HEADER_NAMES = ("x-api-key", "apikey", "api-key", "x-auth-token", "x-access-token", "x-token")
+    _AUTH_HEADER_NAMES = (
+        "x-api-key",
+        "apikey",
+        "api-key",
+        "x-auth-token",
+        "x-access-token",
+        "x-token",
+    )
     _AUTH_QUERY_NAMES = ("token", "access_token", "api_key", "apikey", "auth", "key")
     _SECRET_LIKE = re.compile(
         r"AKIA[0-9A-Z]{16}|sk-[a-zA-Z0-9]{20,}|sk_live_[0-9a-zA-Z]{20,}|ghp_[0-9a-zA-Z]{30,}|"
-        r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+|[0-9a-fA-F]{32,}"
+        r"eyJ[A-Za-z0-9_-]{1,8192}\.eyJ[A-Za-z0-9_-]{1,8192}|[0-9a-fA-F]{32,}"  # jwt bounded: was O(n^2)
     )
 
-    def _object_prop_node(self, node, key: str):
+    def _object_prop_node(self, node: Any, key: str) -> Any | None:
         """Value node of property `key` in an ObjectExpression (or None)."""
         if not isinstance(node, dict) or node.get("type") != "ObjectExpression":
             return None
+        found = None
         for prop in node.get("properties", []):
             if prop.get("type") == "SpreadElement":
                 continue
             if self._extract_property_name(prop.get("key", {})) == key:
-                return prop.get("value")
-        return None
+                found = prop.get("value")
+        return found
 
-    def _ast_value_type(self, node) -> str:
+    def _build_named_object_nodes(self, ast: dict[str, Any]) -> dict[str, dict[str, Any]]:
+        candidates: dict[str, list[dict[str, Any]]] = {}
+        for node in self._iter_nodes(ast):
+            if node.get("type") != "VariableDeclarator":
+                continue
+            ident = node.get("id") or {}
+            init = node.get("init") or {}
+            if ident.get("type") == "Identifier" and init.get("type") == "ObjectExpression":
+                candidates.setdefault(ident.get("name", ""), []).append(init)
+        return {name: nodes[0] for name, nodes in candidates.items() if name and len(nodes) == 1}
+
+    def _resolve_config_node(
+        self,
+        node: Any,
+        seen: set[str] | None = None,
+    ) -> Any:
+        if not isinstance(node, dict):
+            return node
+        if node.get("type") == "Identifier":
+            name = node.get("name", "")
+            seen = set(seen or ())
+            if not name or name in seen:
+                return node
+            target = getattr(self, "_named_object_nodes", {}).get(name)
+            if target is None:
+                return node
+            seen.add(name)
+            return self._resolve_config_node(target, seen)
+        if node.get("type") != "ObjectExpression":
+            return node
+        properties: list[dict[str, Any]] = []
+        for prop in node.get("properties", []) or []:
+            if prop.get("type") == "SpreadElement":
+                spread = self._resolve_config_node(prop.get("argument"), seen)
+                if isinstance(spread, dict) and spread.get("type") == "ObjectExpression":
+                    properties.extend(spread.get("properties", []) or [])
+                continue
+            copied = dict(prop)
+            value = copied.get("value")
+            if isinstance(value, dict) and value.get("type") in ("Identifier", "ObjectExpression"):
+                copied["value"] = self._resolve_config_node(value, seen)
+            properties.append(copied)
+        return {**node, "properties": properties}
+
+    def _ast_value_type(self, node: Any) -> str:
         if not isinstance(node, dict):
             return "unknown"
         t = node.get("type")
@@ -571,8 +1000,8 @@ class EndpointDetector(BaseRule):
             return "object"
         return "unknown"
 
-    def _shape_of(self, obj_node) -> dict:
-        shape: dict = {}
+    def _shape_of(self, obj_node: Any) -> dict[str, Any]:
+        shape: dict[str, Any] = {}
         props = obj_node.get("properties", []) if isinstance(obj_node, dict) else []
         for prop in props[:50]:
             if prop.get("type") == "SpreadElement":
@@ -584,25 +1013,45 @@ class EndpointDetector(BaseRule):
             shape["__truncated__"] = True
         return shape
 
-    def _locate_config_and_body_args(self, call, is_fetch, is_axios, is_xhr_open):
+    def _locate_config_and_body_args(
+        self,
+        call: FunctionCall,
+        is_fetch: bool,
+        is_axios: bool,
+        is_xhr_open: bool,
+    ) -> tuple[Any | None, Any | None]:
         args = call.arguments or []
         if is_xhr_open:
             return None, None
         if is_fetch:
-            config = args[1] if len(args) > 1 else None
+            config = self._resolve_config_node(args[1]) if len(args) > 1 else None
             body = self._object_prop_node(config, "body") if config else None
             return config, body
         name = call.name.lower()
-        if name in ("get", "head", "delete", "options"):
-            return (args[1] if len(args) > 1 else None), None
+        if name in ("get", "head", "options"):
+            return (self._resolve_config_node(args[1]) if len(args) > 1 else None), None
+        if name == "delete":
+            # DQ-E06: axios.delete carries its request body in config.data (2nd arg), unlike
+            # get/head/options which have none. Recover it so a destructive DELETE's payload shape
+            # is captured. (Spread-config recovery, `axios({method,...cfg})`, remains deferred.)
+            config = self._resolve_config_node(args[1]) if len(args) > 1 else None
+            return config, (self._object_prop_node(config, "data") if config else None)
         if name in ("post", "put", "patch"):
-            return (args[2] if len(args) > 2 else None), (args[1] if len(args) > 1 else None)
-        config = args[0] if args else None
+            return (self._resolve_config_node(args[2]) if len(args) > 2 else None), (
+                args[1] if len(args) > 1 else None
+            )
+        config = self._resolve_config_node(args[0]) if args else None
         body = self._object_prop_node(config, "data") if config else None
         return config, body
 
-    def _extract_headers(self, config_node, constants, bool_constants, function_returns) -> dict:
-        headers: dict = {}
+    def _extract_headers(
+        self,
+        config_node: Any,
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+    ) -> dict[str, str]:
+        headers: dict[str, str] = {}
         hdr = self._object_prop_node(config_node, "headers")
         if not isinstance(hdr, dict) or hdr.get("type") != "ObjectExpression":
             return headers
@@ -612,19 +1061,36 @@ class EndpointDetector(BaseRule):
             name = self._extract_property_name(prop.get("key", {}))
             if not name:
                 continue
-            val = self._resolve_string_expr(prop.get("value", {}), constants, bool_constants, function_returns, allow_placeholders=True)
+            val = self._resolve_string_expr(
+                prop.get("value", {}),
+                constants,
+                bool_constants,
+                function_returns,
+                allow_placeholders=True,
+            )
             if val == _BLOCKED_STRING or val == "":
                 val = "${...}"
             headers[name] = val
         return headers
 
-    def _classify_auth(self, headers: dict, query_params: dict):
+    def _classify_auth(
+        self,
+        headers: dict[str, str],
+        query_params: dict[str, Any],
+    ) -> dict[str, str] | None:
         lower = {k.lower(): (k, v) for k, v in headers.items()}
         if "authorization" in lower:
             orig, v = lower["authorization"]
             vl = str(v).lower()
-            scheme = ("bearer" if vl.startswith("bearer") else "basic" if vl.startswith("basic")
-                      else "digest" if vl.startswith("digest") else "bearer?")
+            scheme = (
+                "bearer"
+                if vl.startswith("bearer")
+                else "basic"
+                if vl.startswith("basic")
+                else "digest"
+                if vl.startswith("digest")
+                else "bearer?"
+            )
             return {"scheme": scheme, "in": "header", "header": orig}
         for name in self._AUTH_HEADER_NAMES:
             if name in lower:
@@ -636,7 +1102,13 @@ class EndpointDetector(BaseRule):
                 return {"scheme": "apikey", "in": "query", "header": pname}
         return None
 
-    def _extract_body(self, body_node, constants, bool_constants, function_returns) -> dict:
+    def _extract_body(
+        self,
+        body_node: Any,
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
         if not isinstance(body_node, dict):
             return {"kind": "none", "shape": {}, "raw_preview": None}
         t = body_node.get("type")
@@ -658,7 +1130,9 @@ class EndpointDetector(BaseRule):
                 return {"kind": "urlencoded", "shape": {}, "raw_preview": None}
         if t == "ObjectExpression":
             return {"kind": "json", "shape": self._shape_of(body_node), "raw_preview": None}
-        resolved = self._resolve_string_expr(body_node, constants, bool_constants, function_returns, allow_placeholders=True)
+        resolved = self._resolve_string_expr(
+            body_node, constants, bool_constants, function_returns, allow_placeholders=True
+        )
         if resolved and resolved != _BLOCKED_STRING and "=" in resolved:
             keys = {p.split("=", 1)[0]: "string" for p in resolved.split("&") if "=" in p}
             if keys:
@@ -667,8 +1141,15 @@ class EndpointDetector(BaseRule):
             return {"kind": "raw", "shape": {}, "raw_preview": resolved[:200]}
         return {"kind": "unknown", "shape": {}, "raw_preview": None}
 
-    def _extract_query_params(self, url, config_node, constants, bool_constants, function_returns) -> dict:
-        params: dict = {}
+    def _extract_query_params(
+        self,
+        url: str,
+        config_node: Any,
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        params: dict[str, Any] = {}
         if "?" in url:
             for pair in urlsplit(url).query.split("&"):
                 if not pair:
@@ -684,17 +1165,32 @@ class EndpointDetector(BaseRule):
                 name = self._extract_property_name(prop.get("key", {}))
                 if not name:
                     continue
-                val = self._resolve_string_expr(prop.get("value", {}), constants, bool_constants, function_returns, allow_placeholders=True)
-                params[name] = val if (val and val != _BLOCKED_STRING) else self._ast_value_type(prop.get("value", {}))
+                val = self._resolve_string_expr(
+                    prop.get("value", {}),
+                    constants,
+                    bool_constants,
+                    function_returns,
+                    allow_placeholders=True,
+                )
+                params[name] = (
+                    val
+                    if (val and val != _BLOCKED_STRING)
+                    else self._ast_value_type(prop.get("value", {}))
+                )
         return params
 
-    def _redact_sensitive(self, name: str, value) -> str:
+    def _redact_sensitive(self, name: str, value: Any) -> str:
         """Redact credential-shaped header/param values (secure default: raw secrets never
         enter finding metadata / disk). Placeholders pass through."""
         if not isinstance(value, str) or value.startswith("${"):
             return value if isinstance(value, str) else str(value)
         lname = name.lower()
-        sensitive_name = lname == "authorization" or lname == "cookie" or lname in self._AUTH_HEADER_NAMES or lname in self._AUTH_QUERY_NAMES
+        sensitive_name = (
+            lname == "authorization"
+            or lname == "cookie"
+            or lname in self._AUTH_HEADER_NAMES
+            or lname in self._AUTH_QUERY_NAMES
+        )
         if sensitive_name or self._SECRET_LIKE.search(value):
             vl = value.lower()
             if vl.startswith("bearer"):
@@ -708,9 +1204,15 @@ class EndpointDetector(BaseRule):
             return f"<REDACTED_{scheme}>"
         return value
 
-    def _build_client_headers(self, ast, constants, bool_constants, function_returns) -> dict:
+    def _build_client_headers(
+        self,
+        ast: dict[str, Any],
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+    ) -> dict[str, dict[str, str]]:
         """Map an axios-instance variable name -> default headers from axios.create({headers})."""
-        result: dict = {}
+        result: dict[str, dict[str, str]] = {}
         for node in self._iter_nodes(ast):
             if node.get("type") != "VariableDeclarator":
                 continue
@@ -720,44 +1222,90 @@ class EndpointDetector(BaseRule):
             if not self._extract_member_path(init.get("callee", {})).endswith("axios.create"):
                 continue
             cfg = (init.get("arguments") or [None])[0]
-            headers = self._extract_headers(cfg, constants, bool_constants, function_returns) if isinstance(cfg, dict) else {}
+            headers = (
+                self._extract_headers(cfg, constants, bool_constants, function_returns)
+                if isinstance(cfg, dict)
+                else {}
+            )
             name = (node.get("id") or {}).get("name")
             if name and headers:
                 result[name] = headers
         return result
 
-    def _extract_request_contract(self, call, is_fetch, is_axios, is_xhr_open, url, method,
-                                  constants, bool_constants, function_returns, base_headers=None) -> dict:
+    def _extract_request_contract(
+        self,
+        call: FunctionCall,
+        is_fetch: bool,
+        is_axios: bool,
+        is_xhr_open: bool,
+        url: str,
+        method: str,
+        constants: dict[str, str],
+        bool_constants: dict[str, bool],
+        function_returns: dict[str, dict[str, Any]],
+        base_headers: dict[str, str] | None = None,
+    ) -> dict[str, Any]:
         """Assemble a replayable request contract (method/headers/auth/body-shape/query) for an
         HTTP call finding. Reuses the static resolver, so it never changes which endpoints are found."""
-        config_node, body_node = self._locate_config_and_body_args(call, is_fetch, is_axios, is_xhr_open)
+        config_node, body_node = self._locate_config_and_body_args(
+            call, is_fetch, is_axios, is_xhr_open
+        )
         notes = []
         if is_xhr_open:
             notes.append("XHR headers/body set via setRequestHeader/send (not statically linked)")
-        headers_raw = dict(base_headers or {})   # axios.create client defaults, overridden by call headers
-        headers_raw.update(self._extract_headers(config_node, constants, bool_constants, function_returns))
-        query_params = self._extract_query_params(url, config_node, constants, bool_constants, function_returns)
-        auth = self._classify_auth(headers_raw, query_params)   # classify BEFORE redaction
+        if self.extract_headers:
+            headers_raw = dict(
+                base_headers or {}
+            )  # axios.create client defaults, overridden by call headers
+            headers_raw.update(
+                self._extract_headers(config_node, constants, bool_constants, function_returns)
+            )
+        else:
+            headers_raw = {}
+        query_params = (
+            self._extract_query_params(
+                url, config_node, constants, bool_constants, function_returns
+            )
+            if self.extract_parameters
+            else {}
+        )
+        auth = self._classify_auth(headers_raw, query_params)  # classify BEFORE redaction
         body = self._extract_body(body_node, constants, bool_constants, function_returns)
-        content_type = next((v for k, v in headers_raw.items() if k.lower() == "content-type"), None)
+        content_type = next(
+            (v for k, v in headers_raw.items() if k.lower() == "content-type"), None
+        )
         headers = {k: self._redact_sensitive(k, v) for k, v in headers_raw.items()}
-        query_params = {k: (self._redact_sensitive(k, v) if isinstance(v, str) else v) for k, v in query_params.items()}
+        query_params = {
+            k: (self._redact_sensitive(k, v) if isinstance(v, str) else v)
+            for k, v in query_params.items()
+        }
         allvals = list(headers.values()) + [str(v) for v in query_params.values()]
         if "${" in url or any("${" in str(v) for v in allvals):
             confidence = "medium"
-        elif config_node is not None and not headers and body.get("kind") in ("none", "unknown") and not query_params:
+        elif (
+            config_node is not None
+            and not headers
+            and body.get("kind") in ("none", "unknown")
+            and not query_params
+        ):
             confidence = "low"
         else:
             confidence = "high"
         return {
-            "method": method, "url": url, "headers": headers, "auth": auth,
-            "query_params": query_params, "body": body, "content_type": content_type,
-            "confidence": confidence, "notes": notes,
+            "method": method,
+            "url": url,
+            "headers": headers,
+            "auth": auth,
+            "query_params": query_params,
+            "body": body,
+            "content_type": content_type,
+            "confidence": confidence,
+            "notes": notes,
         }
 
     def _check_http_call(
         self,
-        call,
+        call: FunctionCall,
         ir: IntermediateRepresentation,
         context: AnalysisContext,
         constants: dict[str, str],
@@ -765,12 +1313,11 @@ class EndpointDetector(BaseRule):
         function_returns: dict[str, dict[str, Any]],
         client_base_urls: dict[str, str],
         xhr_clients: set[str],
-        client_headers: dict = None,
+        client_headers: dict[str, dict[str, str]] | None = None,
     ) -> Iterator[RuleResult]:
         """Check if function call is an HTTP request."""
         # Check if it's an HTTP function using exact matching
         name_lower = call.name.lower()
-        full_name_lower = call.full_name.lower()
         object_name = call.full_name.split(".", 1)[0]
 
         is_exact_http = name_lower in self.HTTP_FUNCTIONS_EXACT
@@ -778,13 +1325,20 @@ class EndpointDetector(BaseRule):
         # not any identifier that merely contains "axios" (e.g. myAxiosHelper), and skip
         # non-request statics like axios.create.
         is_axios = (
-            object_name.lower() == "axios"
-            and name_lower not in self.AXIOS_NON_REQUEST_MEMBERS
+            object_name.lower() == "axios" and name_lower not in self.AXIOS_NON_REQUEST_MEMBERS
         )
         # HTTP method names only match when used as obj.method (e.g., axios.get, http.post)
         is_method_call = (
             name_lower in self.HTTP_METHOD_FUNCTIONS
             and "." in call.full_name  # Must be a method call, not standalone
+            and object_name.lower()
+            not in self.NON_HTTP_RECEIVERS  # DQ-E03: cache.get/map.get aren't HTTP
+            and (
+                object_name in client_base_urls
+                or object_name in (client_headers or {})
+                or object_name.lower() in self.HTTP_RECEIVER_HINTS
+                or object_name.lower().endswith(("httpclient", "apiclient", "restclient"))
+            )
         )
         is_xhr_open = name_lower == "open" and object_name in xhr_clients
 
@@ -916,7 +1470,11 @@ class EndpointDetector(BaseRule):
 
             loc = node.get("loc", {})
             start = loc.get("start", {})
-            parsed = urlsplit(url if url.startswith(("http://", "https://", "ws://", "wss://")) else f"https://host{url}")
+            parsed = urlsplit(
+                url
+                if url.startswith(("http://", "https://", "ws://", "wss://"))
+                else f"https://host{url}"
+            )
             confidence = Confidence.HIGH if "${" not in url else Confidence.MEDIUM
 
             yield RuleResult(
@@ -984,11 +1542,7 @@ class EndpointDetector(BaseRule):
             allow_placeholders=True,
         )
         if resolved and self._looks_like_url(resolved):
-            confidence = (
-                Confidence.HIGH
-                if "${" not in resolved
-                else Confidence.MEDIUM
-            )
+            confidence = Confidence.HIGH if "${" not in resolved else Confidence.MEDIUM
             return resolved, confidence
 
         if first_arg.get("type") == "Identifier":
@@ -1129,8 +1683,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve a practical object-literal/config expression."""
         if not isinstance(node, dict):
@@ -1179,7 +1733,10 @@ class EndpointDetector(BaseRule):
                 bindings=bindings,
             )
 
-        if node_type == "CallExpression" and node.get("callee", {}).get("type") == "MemberExpression":
+        if (
+            node_type == "CallExpression"
+            and node.get("callee", {}).get("type") == "MemberExpression"
+        ):
             member_name = self._extract_member_path(node.get("callee", {}))
             if member_name:
                 return self._resolve_function_object_call(
@@ -1202,8 +1759,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve top-level static properties from an object literal."""
         if node.get("type") != "ObjectExpression":
@@ -1256,7 +1813,7 @@ class EndpointDetector(BaseRule):
         for key, value in constants.items():
             if not key.startswith(prefix) or not value:
                 continue
-            remainder = key[len(prefix):]
+            remainder = key[len(prefix) :]
             if "." in remainder:
                 continue
             values[remainder] = value
@@ -1266,7 +1823,7 @@ class EndpointDetector(BaseRule):
         self,
         name: str,
         constants: dict[str, str],
-        bindings: Optional[dict[str, Any]] = None,
+        bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Collect flattened object fields from helper-local bindings before constants."""
         values = self._resolve_named_object_constants(name, constants)
@@ -1274,7 +1831,7 @@ class EndpointDetector(BaseRule):
         for key, value in (bindings or {}).items():
             if not isinstance(key, str) or not key.startswith(prefix) or value in {None, ""}:
                 continue
-            remainder = key[len(prefix):]
+            remainder = key[len(prefix) :]
             if "." in remainder:
                 continue
             values[remainder] = value
@@ -1299,7 +1856,7 @@ class EndpointDetector(BaseRule):
             return value.upper()
         return "GET"
 
-    def _resolve_string_expr(self, *args, **kwargs) -> str:
+    def _resolve_string_expr(self, *args: Any, **kwargs: Any) -> str:
         """Depth-guarded entry point for string resolution.
 
         Shares a single recursion counter (_resolve_depth) with
@@ -1324,8 +1881,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve simple string expressions without executing code."""
         if not isinstance(node, dict):
@@ -1333,7 +1890,8 @@ class EndpointDetector(BaseRule):
 
         node_type = node.get("type")
         if node_type == "Literal" and isinstance(node.get("value"), str):
-            return node.get("value", "")
+            literal_value = node.get("value")
+            return literal_value if isinstance(literal_value, str) else ""
 
         if node_type == "NewExpression":
             url_value = self._resolve_url_constructor(
@@ -1422,7 +1980,7 @@ class EndpointDetector(BaseRule):
                 allow_placeholders=allow_placeholders,
                 seen=seen,
                 bindings=bindings,
-                )
+            )
             if operator == "&&":
                 if left_value is None:
                     return _BLOCKED_STRING
@@ -1450,20 +2008,10 @@ class EndpointDetector(BaseRule):
                         seen=seen,
                         bindings=bindings,
                     )
-                return left_value if isinstance(left_value, str) else self._resolve_string_expr(
-                    node.get("left", {}),
-                    constants,
-                    bool_constants,
-                    function_returns,
-                    allow_placeholders=allow_placeholders,
-                    seen=seen,
-                    bindings=bindings,
-                )
-            if operator == "||":
-                if left_value is None:
-                    return _BLOCKED_STRING
-                if self._is_truthy_static_value(left_value):
-                    return left_value if isinstance(left_value, str) else self._resolve_string_expr(
+                return (
+                    left_value
+                    if isinstance(left_value, str)
+                    else self._resolve_string_expr(
                         node.get("left", {}),
                         constants,
                         bool_constants,
@@ -1471,6 +2019,24 @@ class EndpointDetector(BaseRule):
                         allow_placeholders=allow_placeholders,
                         seen=seen,
                         bindings=bindings,
+                    )
+                )
+            if operator == "||":
+                if left_value is None:
+                    return _BLOCKED_STRING
+                if self._is_truthy_static_value(left_value):
+                    return (
+                        left_value
+                        if isinstance(left_value, str)
+                        else self._resolve_string_expr(
+                            node.get("left", {}),
+                            constants,
+                            bool_constants,
+                            function_returns,
+                            allow_placeholders=allow_placeholders,
+                            seen=seen,
+                            bindings=bindings,
+                        )
                     )
                 return self._resolve_string_expr(
                     node.get("right", {}),
@@ -1529,8 +2095,7 @@ class EndpointDetector(BaseRule):
                 value = constants[name]
                 return value if isinstance(value, str) else ""
             if allow_placeholders and any(
-                keyword in name.lower()
-                for keyword in ("url", "api", "path", "endpoint", "base")
+                keyword in name.lower() for keyword in ("url", "api", "path", "endpoint", "base")
             ):
                 return f"${{{name}}}"
             return ""
@@ -1655,8 +2220,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve practical `new URL(path, base)` expressions into endpoint strings."""
         if node.get("type") != "NewExpression":
@@ -1711,8 +2276,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve practical `new Request(url)` expressions into endpoint strings."""
         if node.get("type") != "NewExpression":
@@ -1746,8 +2311,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve URL-object property reads such as `userUrl.href` or `userUrl.pathname`."""
         if node.get("type") != "MemberExpression":
@@ -1788,8 +2353,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve simple zero-arg URL/Request-object method calls."""
         if callee.get("type") != "MemberExpression":
@@ -1820,8 +2385,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve a simple helper call by substituting static arguments into its return expression."""
         if not name:
@@ -1883,8 +2448,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve a helper call that returns a practical object config."""
         if not name:
@@ -1947,8 +2512,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> bool:
         """Bind a supported helper parameter spec into helper-local bindings."""
         local_bindings = bindings if bindings is not None else {}
@@ -1959,7 +2524,10 @@ class EndpointDetector(BaseRule):
         default_node = param_spec.get("default")
         effective_node = argument_node if isinstance(argument_node, dict) else default_node
 
-        if isinstance(pattern_node, dict) and pattern_node.get("type") in {"ObjectPattern", "ArrayPattern"}:
+        if isinstance(pattern_node, dict) and pattern_node.get("type") in {
+            "ObjectPattern",
+            "ArrayPattern",
+        }:
             if not isinstance(effective_node, dict):
                 return False
             return self._bind_pattern_alias_value(
@@ -2014,8 +2582,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve a conservative subset of block-bodied helper functions."""
         local_bindings = dict(bindings or {})
@@ -2039,8 +2607,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> dict[str, Any]:
         """Resolve a conservative subset of block-bodied object-return helpers."""
         local_bindings = dict(bindings or {})
@@ -2064,8 +2632,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> tuple[str, bool]:
         """Evaluate a small statement subset until a return is reached."""
         local_bindings = bindings if bindings is not None else {}
@@ -2094,8 +2662,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Evaluate a small statement subset for object-return helpers."""
         local_bindings = bindings if bindings is not None else {}
@@ -2124,8 +2692,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> tuple[str, bool]:
         """Evaluate one supported statement and optionally produce a return value."""
         statement_type = statement.get("type")
@@ -2185,16 +2753,16 @@ class EndpointDetector(BaseRule):
                 bindings=local_bindings,
             )
             if decision is None:
-                if self._statement_contains_return(statement.get("consequent")) or self._statement_contains_return(statement.get("alternate")):
+                if self._statement_contains_return(
+                    statement.get("consequent")
+                ) or self._statement_contains_return(statement.get("alternate")):
                     return "", True
                 return "", False
             branch = statement.get("consequent" if decision else "alternate")
             if not isinstance(branch, dict):
                 return "", False
             branch_statements = (
-                branch.get("body", [])
-                if branch.get("type") == "BlockStatement"
-                else [branch]
+                branch.get("body", []) if branch.get("type") == "BlockStatement" else [branch]
             )
             return self._process_statements(
                 branch_statements,
@@ -2275,8 +2843,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Evaluate one supported statement for object-return helpers."""
         statement_type = statement.get("type")
@@ -2336,16 +2904,16 @@ class EndpointDetector(BaseRule):
                 bindings=local_bindings,
             )
             if decision is None:
-                if self._statement_contains_return(statement.get("consequent")) or self._statement_contains_return(statement.get("alternate")):
+                if self._statement_contains_return(
+                    statement.get("consequent")
+                ) or self._statement_contains_return(statement.get("alternate")):
                     return {}, True
                 return {}, False
             branch = statement.get("consequent" if decision else "alternate")
             if not isinstance(branch, dict):
                 return {}, False
             branch_statements = (
-                branch.get("body", [])
-                if branch.get("type") == "BlockStatement"
-                else [branch]
+                branch.get("body", []) if branch.get("type") == "BlockStatement" else [branch]
             )
             return self._process_statements_object(
                 branch_statements,
@@ -2426,8 +2994,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> tuple[str, bool]:
         """Process a matched switch case until break or return."""
         local_bindings = bindings if bindings is not None else {}
@@ -2458,8 +3026,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> tuple[dict[str, Any], bool]:
         """Process a matched switch case for object-return helpers."""
         local_bindings = bindings if bindings is not None else {}
@@ -2492,12 +3060,13 @@ class EndpointDetector(BaseRule):
         if statement.get("type") == "BlockStatement":
             return any(self._statement_contains_return(item) for item in statement.get("body", []))
         if statement.get("type") == "IfStatement":
-            return (
-                self._statement_contains_return(statement.get("consequent"))
-                or self._statement_contains_return(statement.get("alternate"))
-            )
+            return self._statement_contains_return(
+                statement.get("consequent")
+            ) or self._statement_contains_return(statement.get("alternate"))
         if statement.get("type") == "SwitchStatement":
-            return any(self._switch_case_contains_return(case) for case in statement.get("cases", []))
+            return any(
+                self._switch_case_contains_return(case) for case in statement.get("cases", [])
+            )
         return False
 
     def _switch_case_contains_return(self, case: Any) -> bool:
@@ -2513,8 +3082,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> None:
         """Bind a supported local variable declaration into the helper scope."""
         local_bindings = bindings if bindings is not None else {}
@@ -2592,8 +3161,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> None:
         """Apply a simple local assignment to the helper scope."""
         local_bindings = bindings if bindings is not None else {}
@@ -2637,8 +3206,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> bool:
         """Bind object-destructuring aliases into the current scope."""
         local_bindings = bindings if bindings is not None else {}
@@ -2730,8 +3299,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> bool:
         """Bind array-destructuring aliases into the current scope."""
         local_bindings = bindings if bindings is not None else {}
@@ -2786,7 +3355,7 @@ class EndpointDetector(BaseRule):
                 bound_any = True
         return bound_any
 
-    def _normalize_pattern_node(self, node: Any) -> Optional[dict[str, Any]]:
+    def _normalize_pattern_node(self, node: Any) -> dict[str, Any] | None:
         """Unwrap destructuring-assignment nodes to the effective binding pattern."""
         if not isinstance(node, dict):
             return None
@@ -2795,7 +3364,7 @@ class EndpointDetector(BaseRule):
             return left if isinstance(left, dict) else None
         return node
 
-    def _extract_pattern_default_node(self, node: Any) -> Optional[dict[str, Any]]:
+    def _extract_pattern_default_node(self, node: Any) -> dict[str, Any] | None:
         """Extract a destructuring default value when one is present."""
         if not isinstance(node, dict):
             return None
@@ -2812,8 +3381,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> bool:
         """Bind an identifier or nested object-pattern from a concrete AST value node."""
         local_bindings = bindings if bindings is not None else {}
@@ -2822,8 +3391,10 @@ class EndpointDetector(BaseRule):
         if not isinstance(pattern, dict):
             return False
         effective_value_node = (
-            value_node if isinstance(value_node, dict)
-            else default_node if isinstance(default_node, dict)
+            value_node
+            if isinstance(value_node, dict)
+            else default_node
+            if isinstance(default_node, dict)
             else None
         )
         if not isinstance(effective_value_node, dict):
@@ -2910,10 +3481,10 @@ class EndpointDetector(BaseRule):
         source_path: str,
         constants: dict[str, str],
         bindings: dict[str, Any],
-        bool_constants: Optional[dict[str, bool]] = None,
-        function_returns: Optional[dict[str, dict[str, Any]]] = None,
+        bool_constants: dict[str, bool] | None = None,
+        function_returns: dict[str, dict[str, Any]] | None = None,
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
+        seen: set[str] | None = None,
     ) -> bool:
         """Bind an identifier or nested object-pattern from a flattened dotted source path."""
         default_node = self._extract_pattern_default_node(pattern_node)
@@ -3002,8 +3573,8 @@ class EndpointDetector(BaseRule):
         constants: dict[str, str],
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> bool:
         """Clone a flattened object binding into a new helper-local alias when possible."""
         if not target or not isinstance(value_node, dict):
@@ -3026,7 +3597,7 @@ class EndpointDetector(BaseRule):
         for key, value in {**constants, **local_bindings}.items():
             if not isinstance(key, str) or not key.startswith(prefix) or value in {None, ""}:
                 continue
-            suffix = key[len(source_path):]
+            suffix = key[len(source_path) :]
             local_bindings[f"{target}{suffix}"] = value
             cloned = True
         return cloned
@@ -3037,7 +3608,7 @@ class EndpointDetector(BaseRule):
         source_path: str,
         constants: dict[str, str],
         bindings: dict[str, Any],
-        bool_constants: Optional[dict[str, bool]] = None,
+        bool_constants: dict[str, bool] | None = None,
     ) -> bool:
         """Clone flattened dotted bindings from one prefix to another."""
         if not target or not source_path:
@@ -3051,7 +3622,7 @@ class EndpointDetector(BaseRule):
         for key, value in merged.items():
             if not isinstance(key, str) or not key.startswith(prefix) or value in {None, ""}:
                 continue
-            suffix = key[len(source_path):]
+            suffix = key[len(source_path) :]
             bindings[f"{target}{suffix}"] = value
             cloned = True
         return cloned
@@ -3060,7 +3631,7 @@ class EndpointDetector(BaseRule):
         self,
         node: dict[str, Any],
         key_name: str,
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Find a direct object-literal property value by key name."""
         if node.get("type") != "ObjectExpression":
             return None
@@ -3099,8 +3670,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> None:
         """Flatten a local object literal into dotted helper-scope bindings."""
         local_bindings = bindings if bindings is not None else {}
@@ -3124,7 +3695,9 @@ class EndpointDetector(BaseRule):
                         bindings=local_bindings,
                     )
                     continue
-                source_path = self._extract_member_path(argument) or self._resolve_member_lookup_path(
+                source_path = self._extract_member_path(
+                    argument
+                ) or self._resolve_member_lookup_path(
                     argument,
                     constants,
                     bool_constants,
@@ -3150,7 +3723,11 @@ class EndpointDetector(BaseRule):
                     bindings=local_bindings,
                 )
                 for spread_key, spread_value in spread_values.items():
-                    if spread_value is None or spread_value == "" or self._is_nullish_static_value(spread_value):
+                    if (
+                        spread_value is None
+                        or spread_value == ""
+                        or self._is_nullish_static_value(spread_value)
+                    ):
                         continue
                     local_bindings[f"{prefix}.{spread_key}"] = spread_value
                 continue
@@ -3203,8 +3780,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> None:
         """Flatten a local array literal into helper-scope bindings."""
         local_bindings = bindings if bindings is not None else {}
@@ -3251,7 +3828,7 @@ class EndpointDetector(BaseRule):
             if value is not None and value != "":
                 local_bindings[path] = value
 
-    def _resolve_static_value(self, *args, **kwargs) -> Any:
+    def _resolve_static_value(self, *args: Any, **kwargs: Any) -> Any:
         """Depth-guarded entry into the scalar/bool resolution spine (shares the
         _resolve_depth counter with _resolve_string_expr / _extract_object_string_values).
 
@@ -3276,8 +3853,8 @@ class EndpointDetector(BaseRule):
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
         allow_placeholders: bool = False,
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> Any:
         """Resolve a small static scalar subset used for helper argument binding."""
         scalar_value = self._resolve_scalar_expr(
@@ -3315,7 +3892,7 @@ class EndpointDetector(BaseRule):
             return None
         return string_value
 
-    def _resolve_bool_expr(self, *args, **kwargs) -> Optional[bool]:
+    def _resolve_bool_expr(self, *args: Any, **kwargs: Any) -> bool | None:
         """Depth-guarded entry (shares _resolve_depth with the string/scalar spine).
 
         Deeply nested boolean chains (`a && b && ... && z`, `!!!!x`) recurse here directly
@@ -3337,9 +3914,9 @@ class EndpointDetector(BaseRule):
         constants: dict[str, str],
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
-    ) -> Optional[bool]:
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
+    ) -> bool | None:
         """Resolve a conservative boolean subset for branch-aware helper analysis."""
         if not isinstance(node, dict):
             return None
@@ -3350,15 +3927,17 @@ class EndpointDetector(BaseRule):
 
         if node_type == "Identifier":
             name = node.get("name", "")
-            if bindings and isinstance(bindings.get(name), bool):
-                return bindings[name]
+            bound_value = bindings.get(name) if bindings else None
+            if isinstance(bound_value, bool):
+                return bound_value
             value = bool_constants.get(name)
             return value if isinstance(value, bool) else None
 
         if node_type == "MemberExpression":
             path = self._extract_member_path(node)
-            if path and bindings and isinstance(bindings.get(path), bool):
-                return bindings[path]
+            bound_value = bindings.get(path) if path and bindings else None
+            if isinstance(bound_value, bool):
+                return bound_value
             value = bool_constants.get(path or "")
             return value if isinstance(value, bool) else None
 
@@ -3419,7 +3998,7 @@ class EndpointDetector(BaseRule):
                 )
                 if left is None or right is None:
                     return None
-                return (left == right) if operator in {"==", "==="} else (left != right)
+                return bool((left == right) if operator in {"==", "==="} else (left != right))
 
         return None
 
@@ -3429,8 +4008,8 @@ class EndpointDetector(BaseRule):
         constants: dict[str, str],
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> Any:
         """Resolve a scalar literal/binding used by boolean comparisons."""
         if not isinstance(node, dict):
@@ -3481,7 +4060,10 @@ class EndpointDetector(BaseRule):
             if not isinstance(value, str):
                 return None
             return None if self._is_placeholder_value(value) else value
-        if node.get("type") == "CallExpression" and node.get("callee", {}).get("type") == "Identifier":
+        if (
+            node.get("type") == "CallExpression"
+            and node.get("callee", {}).get("type") == "Identifier"
+        ):
             resolved = self._resolve_function_call(
                 node.get("callee", {}).get("name", ""),
                 node.get("arguments", []),
@@ -3495,7 +4077,10 @@ class EndpointDetector(BaseRule):
             if resolved == _BLOCKED_STRING:
                 return None
             return resolved or None
-        if node.get("type") == "CallExpression" and node.get("callee", {}).get("type") == "MemberExpression":
+        if (
+            node.get("type") == "CallExpression"
+            and node.get("callee", {}).get("type") == "MemberExpression"
+        ):
             member_name = self._extract_member_path(node.get("callee", {}))
             if not member_name:
                 return None
@@ -3600,8 +4185,8 @@ class EndpointDetector(BaseRule):
         constants: dict[str, str],
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
-        seen: Optional[set[str]] = None,
-        bindings: Optional[dict[str, Any]] = None,
+        seen: set[str] | None = None,
+        bindings: dict[str, Any] | None = None,
     ) -> str:
         """Resolve computed member expressions such as ROUTES[kind] into dotted paths."""
         if not isinstance(node, dict) or node.get("type") != "MemberExpression":
@@ -3659,13 +4244,35 @@ class EndpointDetector(BaseRule):
     def _build_constant_table(
         self,
         ast: dict[str, Any],
-        function_returns: Optional[dict[str, dict[str, Any]]] = None,
+        function_returns: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """Build a simple constant table for string-valued variables."""
         constants: dict[str, str] = {}
         resolved_functions = function_returns or {}
         if not ast:
             return constants
+
+        # This table is FLAT / scope-blind. A variable SHADOWED across scopes with DIFFERENT string
+        # literals (e.g. `const base="https://good"` in one function and `const base="https://evil"`
+        # in another) would otherwise collapse to a single last-wins value, so every reference would
+        # resolve to a URL that appears NOWHERE in that scope -- a fabricated, HIGH-confidence
+        # endpoint that mis-attributes the domain. Refuse to resolve such names (soundness over
+        # recall for the genuinely ambiguous case; single-scope resolution is unaffected).
+        literal_values_by_name: dict[str, set[str]] = {}
+        for node in self._iter_nodes(ast):
+            if node.get("type") != "VariableDeclarator":
+                continue
+            ident = node.get("id", {})
+            init = node.get("init", {})
+            name = ident.get("name") if isinstance(ident, dict) else None
+            if (
+                name
+                and isinstance(init, dict)
+                and init.get("type") == "Literal"
+                and isinstance(init.get("value"), str)
+            ):
+                literal_values_by_name.setdefault(name, set()).add(init["value"])
+        conflicting_names = {n for n, vals in literal_values_by_name.items() if len(vals) >= 2}
 
         for _ in range(5):
             changed = False
@@ -3712,7 +4319,11 @@ class EndpointDetector(BaseRule):
                             constants[key] = value
                             changed = True
                     continue
-                if isinstance(init, dict) and init.get("type") == "Literal" and isinstance(init.get("value"), int):
+                if (
+                    isinstance(init, dict)
+                    and init.get("type") == "Literal"
+                    and isinstance(init.get("value"), int)
+                ):
                     numeric_value = str(init.get("value"))
                     if constants.get(name) != numeric_value:
                         constants[name] = numeric_value
@@ -3741,7 +4352,7 @@ class EndpointDetector(BaseRule):
                     resolved_functions,
                     allow_placeholders=False,
                 )
-                if value and constants.get(name) != value:
+                if value and name not in conflicting_names and constants.get(name) != value:
                     constants[name] = value
                     changed = True
             if not changed:
@@ -3781,14 +4392,14 @@ class EndpointDetector(BaseRule):
                             bool_constants[key] = value
                             changed = True
                     continue
-                value = self._resolve_bool_expr(
+                resolved_bool = self._resolve_bool_expr(
                     init,
                     constants,
                     bool_constants,
                     {},
                 )
-                if value is not None and bool_constants.get(name) != value:
-                    bool_constants[name] = value
+                if resolved_bool is not None and bool_constants.get(name) != resolved_bool:
+                    bool_constants[name] = resolved_bool
                     changed = True
             if not changed:
                 break
@@ -3810,9 +4421,11 @@ class EndpointDetector(BaseRule):
         for node in self._iter_nodes(ast):
             if node.get("type") != "VariableDeclarator":
                 continue
-            identifier = node.get("id", {})
+            identifier = node.get("id")
+            init = node.get("init")
+            if not isinstance(identifier, dict) or not isinstance(init, dict):
+                continue
             name = identifier.get("name")
-            init = node.get("init", {})
             if not name or init.get("type") != "CallExpression":
                 continue
 
@@ -3841,8 +4454,9 @@ class EndpointDetector(BaseRule):
                     )
                 else:
                     base_url = ""
-                if base_url:
-                    clients[name] = base_url
+                # Presence in this table is also provenance that the receiver is an HTTP client;
+                # an axios instance without a static baseURL still supports `.get/.post/...`.
+                clients[name] = base_url or ""
 
         return clients
 
@@ -3960,16 +4574,14 @@ class EndpointDetector(BaseRule):
                 continue
 
             if isinstance(value, dict) and value.get("type") == "ObjectExpression":
-                function_returns.update(
-                    self._extract_object_method_bodies(path, value)
-                )
+                function_returns.update(self._extract_object_method_bodies(path, value))
 
         return function_returns
 
     def _extract_callable_body_node(
         self,
         node: dict[str, Any],
-    ) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
+    ) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
         """Extract params/body from a function expression or arrow function."""
         if not isinstance(node, dict):
             return [], None
@@ -3990,7 +4602,7 @@ class EndpointDetector(BaseRule):
     def _extract_function_body_node(
         self,
         node: dict[str, Any],
-    ) -> tuple[str, list[dict[str, Any]], Optional[dict[str, Any]]]:
+    ) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
         """Extract a named function's params and returned expression node."""
         node_type = node.get("type")
         if node_type == "FunctionDeclaration":
@@ -4017,33 +4629,42 @@ class EndpointDetector(BaseRule):
         if params is None:
             return "", [], None
 
-        if init_type == "ArrowFunctionExpression" and init.get("body", {}).get("type") != "BlockStatement":
+        if (
+            init_type == "ArrowFunctionExpression"
+            and init.get("body", {}).get("type") != "BlockStatement"
+        ):
             return name, params, init.get("body")
         return name, params, init.get("body", {})
 
-    def _extract_param_specs(self, params: list[Any]) -> Optional[list[dict[str, Any]]]:
+    def _extract_param_specs(self, params: list[Any]) -> list[dict[str, Any]] | None:
         """Extract supported function parameter specs, including simple defaults."""
         specs: list[dict[str, Any]] = []
         for param in params:
             if not isinstance(param, dict):
                 return None
             if param.get("type") == "Identifier":
-                specs.append({
-                    "name": param.get("name", ""),
-                    "default": None,
-                })
+                specs.append(
+                    {
+                        "name": param.get("name", ""),
+                        "default": None,
+                    }
+                )
                 continue
             if param.get("type") == "ObjectPattern":
-                specs.append({
-                    "pattern": param,
-                    "default": None,
-                })
+                specs.append(
+                    {
+                        "pattern": param,
+                        "default": None,
+                    }
+                )
                 continue
             if param.get("type") == "ArrayPattern":
-                specs.append({
-                    "pattern": param,
-                    "default": None,
-                })
+                specs.append(
+                    {
+                        "pattern": param,
+                        "default": None,
+                    }
+                )
                 continue
             if param.get("type") == "AssignmentPattern":
                 left = param.get("left", {})
@@ -4051,22 +4672,28 @@ class EndpointDetector(BaseRule):
                 if not isinstance(right, dict):
                     return None
                 if left.get("type") == "Identifier":
-                    specs.append({
-                        "name": left.get("name", ""),
-                        "default": right,
-                    })
+                    specs.append(
+                        {
+                            "name": left.get("name", ""),
+                            "default": right,
+                        }
+                    )
                     continue
                 if left.get("type") == "ObjectPattern":
-                    specs.append({
-                        "pattern": left,
-                        "default": right,
-                    })
+                    specs.append(
+                        {
+                            "pattern": left,
+                            "default": right,
+                        }
+                    )
                     continue
                 if left.get("type") == "ArrayPattern":
-                    specs.append({
-                        "pattern": left,
-                        "default": right,
-                    })
+                    specs.append(
+                        {
+                            "pattern": left,
+                            "default": right,
+                        }
+                    )
                     continue
                 return None
                 continue
@@ -4076,7 +4703,7 @@ class EndpointDetector(BaseRule):
     def _extract_return_expression(
         self,
         body_node: dict[str, Any],
-    ) -> Optional[dict[str, Any]]:
+    ) -> dict[str, Any] | None:
         """Extract the first returned expression from a function body."""
         if body_node.get("type") != "BlockStatement":
             return None
@@ -4131,7 +4758,11 @@ class EndpointDetector(BaseRule):
                             children.append(item)
             stack.extend(reversed(children))
 
-    def _extract_object_string_values(self, *args, **kwargs) -> dict[str, str]:
+    def _extract_object_string_values(
+        self,
+        *args: Any,
+        **kwargs: Any,
+    ) -> dict[str, str]:
         """Depth-guarded entry point (shares _resolve_depth with _resolve_string_expr).
 
         Deeply nested object literals recurse here; on budget exhaustion returns the
@@ -4150,7 +4781,7 @@ class EndpointDetector(BaseRule):
         prefix: str,
         node: dict[str, Any],
         constants: dict[str, str],
-        function_returns: Optional[dict[str, dict[str, Any]]] = None,
+        function_returns: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """Flatten object-literal string members into dotted constant-table keys."""
         values: dict[str, str] = {}
@@ -4163,9 +4794,15 @@ class EndpointDetector(BaseRule):
             if prop.get("type") == "SpreadElement":
                 argument = prop.get("argument", {})
                 if isinstance(argument, dict) and argument.get("type") == "ObjectExpression":
-                    values.update(self._extract_object_string_values(prefix, argument, constants, function_returns))
+                    values.update(
+                        self._extract_object_string_values(
+                            prefix, argument, constants, function_returns
+                        )
+                    )
                     continue
-                source_path = self._extract_member_path(argument) or self._resolve_member_lookup_path(
+                source_path = self._extract_member_path(
+                    argument
+                ) or self._resolve_member_lookup_path(
                     argument,
                     constants,
                     {},
@@ -4174,9 +4811,13 @@ class EndpointDetector(BaseRule):
                 if source_path:
                     source_prefix = f"{source_path}."
                     for key, value in constants.items():
-                        if not isinstance(key, str) or not key.startswith(source_prefix) or not value:
+                        if (
+                            not isinstance(key, str)
+                            or not key.startswith(source_prefix)
+                            or not value
+                        ):
                             continue
-                        remainder = key[len(source_prefix):]
+                        remainder = key[len(source_prefix) :]
                         path = f"{prefix}.{remainder}" if prefix else remainder
                         values[path] = value
                 spread_values = self._resolve_object_expr(
@@ -4186,7 +4827,11 @@ class EndpointDetector(BaseRule):
                     function_returns or {},
                 )
                 for spread_key, spread_value in spread_values.items():
-                    if not isinstance(spread_value, str) or not spread_value or spread_value == _BLOCKED_STRING:
+                    if (
+                        not isinstance(spread_value, str)
+                        or not spread_value
+                        or spread_value == _BLOCKED_STRING
+                    ):
                         continue
                     path = f"{prefix}.{spread_key}" if prefix else spread_key
                     values[path] = spread_value
@@ -4200,7 +4845,9 @@ class EndpointDetector(BaseRule):
                 values.update(self._extract_object_string_values(path, value_node, constants))
                 continue
             if isinstance(value_node, dict) and value_node.get("type") == "ArrayExpression":
-                values.update(self._extract_array_string_values(path, value_node, constants, function_returns))
+                values.update(
+                    self._extract_array_string_values(path, value_node, constants, function_returns)
+                )
                 continue
             value = self._resolve_string_expr(
                 value_node,
@@ -4218,7 +4865,7 @@ class EndpointDetector(BaseRule):
         prefix: str,
         node: dict[str, Any],
         constants: dict[str, str],
-        function_returns: Optional[dict[str, dict[str, Any]]] = None,
+        function_returns: dict[str, dict[str, Any]] | None = None,
     ) -> dict[str, str]:
         """Flatten array string members into dotted constant-table keys."""
         values: dict[str, str] = {}
@@ -4230,10 +4877,14 @@ class EndpointDetector(BaseRule):
                 continue
             path = f"{prefix}.{index}"
             if element.get("type") == "ObjectExpression":
-                values.update(self._extract_object_string_values(path, element, constants, function_returns))
+                values.update(
+                    self._extract_object_string_values(path, element, constants, function_returns)
+                )
                 continue
             if element.get("type") == "ArrayExpression":
-                values.update(self._extract_array_string_values(path, element, constants, function_returns))
+                values.update(
+                    self._extract_array_string_values(path, element, constants, function_returns)
+                )
                 continue
             value = self._resolve_string_expr(
                 element,
@@ -4273,7 +4924,9 @@ class EndpointDetector(BaseRule):
                         )
                     )
                     continue
-                source_path = self._extract_member_path(argument) or self._resolve_member_lookup_path(
+                source_path = self._extract_member_path(
+                    argument
+                ) or self._resolve_member_lookup_path(
                     argument,
                     constants,
                     bool_constants,
@@ -4284,7 +4937,7 @@ class EndpointDetector(BaseRule):
                     for key, value in bool_constants.items():
                         if not isinstance(key, str) or not key.startswith(source_prefix):
                             continue
-                        remainder = key[len(source_prefix):]
+                        remainder = key[len(source_prefix) :]
                         path = f"{prefix}.{remainder}" if prefix else remainder
                         values[path] = value
                 spread_values = self._resolve_object_expr(
@@ -4314,14 +4967,14 @@ class EndpointDetector(BaseRule):
                     )
                 )
                 continue
-            value = self._resolve_bool_expr(
+            resolved_bool = self._resolve_bool_expr(
                 value_node,
                 constants,
                 bool_constants,
                 {},
             )
-            if value is not None:
-                values[path] = value
+            if resolved_bool is not None:
+                values[path] = resolved_bool
         return values
 
     def _extract_property_name(self, node: Any) -> str:
@@ -4329,7 +4982,8 @@ class EndpointDetector(BaseRule):
         if not isinstance(node, dict):
             return ""
         if node.get("type") == "Identifier":
-            return node.get("name", "")
+            name = node.get("name")
+            return name if isinstance(name, str) else ""
         if node.get("type") == "Literal":
             value = node.get("value")
             if isinstance(value, str):
@@ -4344,7 +4998,8 @@ class EndpointDetector(BaseRule):
             return ""
         node_type = node.get("type")
         if node_type == "Identifier":
-            return node.get("name", "")
+            name = node.get("name")
+            return name if isinstance(name, str) else ""
         if node_type != "MemberExpression":
             return ""
 
@@ -4393,7 +5048,11 @@ class EndpointDetector(BaseRule):
 
     def _is_static_asset_url(self, value: str) -> bool:
         """Return True for obvious frontend asset URLs that are not endpoints."""
-        parsed = urlsplit(value if value.startswith(("http://", "https://", "ws://", "wss://")) else f"https://host{value}")
+        parsed = urlsplit(
+            value
+            if value.startswith(("http://", "https://", "ws://", "wss://"))
+            else f"https://host{value}"
+        )
         path = parsed.path.lower()
         for extension in self.STATIC_ASSET_EXTENSIONS:
             if path.endswith(extension):
@@ -4414,16 +5073,16 @@ class EndpointDetector(BaseRule):
 
     def _extract_method(
         self,
-        call,
+        call: FunctionCall,
         is_fetch: bool,
         is_axios: bool,
         constants: dict[str, str],
         bool_constants: dict[str, bool],
         function_returns: dict[str, dict[str, Any]],
-        resolved_arg_object: Optional[dict[str, Any]] = None,
+        resolved_arg_object: dict[str, Any] | None = None,
     ) -> str:
         """Extract HTTP method from call."""
-        name_lower = call.name.lower()
+        name_lower = str(call.name).lower()
 
         # Method in function name (exact match only)
         if name_lower in self.HTTP_METHOD_FUNCTIONS:
@@ -4436,7 +5095,7 @@ class EndpointDetector(BaseRule):
 
         # Check options object for method
         if len(call.arguments) > 1:
-            options = call.arguments[1]
+            options = self._resolve_config_node(call.arguments[1])
             if options.get("type") == "ObjectExpression":
                 for prop in options.get("properties", []):
                     key_node = prop.get("key", {})
@@ -4465,11 +5124,38 @@ class EndpointDetector(BaseRule):
                 if isinstance(method_value, str) and method_value:
                     return method_value.upper()
 
+        # fetch(new Request(url, {method:'DELETE'})): the verb lives in the Request init, but the
+        # fetch call has a SINGLE argument (the NewExpression), so it was falling through to GET
+        # (DQ-E05). Recover the method from the constructor's init object.
+        if call.arguments:
+            first = call.arguments[0]
+            if (
+                isinstance(first, dict)
+                and first.get("type") == "NewExpression"
+                and (first.get("callee") or {}).get("name") == "Request"
+            ):
+                new_args = first.get("arguments") or []
+                init = new_args[1] if len(new_args) > 1 and isinstance(new_args[1], dict) else {}
+                if init.get("type") == "ObjectExpression":
+                    for prop in init.get("properties", []):
+                        key_node = prop.get("key", {})
+                        key_name = key_node.get("name")
+                        if not isinstance(key_name, str) or not key_name:
+                            literal_key = key_node.get("value")
+                            key_name = literal_key if isinstance(literal_key, str) else ""
+                        if isinstance(key_name, str) and key_name.lower() == "method":
+                            return self._resolve_http_method_expr(
+                                prop.get("value", {}),
+                                constants,
+                                bool_constants,
+                                function_returns,
+                            )
+
         return "GET"
 
     def _check_url_pattern(
         self,
-        literal,
+        literal: StringLiteral,
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Check string literals for URL patterns."""
@@ -4525,10 +5211,7 @@ class EndpointDetector(BaseRule):
             return
 
         # Check for full URLs (path is optional ??bare domain, trailing slash, or query-only is valid)
-        url_match = re.match(
-            r"^((?:https?|wss?)://[a-zA-Z0-9.-]+(?::\d+)?)((?:/|\?).*)?$",
-            value
-        )
+        url_match = re.match(r"^((?:https?|wss?)://[a-zA-Z0-9.-]+(?::\d+)?)((?:/|\?).*)?$", value)
         if url_match:
             if not self._is_standalone_api_literal(value, literal, context):
                 return
@@ -4556,7 +5239,7 @@ class EndpointDetector(BaseRule):
     def _is_standalone_api_literal(
         self,
         value: str,
-        literal,
+        literal: StringLiteral,
         context: AnalysisContext,
     ) -> bool:
         """Return True when a standalone full URL literal looks API-like enough to report."""
@@ -4589,18 +5272,34 @@ class EndpointDetector(BaseRule):
 
     def _has_documentation_literal_context(
         self,
-        literal,
+        literal: StringLiteral,
         context: AnalysisContext,
     ) -> bool:
         """Return True when a standalone literal line looks like docs/example content."""
         if not context.source_content or literal.line <= 0:
             return False
 
-        lines = context.source_content.split("\n")
+        # Memoize per (source, line): the result is a pure function of the finding's source line, but
+        # it was recomputed (split + mask + hint scan) for EVERY finding -> O(findings x line_len),
+        # quadratic on a single-line minified bundle (every finding shares line 1 = the whole file).
+        # Cache the split + per-line boolean for the current source_content.
+        src = context.source_content
+        if src is not getattr(self, "_doc_ctx_src", None):
+            self._doc_ctx_src = src
+            self._doc_ctx_lines = src.split("\n")
+            self._doc_ctx_cache: dict[int, bool] = {}
+        lines = self._doc_ctx_lines
         line_idx = literal.line - 1
         if line_idx < 0 or line_idx >= len(lines):
             return False
+        cached = self._doc_ctx_cache.get(line_idx)
+        if cached is not None:
+            return cached
 
-        line = re.sub(r'(["\'`])(?:\\.|(?!\1).)*\1', '""', lines[line_idx]).lower()
-        return any(hint in line for hint in self.DOC_CONTEXT_HINTS)
-
+        # `[^\\]` (not bare `.`) keeps the non-escape branch DISJOINT from `\\.` -> linear, not the
+        # exponential Fibonacci backtracking an overlapping `.` causes on an unterminated quote +
+        # backslash run. Same match set for well-formed strings.
+        line = _DOC_MASK_RE.sub('""', lines[line_idx]).lower()
+        result = any(hint in line for hint in self.DOC_CONTEXT_HINTS)
+        self._doc_ctx_cache[line_idx] = result
+        return result

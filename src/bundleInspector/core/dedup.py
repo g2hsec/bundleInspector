@@ -7,15 +7,15 @@ from __future__ import annotations
 import hashlib
 from collections import OrderedDict
 from dataclasses import dataclass
-from typing import Optional
 
 
 @dataclass
 class CacheEntry:
     """Cache entry."""
+
     key: str
-    content_hash: Optional[str] = None
-    metadata: Optional[dict] = None
+    content_hash: str | None = None
+    metadata: dict | None = None
 
 
 class DedupCache:
@@ -37,7 +37,7 @@ class DedupCache:
         normalized = self._normalize_url(url)
         return normalized in self._url_cache
 
-    def add_url(self, url: str, content_hash: Optional[str] = None) -> bool:
+    def add_url(self, url: str, content_hash: str | None = None) -> bool:
         """
         Add URL to cache.
 
@@ -70,7 +70,7 @@ class DedupCache:
         """Check if content hash has been seen."""
         return content_hash in self._hash_cache
 
-    def get_url_for_hash(self, content_hash: str) -> Optional[str]:
+    def get_url_for_hash(self, content_hash: str) -> str | None:
         """Get first URL for a content hash."""
         return self._hash_cache.get(content_hash)
 
@@ -118,14 +118,16 @@ class DedupCache:
         path = parsed.path.rstrip("/")
 
         # Remove fragment, normalize scheme and host
-        normalized = urlunparse((
-            scheme,
-            netloc,
-            path,
-            parsed.params,
-            parsed.query,
-            "",  # No fragment
-        ))
+        normalized = urlunparse(
+            (
+                scheme,
+                netloc,
+                path,
+                parsed.params,
+                parsed.query,
+                "",  # No fragment
+            )
+        )
 
         return normalized
 

@@ -4,17 +4,23 @@ Correlation graph for connecting findings.
 
 from __future__ import annotations
 
-from collections import defaultdict
+import json
+import posixpath
+import sys
+from collections import defaultdict, deque
+from collections.abc import Callable, Iterable, Iterator
 from pathlib import PurePosixPath
+from typing import Any, TypeVar, cast
+
+from bundleInspector.correlator.cluster import ClusterBuilder, canonicalize_origin
 from bundleInspector.correlator.edges import (
     create_call_chain_edge,
-    create_import_edge,
-    create_same_file_edge,
     create_config_edge,
+    create_import_edge,
     create_runtime_edge,
+    create_same_file_edge,
     create_taint_edge,
 )
-from bundleInspector.correlator.cluster import ClusterBuilder
 from bundleInspector.storage.models import (
     Category,
     Cluster,
@@ -25,13 +31,54 @@ from bundleInspector.storage.models import (
     Severity,
 )
 
+# DQ-G04: edge types whose two endpoints are interchangeable -- co-occurrence within the same
+# file / base URL / environment. For these, A-B and B-A denote the same relation and must
+# deduplicate together. All other edge types (IMPORT, CALL_CHAIN, RUNTIME, TAINT) are directed:
+# A->B and B->A are distinct, so their orientation is preserved in the dedup key.
+_SYMMETRIC_EDGE_TYPES = frozenset({EdgeType.SAME_FILE, EdgeType.CONFIG, EdgeType.ENV})
+_T = TypeVar("_T")
+
+
+class _TelemetryEdgeCap(int):
+    """An integer cap that records the exact `count >= cap` saturation point."""
+
+    _graph: CorrelationGraph
+    _pass_name: str
+    _possible_candidates: int | None
+
+    def __new__(
+        cls,
+        value: int,
+        graph: CorrelationGraph,
+        pass_name: str,
+        possible_candidates: int | None,
+    ) -> _TelemetryEdgeCap:
+        instance = int.__new__(cls, value)
+        instance._graph = graph
+        instance._pass_name = pass_name
+        instance._possible_candidates = possible_candidates
+        return instance
+
+    def __le__(self, other: object) -> bool:
+        if not isinstance(other, int):
+            return NotImplemented
+        reached = other >= int(self)
+        if reached:
+            remaining = (
+                max(self._possible_candidates - other, 0)
+                if self._possible_candidates is not None
+                else None
+            )
+            self._graph.note_cap(self._pass_name, truncated_candidates=remaining)
+        return reached
+
 
 class CorrelationGraph:
     """
     Graph of correlations between findings.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.edges: list[Edge] = []
         self.clusters: list[Cluster] = []
         self._edge_keys: set[tuple[str, str, EdgeType, str]] = set()
@@ -39,15 +86,106 @@ class CorrelationGraph:
         # Indexes
         self._by_source: dict[str, list[Edge]] = defaultdict(list)
         self._by_target: dict[str, list[Edge]] = defaultdict(list)
+        self.telemetry: dict[str, Any] = {
+            "candidates": 0,
+            "candidate_attempts": 0,
+            "emitted": 0,
+            "dropped": 0,
+            "duplicate_dropped": 0,
+            "cap_dropped": 0,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 0,
+            "truncated_candidates_unknown": 0,
+            "capped_passes": {},
+            "passes": {},
+        }
+        self._last_cap_markers: dict[str, int] = {}
 
-    def add_edge(self, edge: Edge) -> None:
-        """Add an edge to the graph."""
-        source_id, target_id = sorted([edge.source_id, edge.target_id])
+    def _pass_stats(self, pass_name: str) -> dict[str, int]:
+        passes = self.telemetry["passes"]
+        assert isinstance(passes, dict)
+        stats = passes.setdefault(
+            pass_name,
+            {
+                "candidate_attempts": 0,
+                "emitted": 0,
+                "duplicate_dropped": 0,
+                "cap_dropped": 0,
+                "truncated_candidates": 0,
+                "truncated_candidates_lower_bound": 0,
+                "truncated_candidates_unknown": 0,
+            },
+        )
+        return cast(dict[str, int], stats)
+
+    def edge_cap(
+        self,
+        value: int,
+        possible_candidates: int | None = None,
+        *,
+        pass_name: str | None = None,
+    ) -> _TelemetryEdgeCap:
+        """Create a cap, optionally with an exact pre-cap candidate cardinality."""
+        effective_pass_name = pass_name or sys._getframe(1).f_code.co_name
+        return _TelemetryEdgeCap(value, self, effective_pass_name, possible_candidates)
+
+    def note_cap(
+        self,
+        pass_name: str,
+        truncated_candidates: int | None = None,
+    ) -> None:
+        """Record truncation separately from candidates actually evaluated by ``add_edge``.
+
+        When a pass can supply its full candidate cardinality, ``truncated_candidates`` is exact.
+        Otherwise telemetry records a one-candidate lower bound and increments the unknown counter.
+        """
+        stats = self._pass_stats(pass_name)
+        marker = stats["emitted"] + stats["duplicate_dropped"]
+        if self._last_cap_markers.get(pass_name) == marker:
+            return
+        if truncated_candidates == 0:
+            return
+        self._last_cap_markers[pass_name] = marker
+        lower_bound = truncated_candidates if truncated_candidates is not None else 1
+        self.telemetry["cap_dropped"] += lower_bound
+        self.telemetry["truncated_candidates_lower_bound"] += lower_bound
+        stats["cap_dropped"] += lower_bound
+        stats["truncated_candidates_lower_bound"] += lower_bound
+        if truncated_candidates is None:
+            self.telemetry["truncated_candidates_unknown"] += 1
+            stats["truncated_candidates_unknown"] += 1
+        else:
+            self.telemetry["truncated_candidates"] += truncated_candidates
+            stats["truncated_candidates"] += truncated_candidates
+        capped_passes = self.telemetry["capped_passes"]
+        assert isinstance(capped_passes, dict)
+        capped_passes[pass_name] = capped_passes.get(pass_name, 0) + 1
+
+    def add_edge(self, edge: Edge, *, pass_name: str | None = None) -> None:
+        """Add an edge to the graph, deduplicating identical relations.
+
+        DQ-G04: only symmetric edge types sort their endpoints so A-B and B-A collapse to one.
+        Directed types keep their orientation, so a genuine reverse edge (e.g. a circular import
+        A->B and B->A) is preserved instead of being silently dropped."""
+        effective_pass_name = pass_name or sys._getframe(1).f_code.co_name
+        stats = self._pass_stats(effective_pass_name)
+        self.telemetry["candidate_attempts"] += 1
+        self.telemetry["candidates"] += 1
+        stats["candidate_attempts"] += 1
+        if edge.edge_type in _SYMMETRIC_EDGE_TYPES:
+            source_id, target_id = sorted([edge.source_id, edge.target_id])
+        else:
+            source_id, target_id = edge.source_id, edge.target_id
         edge_key = (source_id, target_id, edge.edge_type, edge.reasoning)
         if edge_key in self._edge_keys:
+            self.telemetry["duplicate_dropped"] += 1
+            self.telemetry["dropped"] += 1
+            stats["duplicate_dropped"] += 1
             return
         self._edge_keys.add(edge_key)
         self.edges.append(edge)
+        self.telemetry["emitted"] += 1
+        stats["emitted"] += 1
         self._by_source[edge.source_id].append(edge)
         self._by_target[edge.target_id].append(edge)
 
@@ -91,9 +229,40 @@ class Correlator:
     Build correlations between findings.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._cluster_builder = ClusterBuilder()
         self._correlation_cache: dict[tuple[object, ...], object] | None = None
+        self._ambiguous_import_resolutions: set[tuple[str, str, tuple[str, ...]]] = set()
+
+    @staticmethod
+    def _finding_sort_key(f: Finding) -> tuple:
+        """Stable semantic ordering with ID only as a final tie for identical findings."""
+        ev = getattr(f, "evidence", None)
+        cat = getattr(f, "category", None)
+        sev = getattr(f, "severity", None)
+        confidence = getattr(f, "confidence", None)
+        metadata = json.dumps(
+            getattr(f, "metadata", {}) or {},
+            sort_keys=True,
+            separators=(",", ":"),
+            default=str,
+        )
+        return (
+            (getattr(ev, "file_url", "") or "") if ev else "",
+            (getattr(ev, "line", 0) or 0) if ev else 0,
+            (getattr(ev, "column", 0) or 0) if ev else 0,
+            getattr(cat, "value", "") if cat is not None else "",
+            getattr(f, "rule_id", "") or "",
+            getattr(sev, "value", "") if sev is not None else "",
+            getattr(confidence, "value", "") if confidence is not None else "",
+            str(getattr(f, "extracted_value", "") or ""),
+            getattr(f, "value_type", "") or "",
+            getattr(f, "title", "") or "",
+            getattr(f, "description", "") or "",
+            tuple(sorted(getattr(f, "tags", []) or [])),
+            metadata,
+            getattr(f, "id", "") or "",
+        )
 
     def correlate(self, findings: list[Finding]) -> CorrelationGraph:
         """
@@ -107,6 +276,15 @@ class Correlator:
         """
         graph = CorrelationGraph()
         self._correlation_cache = {}
+        self._ambiguous_import_resolutions = set()
+
+        # DQ-G02: process findings in a deterministic content order so the correlation output -- which
+        # the per-pass edge caps make order-sensitive -- does not depend on the CALLER's finding order
+        # (reversing it previously flipped which related edges/risk survived the cap). A local copy;
+        # the caller's list is not reordered.
+        findings = sorted(findings, key=self._finding_sort_key)
+        for finding in findings:
+            finding.cluster_id = None
 
         try:
             # Index findings by various attributes
@@ -175,9 +353,25 @@ class Correlator:
             findings_by_id = {f.id: f for f in findings}
             for cluster in graph.clusters:
                 for finding_id in cluster.finding_ids:
-                    finding = findings_by_id.get(finding_id)
-                    if finding and not finding.cluster_id:
-                        finding.cluster_id = cluster.id
+                    clustered_finding = findings_by_id.get(finding_id)
+                    if clustered_finding and not clustered_finding.cluster_id:
+                        clustered_finding.cluster_id = cluster.id
+
+            # DQ-G04: surface each finding's correlation neighborhood. Finding.correlation_ids was
+            # declared but never populated; downstream consumers (reporters, triage) can now read a
+            # finding's related IDs directly instead of re-walking the graph.
+            for finding in findings:
+                related = graph.get_related(finding.id) - {finding.id}
+                finding.correlation_ids = sorted(related)
+
+            graph.telemetry["ambiguous_imports"] = [
+                {
+                    "importer": importer,
+                    "source": source,
+                    "candidate_targets": list(targets),
+                }
+                for importer, source, targets in sorted(self._ambiguous_import_resolutions)
+            ]
 
             return graph
         finally:
@@ -186,15 +380,52 @@ class Correlator:
     def _cache_result(
         self,
         key: tuple[object, ...],
-        factory,
-    ):
+        factory: Callable[[], _T],
+    ) -> _T:
         """Reuse expensive correlation-pass computations during one correlate() call."""
         cache = self._correlation_cache
         if cache is None:
             return factory()
         if key not in cache:
             cache[key] = factory()
-        return cache[key]
+        return cast(_T, cache[key])
+
+    def _emit_fair_edges(
+        self,
+        graph: CorrelationGraph,
+        partitions: Iterable[tuple[str, Iterable[Edge]]],
+        limit: int = 50,
+    ) -> None:
+        """Emit a globally bounded, deterministic round-robin sample of partitioned candidates.
+
+        Candidate iterables stay lazy: only one candidate per active partition is constructed in a
+        round, and at most one candidate beyond ``limit`` is requested to prove truncation. This
+        prevents an early source/context/file from consuming the complete pass budget without
+        materializing the Cartesian products that the cap exists to bound.
+        """
+        pass_name = sys._getframe(1).f_code.co_name
+        max_edges = graph.edge_cap(limit, pass_name=pass_name)
+        active: deque[tuple[str, Iterator[Edge]]] = deque(
+            (partition_key, iter(candidates))
+            for partition_key, candidates in sorted(partitions, key=lambda item: item[0])
+        )
+        count = 0
+        while active:
+            partition_key, candidates = active.popleft()
+            try:
+                edge = next(candidates)
+            except StopIteration:
+                continue
+            if count >= max_edges:
+                return
+            graph.add_edge(edge, pass_name=pass_name)
+            count += 1
+            active.append((partition_key, candidates))
+
+    @staticmethod
+    def _compound_partition_key(*components: str) -> str:
+        """Build a collision-free sortable key for a compound semantic partition."""
+        return "".join(f"{len(component)}:{component}" for component in components)
 
     def _group_by_file(
         self,
@@ -214,16 +445,12 @@ class Correlator:
         findings: list[Finding],
     ) -> dict[str, list[Finding]]:
         """Group endpoint findings by base URL."""
-        from bundleInspector.core.url_utils import safe_urlparse as urlparse
-
         groups: dict[str, list[Finding]] = defaultdict(list)
 
         for finding in findings:
             if finding.category == Category.ENDPOINT:
-                value = finding.extracted_value
-                if value.startswith(("http://", "https://")):
-                    parsed = urlparse(value)
-                    base = f"{parsed.scheme}://{parsed.netloc}"
+                base = canonicalize_origin(finding.extracted_value)
+                if base:
                     groups[base].append(finding)
 
         return groups
@@ -235,9 +462,6 @@ class Correlator:
         file_url: str,
     ) -> None:
         """Add edges for findings in the same file."""
-        # Limit to avoid explosion
-        max_edges = 50
-
         # Sort by severity (highest first) to prioritize important findings
         severity_order = {
             Severity.CRITICAL: 4,
@@ -251,16 +475,16 @@ class Correlator:
             key=lambda f: severity_order.get(f.severity, 0),
             reverse=True,
         )
+        possible_candidates = len(sorted_findings) * (len(sorted_findings) - 1) // 2
+        max_edges = graph.edge_cap(50, possible_candidates=possible_candidates)
 
         count = 0
         for i, f1 in enumerate(sorted_findings):
-            for f2 in sorted_findings[i+1:]:
+            for f2 in sorted_findings[i + 1 :]:
                 if count >= max_edges:
                     return
 
-                graph.add_edge(create_same_file_edge(
-                    f1.id, f2.id, file_url
-                ))
+                graph.add_edge(create_same_file_edge(f1.id, f2.id, file_url))
                 count += 1
 
     def _add_config_edges(
@@ -270,17 +494,16 @@ class Correlator:
         base_url: str,
     ) -> None:
         """Add edges for findings sharing config."""
-        max_edges = 30
+        possible_candidates = len(findings) * (len(findings) - 1) // 2
+        max_edges = graph.edge_cap(30, possible_candidates=possible_candidates)
 
         count = 0
         for i, f1 in enumerate(findings):
-            for f2 in findings[i+1:]:
+            for f2 in findings[i + 1 :]:
                 if count >= max_edges:
                     return
 
-                graph.add_edge(create_config_edge(
-                    f1.id, f2.id, f"baseURL: {base_url}"
-                ))
+                graph.add_edge(create_config_edge(f1.id, f2.id, f"baseURL: {base_url}"))
                 count += 1
 
     def _add_import_edges(
@@ -289,42 +512,34 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add edges for findings connected by imports between files."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
 
-        for file_url, source_findings in by_file.items():
+        def candidates_for(file_url: str, source_findings: list[Finding]) -> Iterator[Edge]:
             imports = self._collect_imports(source_findings)
-            if not imports:
-                continue
-
-            # sorted(): imports is a set; the max_edges cap below makes WHICH edges survive
-            # depend on iteration order, so an unsorted set gave PYTHONHASHSEED-dependent,
-            # run-to-run-different correlation counts -> non-deterministic risk scores/tiers.
             for import_source in sorted(imports):
-                normalized_import = self._normalize_import_source(import_source)
-                if not normalized_import:
-                    continue
-
-                for target_url, target_findings in by_file.items():
-                    if target_url == file_url:
-                        continue
-                    if not self._import_matches(normalized_import, file_aliases[target_url]):
-                        continue
+                target_urls = self._resolve_import_targets(
+                    import_source,
+                    file_url,
+                    file_aliases,
+                )
+                for target_url in target_urls:
+                    target_findings = by_file[target_url]
 
                     for source_finding in source_findings:
                         for target_finding in target_findings:
-                            if count >= max_edges:
-                                return
-                            graph.add_edge(create_import_edge(
+                            yield create_import_edge(
                                 source_finding.id,
                                 target_finding.id,
                                 import_source,
-                            ))
-                            count += 1
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (file_url, candidates_for(file_url, by_file[file_url]))
+                for file_url in sorted(by_file)
+            ),
+        )
 
     def _add_dynamic_import_edges(
         self,
@@ -332,40 +547,34 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add edges for findings connected by dynamic imports between files."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
 
-        for file_url, source_findings in by_file.items():
+        def candidates_for(file_url: str, source_findings: list[Finding]) -> Iterator[Edge]:
             dynamic_imports = self._collect_dynamic_imports(source_findings)
-            if not dynamic_imports:
-                continue
-
-            # sorted(): deterministic edge selection under the max_edges cap (see _add_import_edges).
             for import_source in sorted(dynamic_imports):
-                normalized_import = self._normalize_import_source(import_source)
-                if not normalized_import:
-                    continue
-
-                for target_url, target_findings in by_file.items():
-                    if target_url == file_url:
-                        continue
-                    if not self._import_matches(normalized_import, file_aliases[target_url]):
-                        continue
+                target_urls = self._resolve_import_targets(
+                    import_source,
+                    file_url,
+                    file_aliases,
+                )
+                for target_url in target_urls:
+                    target_findings = by_file[target_url]
 
                     for source_finding in source_findings:
                         for target_finding in target_findings:
-                            if count >= max_edges:
-                                return
-                            graph.add_edge(create_import_edge(
+                            yield create_import_edge(
                                 source_finding.id,
                                 target_finding.id,
                                 f"dynamic:{import_source}",
-                            ))
-                            count += 1
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (file_url, candidates_for(file_url, by_file[file_url]))
+                for file_url in sorted(by_file)
+            ),
+        )
 
     def _add_transitive_import_edges(
         self,
@@ -373,16 +582,18 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add import edges for multi-hop import chains across files."""
-        max_edges = 50
-        count = 0
         dependency_graph = self._build_dependency_graph(by_file)
 
-        for source_url, reachable in dependency_graph.items():
+        def candidates_for(
+            source_url: str,
+            reachable: dict[str, list[list[str]]],
+        ) -> Iterator[Edge]:
             source_findings = by_file.get(source_url, [])
             if not source_findings:
-                continue
+                return
 
-            for target_url, import_chains in reachable.items():
+            for target_url in sorted(reachable):
+                import_chains = reachable[target_url]
                 if target_url == source_url or not import_chains:
                     continue
                 target_findings = by_file.get(target_url, [])
@@ -394,14 +605,19 @@ class Correlator:
                     context = f"transitive:{' -> '.join(import_chain)}"
                     for source_finding in source_findings:
                         for target_finding in target_findings:
-                            if count >= max_edges:
-                                return
-                            graph.add_edge(create_import_edge(
+                            yield create_import_edge(
                                 source_finding.id,
                                 target_finding.id,
                                 context,
-                            ))
-                            count += 1
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, dependency_graph[source_url]))
+                for source_url in sorted(dependency_graph)
+            ),
+        )
 
     def _add_runtime_edges(
         self,
@@ -409,9 +625,6 @@ class Correlator:
         findings: list[Finding],
     ) -> None:
         """Add edges for findings loaded together by runtime context."""
-        max_edges = 50
-        count = 0
-
         groups: dict[str, list[Finding]] = defaultdict(list)
         for finding in findings:
             load_context = (finding.metadata.get("load_context") or "").strip()
@@ -421,19 +634,21 @@ class Correlator:
             if initiator:
                 groups[f"initiator:{initiator}"].append(finding)
 
-        for context, group in groups.items():
+        def candidates_for(context: str, group: list[Finding]) -> Iterator[Edge]:
             for i, f1 in enumerate(group):
-                for f2 in group[i+1:]:
-                    if count >= max_edges:
-                        return
+                for f2 in group[i + 1 :]:
                     if f1.evidence.file_url == f2.evidence.file_url:
                         continue
-                    graph.add_edge(create_runtime_edge(
+                    yield create_runtime_edge(
                         f1.id,
                         f2.id,
                         context,
-                    ))
-                    count += 1
+                    )
+
+        self._emit_fair_edges(
+            graph,
+            ((context, candidates_for(context, groups[context])) for context in sorted(groups)),
+        )
 
     def _add_initiator_chain_edges(
         self,
@@ -441,35 +656,44 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges from initiating JS files to directly or transitively loaded files."""
-        max_edges = 50
-        count = 0
         initiator_map = self._build_initiator_map(by_file)
+        root_inputs: dict[str, list[tuple[Finding, list[str]]]] = defaultdict(list)
 
-        for target_url, target_findings in by_file.items():
+        for target_url in sorted(by_file):
+            target_findings = by_file[target_url]
             ancestor_chains = self._collect_initiator_ancestor_chains(target_url, initiator_map)
             if not ancestor_chains:
                 continue
             for target_finding in target_findings:
                 for ancestor_chain in ancestor_chains:
-                    source_url = ancestor_chain[0]
-                    source_findings = by_file.get(source_url, [])
-                    if not source_findings:
+                    root_inputs[ancestor_chain[0]].append((target_finding, ancestor_chain))
+
+        def candidates_for(
+            source_url: str,
+            inputs: list[tuple[Finding, list[str]]],
+        ) -> Iterator[Edge]:
+            source_findings = by_file.get(source_url, [])
+            for target_finding, ancestor_chain in inputs:
+                if len(ancestor_chain) == 1:
+                    context = f"initiator_chain:{source_url}"
+                else:
+                    context = f"initiator_chain:{' -> '.join(ancestor_chain)}"
+                for source_finding in source_findings:
+                    if source_finding.id == target_finding.id:
                         continue
-                    if len(ancestor_chain) == 1:
-                        context = f"initiator_chain:{source_url}"
-                    else:
-                        context = f"initiator_chain:{' -> '.join(ancestor_chain)}"
-                    for source_finding in source_findings:
-                        if count >= max_edges:
-                            return
-                        if source_finding.id == target_finding.id:
-                            continue
-                        graph.add_edge(create_runtime_edge(
-                            source_finding.id,
-                            target_finding.id,
-                            context,
-                        ))
-                        count += 1
+                    yield create_runtime_edge(
+                        source_finding.id,
+                        target_finding.id,
+                        context,
+                    )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, root_inputs[source_url]))
+                for source_url in sorted(root_inputs)
+            ),
+        )
 
     def _add_execution_chain_edges(
         self,
@@ -477,23 +701,20 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for mixed import/initiator execution paths without requiring load-context metadata."""
-        max_edges = 50
-        count = 0
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
 
-        for source_url, source_findings in by_file.items():
+        def candidates_for(source_url: str, source_findings: list[Finding]) -> Iterator[Edge]:
             if not source_findings:
-                continue
+                return
 
             reachable = self._collect_mixed_runtime_execution_paths(
                 source_url,
                 direct_dependency_edges,
                 initiator_children,
             )
-            for target_url, execution_chains in reachable.items():
+            for target_url in sorted(reachable):
+                execution_chains = reachable[target_url]
                 if target_url == source_url or not execution_chains:
                     continue
                 target_findings = by_file.get(target_url, [])
@@ -504,16 +725,21 @@ class Correlator:
                     context = f"execution_chain:{source_url} -> {' -> '.join(execution_chain)}"
                     for source_finding in source_findings:
                         for target_finding in target_findings:
-                            if count >= max_edges:
-                                return
                             if source_finding.id == target_finding.id:
                                 continue
-                            graph.add_edge(create_runtime_edge(
+                            yield create_runtime_edge(
                                 source_finding.id,
                                 target_finding.id,
                                 context,
-                            ))
-                            count += 1
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, by_file[source_url]))
+                for source_url in sorted(by_file)
+            ),
+        )
 
     def _add_runtime_execution_graph_edges(
         self,
@@ -521,41 +747,45 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add unified runtime edges across practical import/dynamic/initiator execution paths."""
-        max_edges = 50
-        count = 0
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
 
-        for source_url, source_findings in by_file.items():
+        def candidates_for(source_url: str, source_findings: list[Finding]) -> Iterator[Edge]:
             if not source_findings:
-                continue
+                return
             reachable = self._collect_runtime_execution_paths(
                 source_url,
                 direct_dependency_edges,
                 initiator_children,
             )
-            for target_url, execution_chains in reachable.items():
+            for target_url in sorted(reachable):
+                execution_chains = reachable[target_url]
                 if target_url == source_url or not execution_chains:
                     continue
                 target_findings = by_file.get(target_url, [])
                 if not target_findings:
                     continue
                 for execution_chain in execution_chains:
-                    context = f"runtime_execution_graph:{source_url} -> {' -> '.join(execution_chain)}"
+                    context = (
+                        f"runtime_execution_graph:{source_url} -> {' -> '.join(execution_chain)}"
+                    )
                     for source_finding in source_findings:
                         for target_finding in target_findings:
-                            if count >= max_edges:
-                                return
                             if source_finding.id == target_finding.id:
                                 continue
-                            graph.add_edge(create_runtime_edge(
+                            yield create_runtime_edge(
                                 source_finding.id,
                                 target_finding.id,
                                 context,
-                            ))
-                            count += 1
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, by_file[source_url]))
+                for source_url in sorted(by_file)
+            ),
+        )
 
     def _add_load_context_chain_edges(
         self,
@@ -563,39 +793,51 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges from load-context roots through transitive initiator chains."""
-        max_edges = 50
-        count = 0
         initiator_map = self._build_initiator_map(by_file)
         file_load_contexts = self._build_file_load_contexts(by_file)
+        root_inputs: dict[str, list[tuple[Finding, list[str]]]] = defaultdict(list)
 
-        for target_url, target_findings in by_file.items():
+        for target_url in sorted(by_file):
+            target_findings = by_file[target_url]
             ancestor_chains = self._collect_initiator_ancestor_chains(target_url, initiator_map)
             if not ancestor_chains:
                 continue
             for target_finding in target_findings:
                 for ancestor_chain in ancestor_chains:
-                    source_url = ancestor_chain[0]
-                    source_findings = by_file.get(source_url, [])
-                    load_contexts = sorted(file_load_contexts.get(source_url, set()))
-                    if not source_findings or not load_contexts:
+                    root_inputs[ancestor_chain[0]].append((target_finding, ancestor_chain))
+
+        def candidates_for(
+            source_url: str,
+            load_context: str,
+            inputs: list[tuple[Finding, list[str]]],
+        ) -> Iterator[Edge]:
+            source_findings = by_file.get(source_url, [])
+            for target_finding, ancestor_chain in inputs:
+                if len(ancestor_chain) == 1:
+                    base_chain = source_url
+                else:
+                    base_chain = " -> ".join(ancestor_chain)
+                context = f"load_context_chain:{load_context} -> {base_chain}"
+                for source_finding in source_findings:
+                    if source_finding.id == target_finding.id:
                         continue
-                    if len(ancestor_chain) == 1:
-                        base_chain = source_url
-                    else:
-                        base_chain = " -> ".join(ancestor_chain)
-                    for load_context in load_contexts:
-                        context = f"load_context_chain:{load_context} -> {base_chain}"
-                        for source_finding in source_findings:
-                            if count >= max_edges:
-                                return
-                            if source_finding.id == target_finding.id:
-                                continue
-                            graph.add_edge(create_runtime_edge(
-                                source_finding.id,
-                                target_finding.id,
-                                context,
-                            ))
-                            count += 1
+                    yield create_runtime_edge(
+                        source_finding.id,
+                        target_finding.id,
+                        context,
+                    )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (
+                    self._compound_partition_key(source_url, load_context),
+                    candidates_for(source_url, load_context, root_inputs[source_url]),
+                )
+                for source_url in sorted(root_inputs)
+                for load_context in sorted(file_load_contexts.get(source_url, set()))
+            ),
+        )
 
     def _add_initiator_execution_call_chain_edges(
         self,
@@ -603,15 +845,8 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for imported call chains reached through initiator-loaded descendants."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_initiator_descendant_paths(
                 source_url,
@@ -621,22 +856,28 @@ class Correlator:
         }
         scope_target_cache: dict[tuple[str, str], list[tuple[Finding, list[str]]]] = {}
 
-        for source_url, reachable in reachable_by_source.items():
+        def candidates_for(
+            source_url: str,
+            reachable: dict[str, list[list[str]]],
+        ) -> Iterator[Edge]:
             source_findings = by_file.get(source_url, [])
             if not source_findings or not reachable:
-                continue
+                return
 
-            for intermediate_url, path_chains in reachable.items():
+            for intermediate_url in sorted(reachable):
+                path_chains = reachable[intermediate_url]
                 if intermediate_url == source_url or not path_chains:
                     continue
                 intermediate_findings = by_file.get(intermediate_url, [])
                 if not intermediate_findings:
                     continue
 
-                intermediate_scopes = sorted({
-                    (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
-                    for finding in intermediate_findings
-                })
+                intermediate_scopes = sorted(
+                    {
+                        (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
+                        for finding in intermediate_findings
+                    }
+                )
 
                 for intermediate_scope in intermediate_scopes:
                     cache_key = (intermediate_url, intermediate_scope)
@@ -657,16 +898,21 @@ class Correlator:
                                 + " -> ".join([*path_chain, intermediate_scope, *target_chain])
                             )
                             for source_finding in source_findings:
-                                if count >= max_edges:
-                                    return
                                 if source_finding.id == target_finding.id:
                                     continue
-                                graph.add_edge(create_runtime_edge(
+                                yield create_runtime_edge(
                                     source_finding.id,
                                     target_finding.id,
                                     context,
-                                ))
-                                count += 1
+                                )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, reachable_by_source[source_url]))
+                for source_url in sorted(reachable_by_source)
+            ),
+        )
 
     def _add_initiator_execution_scope_call_chain_edges(
         self,
@@ -674,9 +920,7 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for same-file call chains inside initiator-loaded descendants."""
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_initiator_descendant_paths(
                 source_url,
@@ -697,16 +941,18 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges through pure transitive import chains without load-context metadata."""
-        max_edges = 50
-        count = 0
         dependency_graph = self._build_dependency_graph(by_file)
 
-        for source_url, reachable in dependency_graph.items():
+        def candidates_for(
+            source_url: str,
+            reachable: dict[str, list[list[str]]],
+        ) -> Iterator[Edge]:
             source_findings = by_file.get(source_url, [])
             if not source_findings or not reachable:
-                continue
+                return
 
-            for target_url, import_chains in reachable.items():
+            for target_url in sorted(reachable):
+                import_chains = reachable[target_url]
                 if target_url == source_url or not import_chains:
                     continue
                 target_findings = by_file.get(target_url, [])
@@ -719,23 +965,28 @@ class Correlator:
                     context = f"import_chain:{source_url} -> {' -> '.join(import_chain)}"
                     for source_finding in source_findings:
                         for target_finding in target_findings:
-                            if count >= max_edges:
-                                return
                             if source_finding.id == target_finding.id:
                                 continue
-                            graph.add_edge(create_runtime_edge(
+                            yield create_runtime_edge(
                                 source_finding.id,
                                 target_finding.id,
                                 context,
-                            ))
-                            count += 1
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, dependency_graph[source_url]))
+                for source_url in sorted(dependency_graph)
+            ),
+        )
 
     def _add_import_call_chain_edges(
         self,
         graph: CorrelationGraph,
         by_file: dict[str, list[Finding]],
     ) -> None:
-        """Add runtime edges for downstream-module imported call chains on pure import paths.""" 
+        """Add runtime edges for downstream-module imported call chains on pure import paths."""
         dependency_graph = self._build_dependency_graph(by_file)
         self._add_runtime_downstream_call_chain_edges(
             graph,
@@ -764,38 +1015,34 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for downstream-module imported call chains on mixed execution paths without load-context metadata."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         scope_target_cache: dict[tuple[str, str], list[tuple[Finding, list[str]]]] = {}
 
-        for source_url, source_findings in by_file.items():
+        def candidates_for(source_url: str, source_findings: list[Finding]) -> Iterator[Edge]:
             if not source_findings:
-                continue
+                return
 
             reachable = self._collect_mixed_runtime_execution_paths(
                 source_url,
                 direct_dependency_edges,
                 initiator_children,
             )
-            for intermediate_url, path_chains in reachable.items():
+            for intermediate_url in sorted(reachable):
+                path_chains = reachable[intermediate_url]
                 if intermediate_url == source_url or not path_chains:
                     continue
                 intermediate_findings = by_file.get(intermediate_url, [])
                 if not intermediate_findings:
                     continue
 
-                intermediate_scopes = sorted({
-                    (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
-                    for finding in intermediate_findings
-                })
+                intermediate_scopes = sorted(
+                    {
+                        (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
+                        for finding in intermediate_findings
+                    }
+                )
 
                 for intermediate_scope in intermediate_scopes:
                     cache_key = (intermediate_url, intermediate_scope)
@@ -811,21 +1058,25 @@ class Correlator:
                         if target_finding.evidence.file_url == source_url:
                             continue
                         for path_chain in path_chains:
-                            context = (
-                                f"execution_call_chain:{source_url} -> "
-                                + " -> ".join([*path_chain, intermediate_scope, *target_chain])
+                            context = f"execution_call_chain:{source_url} -> " + " -> ".join(
+                                [*path_chain, intermediate_scope, *target_chain]
                             )
                             for source_finding in source_findings:
-                                if count >= max_edges:
-                                    return
                                 if source_finding.id == target_finding.id:
                                     continue
-                                graph.add_edge(create_runtime_edge(
+                                yield create_runtime_edge(
                                     source_finding.id,
                                     target_finding.id,
                                     context,
-                                ))
-                                count += 1
+                                )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, by_file[source_url]))
+                for source_url in sorted(by_file)
+            ),
+        )
 
     def _add_execution_scope_call_chain_edges(
         self,
@@ -834,9 +1085,7 @@ class Correlator:
     ) -> None:
         """Add runtime edges for same-file call chains inside mixed execution-path modules."""
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_mixed_runtime_execution_paths(
                 source_url,
@@ -859,9 +1108,7 @@ class Correlator:
     ) -> None:
         """Add same-file runtime call-graph edges on unified execution paths."""
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_runtime_execution_paths(
                 source_url,
@@ -884,9 +1131,7 @@ class Correlator:
     ) -> None:
         """Add downstream inter-module runtime call-graph edges on unified execution paths."""
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_runtime_execution_paths(
                 source_url,
@@ -908,18 +1153,20 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges from load-context roots through transitive import chains."""
-        max_edges = 50
-        count = 0
         dependency_graph = self._build_dependency_graph(by_file)
         file_load_contexts = self._build_file_load_contexts(by_file)
 
-        for source_url, reachable in dependency_graph.items():
+        def candidates_for(
+            source_url: str,
+            load_context: str,
+            reachable: dict[str, list[list[str]]],
+        ) -> Iterator[Edge]:
             source_findings = by_file.get(source_url, [])
-            load_contexts = sorted(file_load_contexts.get(source_url, set()))
-            if not source_findings or not load_contexts:
-                continue
+            if not source_findings:
+                return
 
-            for target_url, import_chains in reachable.items():
+            for target_url in sorted(reachable):
+                import_chains = reachable[target_url]
                 if target_url == source_url or not import_chains:
                     continue
                 target_findings = by_file.get(target_url, [])
@@ -929,20 +1176,28 @@ class Correlator:
                 for import_chain in import_chains:
                     if not import_chain:
                         continue
-                    for load_context in load_contexts:
-                        context = f"load_context_import_chain:{load_context} -> {' -> '.join(import_chain)}"
-                        for source_finding in source_findings:
-                            for target_finding in target_findings:
-                                if count >= max_edges:
-                                    return
-                                if source_finding.id == target_finding.id:
-                                    continue
-                                graph.add_edge(create_runtime_edge(
-                                    source_finding.id,
-                                    target_finding.id,
-                                    context,
-                                ))
-                                count += 1
+                    context = f"load_context_import_chain:{load_context} -> {' -> '.join(import_chain)}"
+                    for source_finding in source_findings:
+                        for target_finding in target_findings:
+                            if source_finding.id == target_finding.id:
+                                continue
+                            yield create_runtime_edge(
+                                source_finding.id,
+                                target_finding.id,
+                                context,
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (
+                    self._compound_partition_key(source_url, load_context),
+                    candidates_for(source_url, load_context, dependency_graph[source_url]),
+                )
+                for source_url in sorted(dependency_graph)
+                for load_context in sorted(file_load_contexts.get(source_url, set()))
+            ),
+        )
 
     def _add_load_context_execution_chain_edges(
         self,
@@ -950,25 +1205,25 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for mixed import/initiator execution paths from load-context roots."""
-        max_edges = 50
-        count = 0
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         file_load_contexts = self._build_file_load_contexts(by_file)
 
-        for source_url, source_findings in by_file.items():
-            load_contexts = sorted(file_load_contexts.get(source_url, set()))
-            if not source_findings or not load_contexts:
-                continue
+        def candidates_for(
+            source_url: str,
+            load_context: str,
+            source_findings: list[Finding],
+        ) -> Iterator[Edge]:
+            if not source_findings:
+                return
 
             reachable = self._collect_mixed_runtime_execution_paths(
                 source_url,
                 direct_dependency_edges,
                 initiator_children,
             )
-            for target_url, execution_chains in reachable.items():
+            for target_url in sorted(reachable):
+                execution_chains = reachable[target_url]
                 if target_url == source_url or not execution_chains:
                     continue
                 target_findings = by_file.get(target_url, [])
@@ -976,23 +1231,31 @@ class Correlator:
                     continue
 
                 for execution_chain in execution_chains:
-                    for load_context in load_contexts:
-                        context = (
-                            "load_context_execution_chain:"
-                            f"{load_context} -> {' -> '.join(execution_chain)}"
-                        )
-                        for source_finding in source_findings:
-                            for target_finding in target_findings:
-                                if count >= max_edges:
-                                    return
-                                if source_finding.id == target_finding.id:
-                                    continue
-                                graph.add_edge(create_runtime_edge(
-                                    source_finding.id,
-                                    target_finding.id,
-                                    context,
-                                ))
-                                count += 1
+                    context = (
+                        "load_context_execution_chain:"
+                        f"{load_context} -> {' -> '.join(execution_chain)}"
+                    )
+                    for source_finding in source_findings:
+                        for target_finding in target_findings:
+                            if source_finding.id == target_finding.id:
+                                continue
+                            yield create_runtime_edge(
+                                source_finding.id,
+                                target_finding.id,
+                                context,
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (
+                    self._compound_partition_key(source_url, load_context),
+                    candidates_for(source_url, load_context, by_file[source_url]),
+                )
+                for source_url in sorted(by_file)
+                for load_context in sorted(file_load_contexts.get(source_url, set()))
+            ),
+        )
 
     def _add_load_context_runtime_execution_graph_edges(
         self,
@@ -1000,47 +1263,55 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add unified runtime edges from load-context roots across any practical execution path."""
-        max_edges = 50
-        count = 0
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         file_load_contexts = self._build_file_load_contexts(by_file)
 
-        for source_url, source_findings in by_file.items():
-            load_contexts = sorted(file_load_contexts.get(source_url, set()))
-            if not source_findings or not load_contexts:
-                continue
+        def candidates_for(
+            source_url: str,
+            load_context: str,
+            source_findings: list[Finding],
+        ) -> Iterator[Edge]:
+            if not source_findings:
+                return
             reachable = self._collect_runtime_execution_paths(
                 source_url,
                 direct_dependency_edges,
                 initiator_children,
             )
-            for target_url, execution_chains in reachable.items():
+            for target_url in sorted(reachable):
+                execution_chains = reachable[target_url]
                 if target_url == source_url or not execution_chains:
                     continue
                 target_findings = by_file.get(target_url, [])
                 if not target_findings:
                     continue
                 for execution_chain in execution_chains:
-                    for load_context in load_contexts:
-                        context = (
-                            "load_context_runtime_execution_graph:"
-                            f"{load_context} -> {' -> '.join(execution_chain)}"
-                        )
-                        for source_finding in source_findings:
-                            for target_finding in target_findings:
-                                if count >= max_edges:
-                                    return
-                                if source_finding.id == target_finding.id:
-                                    continue
-                                graph.add_edge(create_runtime_edge(
-                                    source_finding.id,
-                                    target_finding.id,
-                                    context,
-                                ))
-                                count += 1
+                    context = (
+                        "load_context_runtime_execution_graph:"
+                        f"{load_context} -> {' -> '.join(execution_chain)}"
+                    )
+                    for source_finding in source_findings:
+                        for target_finding in target_findings:
+                            if source_finding.id == target_finding.id:
+                                continue
+                            yield create_runtime_edge(
+                                source_finding.id,
+                                target_finding.id,
+                                context,
+                            )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (
+                    self._compound_partition_key(source_url, load_context),
+                    candidates_for(source_url, load_context, by_file[source_url]),
+                )
+                for source_url in sorted(by_file)
+                for load_context in sorted(file_load_contexts.get(source_url, set()))
+            ),
+        )
 
     def _add_load_context_import_call_chain_edges(
         self,
@@ -1062,9 +1333,7 @@ class Correlator:
     ) -> None:
         """Add runtime edges for downstream-module imported call chains on mixed execution paths."""
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         execution_paths = {
             source_url: self._collect_mixed_runtime_execution_paths(
                 source_url,
@@ -1087,9 +1356,7 @@ class Correlator:
     ) -> None:
         """Add same-file runtime call-graph edges on unified execution paths from load-context roots."""
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_runtime_execution_paths(
                 source_url,
@@ -1113,9 +1380,7 @@ class Correlator:
     ) -> None:
         """Add downstream inter-module runtime call-graph edges on unified execution paths from load-context roots."""
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_runtime_execution_paths(
                 source_url,
@@ -1137,9 +1402,7 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for downstream imported call chains on pure initiator paths with load context."""
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_initiator_descendant_paths(
                 source_url,
@@ -1176,9 +1439,7 @@ class Correlator:
     ) -> None:
         """Add runtime edges for same-file call chains inside mixed execution-path modules with load context."""
         direct_dependency_edges = self._build_direct_dependency_edges(by_file)
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_mixed_runtime_execution_paths(
                 source_url,
@@ -1201,9 +1462,7 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for same-file call chains inside pure initiator-path modules with load context."""
-        initiator_children = self._build_initiator_children_map(
-            self._build_initiator_map(by_file)
-        )
+        initiator_children = self._build_initiator_children_map(self._build_initiator_map(by_file))
         reachable_by_source = {
             source_url: self._collect_initiator_descendant_paths(
                 source_url,
@@ -1227,32 +1486,33 @@ class Correlator:
         context_prefix: str,
     ) -> None:
         """Add runtime edges for downstream-module imported call chains reached from load-context roots."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
         file_load_contexts = self._build_file_load_contexts(by_file)
         scope_target_cache: dict[tuple[str, str], list[tuple[Finding, list[str]]]] = {}
 
-        for source_url, reachable in reachable_by_source.items():
+        def candidates_for(
+            source_url: str,
+            load_context: str,
+            reachable: dict[str, list[list[str]]],
+        ) -> Iterator[Edge]:
             source_findings = by_file.get(source_url, [])
-            load_contexts = sorted(file_load_contexts.get(source_url, set()))
-            if not source_findings or not load_contexts or not reachable:
-                continue
+            if not source_findings or not reachable:
+                return
 
-            for intermediate_url, path_chains in reachable.items():
+            for intermediate_url in sorted(reachable):
+                path_chains = reachable[intermediate_url]
                 if intermediate_url == source_url or not path_chains:
                     continue
                 intermediate_findings = by_file.get(intermediate_url, [])
                 if not intermediate_findings:
                     continue
 
-                intermediate_scopes = sorted({
-                    (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
-                    for finding in intermediate_findings
-                })
+                intermediate_scopes = sorted(
+                    {
+                        (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
+                        for finding in intermediate_findings
+                    }
+                )
 
                 for intermediate_scope in intermediate_scopes:
                     cache_key = (intermediate_url, intermediate_scope)
@@ -1270,19 +1530,27 @@ class Correlator:
                         for path_chain in path_chains:
                             context_chain = [*path_chain, intermediate_scope, *target_chain]
                             context_suffix = " -> ".join(context_chain)
-                            for load_context in load_contexts:
-                                context = f"{context_prefix}:{load_context} -> {context_suffix}"
-                                for source_finding in source_findings:
-                                    if count >= max_edges:
-                                        return
-                                    if source_finding.id == target_finding.id:
-                                        continue
-                                    graph.add_edge(create_runtime_edge(
-                                        source_finding.id,
-                                        target_finding.id,
-                                        context,
-                                    ))
-                                    count += 1
+                            context = f"{context_prefix}:{load_context} -> {context_suffix}"
+                            for source_finding in source_findings:
+                                if source_finding.id == target_finding.id:
+                                    continue
+                                yield create_runtime_edge(
+                                    source_finding.id,
+                                    target_finding.id,
+                                    context,
+                                )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (
+                    self._compound_partition_key(source_url, load_context),
+                    candidates_for(source_url, load_context, reachable_by_source[source_url]),
+                )
+                for source_url in sorted(reachable_by_source)
+                for load_context in sorted(file_load_contexts.get(source_url, set()))
+            ),
+        )
 
     def _add_runtime_downstream_call_chain_edges(
         self,
@@ -1292,30 +1560,31 @@ class Correlator:
         context_prefix: str,
     ) -> None:
         """Add runtime edges for downstream-module imported call chains without load-context metadata."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
         scope_target_cache: dict[tuple[str, str], list[tuple[Finding, list[str]]]] = {}
 
-        for source_url, reachable in reachable_by_source.items():
+        def candidates_for(
+            source_url: str,
+            reachable: dict[str, list[list[str]]],
+        ) -> Iterator[Edge]:
             source_findings = by_file.get(source_url, [])
             if not source_findings or not reachable:
-                continue
+                return
 
-            for intermediate_url, path_chains in reachable.items():
+            for intermediate_url in sorted(reachable):
+                path_chains = reachable[intermediate_url]
                 if intermediate_url == source_url or not path_chains:
                     continue
                 intermediate_findings = by_file.get(intermediate_url, [])
                 if not intermediate_findings:
                     continue
 
-                intermediate_scopes = sorted({
-                    (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
-                    for finding in intermediate_findings
-                })
+                intermediate_scopes = sorted(
+                    {
+                        (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
+                        for finding in intermediate_findings
+                    }
+                )
 
                 for intermediate_scope in intermediate_scopes:
                     cache_key = (intermediate_url, intermediate_scope)
@@ -1331,19 +1600,26 @@ class Correlator:
                         if target_finding.evidence.file_url == source_url:
                             continue
                         for path_chain in path_chains:
-                            context_suffix = " -> ".join([*path_chain, intermediate_scope, *target_chain])
+                            context_suffix = " -> ".join(
+                                [*path_chain, intermediate_scope, *target_chain]
+                            )
                             context = f"{context_prefix}:{source_url} -> {context_suffix}"
                             for source_finding in source_findings:
-                                if count >= max_edges:
-                                    return
                                 if source_finding.id == target_finding.id:
                                     continue
-                                graph.add_edge(create_runtime_edge(
+                                yield create_runtime_edge(
                                     source_finding.id,
                                     target_finding.id,
                                     context,
-                                ))
-                                count += 1
+                                )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (source_url, candidates_for(source_url, reachable_by_source[source_url]))
+                for source_url in sorted(reachable_by_source)
+            ),
+        )
 
     def _add_runtime_scope_call_chain_edges(
         self,
@@ -1354,31 +1630,35 @@ class Correlator:
         include_load_context: bool = False,
     ) -> None:
         """Add runtime edges for same-file call chains inside runtime-reached modules."""
-        max_edges = 50
-        count = 0
         file_load_contexts = self._build_file_load_contexts(by_file) if include_load_context else {}
         scope_target_cache: dict[tuple[str, str], list[tuple[Finding, list[str]]]] = {}
 
-        for source_url, reachable in reachable_by_source.items():
+        def candidates_for(
+            source_url: str,
+            load_context: str | None,
+            reachable: dict[str, list[list[str]]],
+        ) -> Iterator[Edge]:
             source_findings = by_file.get(source_url, [])
             if not source_findings or not reachable:
-                continue
+                return
 
-            load_contexts = sorted(file_load_contexts.get(source_url, set())) if include_load_context else []
-            if include_load_context and not load_contexts:
-                continue
+            if include_load_context and load_context is None:
+                return
 
-            for intermediate_url, path_chains in reachable.items():
+            for intermediate_url in sorted(reachable):
+                path_chains = reachable[intermediate_url]
                 if intermediate_url == source_url or not path_chains:
                     continue
                 intermediate_findings = by_file.get(intermediate_url, [])
                 if not intermediate_findings:
                     continue
 
-                intermediate_scopes = sorted({
-                    (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
-                    for finding in intermediate_findings
-                })
+                intermediate_scopes = sorted(
+                    {
+                        (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
+                        for finding in intermediate_findings
+                    }
+                )
                 if not intermediate_scopes:
                     continue
 
@@ -1394,24 +1674,42 @@ class Correlator:
                         if target_finding.evidence.file_url == source_url:
                             continue
                         for path_chain in path_chains:
-                            context_suffix = " -> ".join([*path_chain, intermediate_scope, *target_chain])
-                            contexts = (
-                                [f"{context_prefix}:{load_context} -> {context_suffix}" for load_context in load_contexts]
-                                if include_load_context
-                                else [f"{context_prefix}:{source_url} -> {context_suffix}"]
+                            context_suffix = " -> ".join(
+                                [*path_chain, intermediate_scope, *target_chain]
                             )
-                            for context in contexts:
-                                for source_finding in source_findings:
-                                    if count >= max_edges:
-                                        return
-                                    if source_finding.id == target_finding.id:
-                                        continue
-                                    graph.add_edge(create_runtime_edge(
-                                        source_finding.id,
-                                        target_finding.id,
-                                        context,
-                                    ))
-                                    count += 1
+                            context = (
+                                f"{context_prefix}:{load_context} -> {context_suffix}"
+                                if include_load_context
+                                else f"{context_prefix}:{source_url} -> {context_suffix}"
+                            )
+                            for source_finding in source_findings:
+                                if source_finding.id == target_finding.id:
+                                    continue
+                                yield create_runtime_edge(
+                                    source_finding.id,
+                                    target_finding.id,
+                                    context,
+                                )
+
+        partitions = (
+            (
+                self._compound_partition_key(source_url, load_context),
+                candidates_for(source_url, load_context, reachable_by_source[source_url]),
+            )
+            for source_url in sorted(reachable_by_source)
+            for load_context in sorted(file_load_contexts.get(source_url, set()))
+        ) if include_load_context else (
+            (
+                source_url,
+                candidates_for(source_url, None, reachable_by_source[source_url]),
+            )
+            for source_url in sorted(reachable_by_source)
+        )
+
+        self._emit_fair_edges(
+            graph,
+            partitions,
+        )
 
     def _add_call_graph_edges(
         self,
@@ -1419,20 +1717,17 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add edges for findings connected through intra-file function call graphs."""
-        max_edges = 50
-        count = 0
-
-        for file_findings in by_file.values():
+        def candidates_for(file_findings: list[Finding]) -> Iterator[Edge]:
             call_graph = self._collect_call_graph(file_findings)
             if not call_graph:
-                continue
+                return
 
             by_scope: dict[str, list[Finding]] = defaultdict(list)
             for finding in file_findings:
                 scope = (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
                 by_scope[scope].append(finding)
 
-            for source_scope in call_graph:
+            for source_scope in sorted(call_graph):
                 source_findings = by_scope.get(source_scope, [])
                 if not source_findings:
                     continue
@@ -1446,16 +1741,21 @@ class Correlator:
                     for target_chain in target_chains:
                         for source_finding in source_findings:
                             for target_finding in target_findings:
-                                if count >= max_edges:
-                                    return
                                 if source_finding.id == target_finding.id:
                                     continue
-                                graph.add_edge(create_call_chain_edge(
+                                yield create_call_chain_edge(
                                     source_finding.id,
                                     target_finding.id,
                                     [source_scope, *target_chain],
-                                ))
-                                count += 1
+                                )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (file_url, candidates_for(by_file[file_url]))
+                for file_url in sorted(by_file)
+            ),
+        )
 
     def _add_inter_module_call_edges(
         self,
@@ -1463,17 +1763,14 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add call-chain edges for imported symbols actually invoked by scope."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
         scope_target_cache: dict[tuple[str, str], list[tuple[Finding, list[str]]]] = {}
 
-        for file_url, source_findings in by_file.items():
+        def candidates_for(file_url: str, source_findings: list[Finding]) -> Iterator[Edge]:
             for source_finding in source_findings:
-                source_scope = (source_finding.metadata.get("enclosing_scope") or "global").strip() or "global"
+                source_scope = (
+                    source_finding.metadata.get("enclosing_scope") or "global"
+                ).strip() or "global"
                 cache_key = (file_url, source_scope)
                 if cache_key not in scope_target_cache:
                     scope_target_cache[cache_key] = self._resolve_inter_module_call_targets(
@@ -1484,16 +1781,21 @@ class Correlator:
                     )
 
                 for target_finding, target_chain in scope_target_cache[cache_key]:
-                    if count >= max_edges:
-                        return
                     if source_finding.id == target_finding.id:
                         continue
-                    graph.add_edge(create_call_chain_edge(
+                    yield create_call_chain_edge(
                         source_finding.id,
                         target_finding.id,
                         [source_scope, *target_chain],
-                    ))
-                    count += 1
+                    )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (file_url, candidates_for(file_url, by_file[file_url]))
+                for file_url in sorted(by_file)
+            ),
+        )
 
     def _add_load_context_call_chain_edges(
         self,
@@ -1501,22 +1803,22 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for load-context-rooted imported call chains."""
-        max_edges = 50
-        count = 0
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
         file_load_contexts = self._build_file_load_contexts(by_file)
         scope_target_cache: dict[tuple[str, str], list[tuple[Finding, list[str]]]] = {}
 
-        for file_url, source_findings in by_file.items():
-            load_contexts = sorted(file_load_contexts.get(file_url, set()))
-            if not source_findings or not load_contexts:
-                continue
+        def candidates_for(
+            file_url: str,
+            load_context: str,
+            source_findings: list[Finding],
+        ) -> Iterator[Edge]:
+            if not source_findings:
+                return
 
             for source_finding in source_findings:
-                source_scope = (source_finding.metadata.get("enclosing_scope") or "global").strip() or "global"
+                source_scope = (
+                    source_finding.metadata.get("enclosing_scope") or "global"
+                ).strip() or "global"
                 cache_key = (file_url, source_scope)
                 if cache_key not in scope_target_cache:
                     scope_target_cache[cache_key] = self._resolve_inter_module_call_targets(
@@ -1529,16 +1831,24 @@ class Correlator:
                 for target_finding, target_chain in scope_target_cache[cache_key]:
                     if source_finding.id == target_finding.id:
                         continue
-                    for load_context in load_contexts:
-                        if count >= max_edges:
-                            return
-                        graph.add_edge(create_runtime_edge(
-                            source_finding.id,
-                            target_finding.id,
-                            "load_context_call_chain:"
-                            f"{load_context} -> {' -> '.join([source_scope, *target_chain])}",
-                        ))
-                        count += 1
+                    yield create_runtime_edge(
+                        source_finding.id,
+                        target_finding.id,
+                        "load_context_call_chain:"
+                        f"{load_context} -> {' -> '.join([source_scope, *target_chain])}",
+                    )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (
+                    self._compound_partition_key(file_url, load_context),
+                    candidates_for(file_url, load_context, by_file[file_url]),
+                )
+                for file_url in sorted(by_file)
+                for load_context in sorted(file_load_contexts.get(file_url, set()))
+            ),
+        )
 
     def _add_load_context_scope_call_chain_edges(
         self,
@@ -1546,25 +1856,26 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> None:
         """Add runtime edges for same-file transitive call chains inside load-context root files."""
-        max_edges = 50
-        count = 0
         file_load_contexts = self._build_file_load_contexts(by_file)
 
-        for file_url, file_findings in by_file.items():
-            load_contexts = sorted(file_load_contexts.get(file_url, set()))
-            if not file_findings or not load_contexts:
-                continue
+        def candidates_for(
+            file_url: str,
+            load_context: str,
+            file_findings: list[Finding],
+        ) -> Iterator[Edge]:
+            if not file_findings:
+                return
 
             call_graph = self._collect_call_graph(file_findings)
             if not call_graph:
-                continue
+                return
 
             by_scope: dict[str, list[Finding]] = defaultdict(list)
             for finding in file_findings:
                 scope = (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
                 by_scope[scope].append(finding)
 
-            for source_scope in call_graph:
+            for source_scope in sorted(call_graph):
                 source_findings = by_scope.get(source_scope, [])
                 if not source_findings:
                     continue
@@ -1577,20 +1888,30 @@ class Correlator:
 
                     for target_chain in target_chains:
                         chain_context = " -> ".join([source_scope, *target_chain])
-                        for load_context in load_contexts:
-                            context = f"load_context_scope_call_chain:{load_context} -> {chain_context}"
-                            for source_finding in source_findings:
-                                for target_finding in target_findings:
-                                    if count >= max_edges:
-                                        return
-                                    if source_finding.id == target_finding.id:
-                                        continue
-                                    graph.add_edge(create_runtime_edge(
-                                        source_finding.id,
-                                        target_finding.id,
-                                        context,
-                                    ))
-                                    count += 1
+                        context = (
+                            f"load_context_scope_call_chain:{load_context} -> {chain_context}"
+                        )
+                        for source_finding in source_findings:
+                            for target_finding in target_findings:
+                                if source_finding.id == target_finding.id:
+                                    continue
+                                yield create_runtime_edge(
+                                    source_finding.id,
+                                    target_finding.id,
+                                    context,
+                                )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (
+                    self._compound_partition_key(file_url, load_context),
+                    candidates_for(file_url, load_context, by_file[file_url]),
+                )
+                for file_url in sorted(by_file)
+                for load_context in sorted(file_load_contexts.get(file_url, set()))
+            ),
+        )
 
     def _add_secret_endpoint_edges(
         self,
@@ -1598,21 +1919,23 @@ class Correlator:
         findings: list[Finding],
     ) -> None:
         """Add edges between secrets and endpoints in same file."""
-        secrets = [f for f in findings if f.category == Category.SECRET]
-        endpoints = [f for f in findings if f.category == Category.ENDPOINT]
-        max_edges = 50
-        count = 0
+        by_file: dict[str, list[Finding]] = defaultdict(list)
+        for finding in findings:
+            by_file[finding.evidence.file_url].append(finding)
 
-        for secret in secrets:
-            for endpoint in endpoints:
-                if count >= max_edges:
-                    return
-                # Same file
-                if secret.evidence.file_url == endpoint.evidence.file_url:
-                    # Close proximity (within 20 lines); skip unknown lines (0)
-                    if (secret.evidence.line > 0 and endpoint.evidence.line > 0
-                            and abs(secret.evidence.line - endpoint.evidence.line) < 20):
-                        graph.add_edge(Edge(
+        def candidates_for(file_findings: list[Finding]) -> Iterator[Edge]:
+            secrets = [finding for finding in file_findings if finding.category == Category.SECRET]
+            endpoints = [
+                finding for finding in file_findings if finding.category == Category.ENDPOINT
+            ]
+            for secret in secrets:
+                for endpoint in endpoints:
+                    if (
+                        secret.evidence.line > 0
+                        and endpoint.evidence.line > 0
+                        and abs(secret.evidence.line - endpoint.evidence.line) < 20
+                    ):
+                        yield Edge(
                             source_id=secret.id,
                             target_id=endpoint.id,
                             edge_type=EdgeType.CALL_CHAIN,
@@ -1622,14 +1945,46 @@ class Correlator:
                                 "secret_line": secret.evidence.line,
                                 "endpoint_line": endpoint.evidence.line,
                             },
-                        ))
-                        count += 1
+                        )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (file_url, candidates_for(by_file[file_url]))
+                for file_url in sorted(by_file)
+            ),
+        )
 
     # Upload-source and media-sink recognition for the light taint pass.
     _TAINT_UPLOAD_EP_HINTS = ("upload", "file", "attach", "image", "img", "photo", "avatar")
     _TAINT_SINK_ATTRS = frozenset({"src", "href", "srcdoc", "poster", "background", "xlink:href"})
-    _TAINT_SOURCE_HINTS = ("image", "img", "photo", "avatar", "thumb", "file", "upload", "attach",
-                           "path", "url", "src", "result", "response", "res", "data", "content")
+    # DQ-G03: media/upload tokens matched as a SUBSTRING (imageUrl, avatarUrl, fileData).
+    _TAINT_SOURCE_HINTS = ("image", "img", "photo", "avatar", "thumb", "file", "upload", "attach")
+    # DQ-G03: response-OBJECT root tokens for the canonical upload response (response.url / data.url /
+    # res.data). Matched ONLY as the sink expression's FIRST identifier -- NOT a raw substring -- so
+    # `data.url` matches but chartData / metadata / dataset / searchResult do not (those substring
+    # matches were the false-positive class). Generic PROPERTY tokens (url/src/path/content) stay
+    # excluded: they name properties on non-response objects too (config.cdnUrl, router.currentPath).
+    _TAINT_SOURCE_ROOTS = ("response", "data", "result", "res")
+
+    @staticmethod
+    def _sink_source_root(expr: str) -> str:
+        """DQ-G03: the FIRST identifier of a sink expression (already lowercased), skipping a leading
+        `${`/whitespace wrapper -- so `${data.url}` -> 'data' but `${chartData}` -> 'chartdata'. Lets
+        response-object roots be matched as the root, not a substring."""
+        expr = expr.strip()
+        if expr.startswith("${"):
+            expr = expr[2:]
+        i = 0
+        n = len(expr)
+        while i < n and not (
+            expr[i].isalpha() or expr[i] == "_"
+        ):  # NOT '$' -> not an interpolation marker
+            i += 1
+        j = i
+        while j < n and (expr[j].isalnum() or expr[j] in "_$"):
+            j += 1
+        return expr[i:j]
 
     def _add_taint_chain_edges(
         self,
@@ -1642,10 +1997,7 @@ class Correlator:
         `upload -> <img src>` stored/DOM-XSS chain a tester would otherwise assemble by hand.
         Name/context heuristic (not full dataflow) -> MEDIUM confidence. Iterates lists in a
         fixed order, so edge selection under the cap is deterministic."""
-        max_edges = 50
-        count = 0
-
-        for file_url, file_findings in by_file.items():
+        def candidates_for(file_findings: list[Finding]) -> Iterator[Edge]:
             sources = []
             for f in file_findings:
                 if f.category == Category.UPLOAD:
@@ -1655,7 +2007,7 @@ class Correlator:
                     if any(h in v for h in self._TAINT_UPLOAD_EP_HINTS):
                         sources.append(f)
             if not sources:
-                continue
+                return
 
             for sink in file_findings:
                 if sink.category != Category.SINK:
@@ -1666,32 +2018,40 @@ class Correlator:
                 src_expr = str(sink.metadata.get("sink_source", "")).lower()
                 if attr not in self._TAINT_SINK_ATTRS:
                     continue
-                if not any(h in src_expr for h in self._TAINT_SOURCE_HINTS):
+                # media token as a substring, OR a response-object root as the FIRST identifier.
+                if not (
+                    any(h in src_expr for h in self._TAINT_SOURCE_HINTS)
+                    or self._sink_source_root(src_expr) in self._TAINT_SOURCE_ROOTS
+                ):
                     continue
 
-                if count >= max_edges:
-                    return
                 # One representative source per sink (prefer an explicit upload surface over an
                 # upload/file endpoint) so a widget validated in two places is not linked twice.
-                source = next(
-                    (s for s in sources if s.category == Category.UPLOAD), sources[0]
-                )
+                source = next((s for s in sources if s.category == Category.UPLOAD), sources[0])
                 if source.category == Category.UPLOAD:
                     label = f"file-upload surface ({source.extracted_value})"
                 else:
                     label = f"upload/file endpoint {source.extracted_value[:40]}"
-                graph.add_edge(create_taint_edge(
+                yield create_taint_edge(
                     source.id,
                     sink.id,
                     reasoning=(
                         f"Potential upload->stored/DOM-XSS chain: {label} + a dynamic "
                         f"'{sink.metadata.get('sink_attr', '')}' value "
                         f"({sink.metadata.get('sink_source', '')}) reaching a DOM sink in the "
-                        f"same asset -- verify the value is user/upload-controlled and unencoded"),
+                        f"same asset -- verify the value is user/upload-controlled and unencoded"
+                    ),
                     sink_source=str(sink.metadata.get("sink_source", "")),
                     sink_attr=str(sink.metadata.get("sink_attr", "")),
-                ))
-                count += 1
+                )
+
+        self._emit_fair_edges(
+            graph,
+            (
+                (file_url, candidates_for(by_file[file_url]))
+                for file_url in sorted(by_file)
+            ),
+        )
 
     def _collect_imports(self, findings: list[Finding]) -> set[str]:
         """Collect unique import sources from finding metadata."""
@@ -1724,10 +2084,7 @@ class Correlator:
                 for target in targets or []:
                     if isinstance(target, str) and target:
                         merged[source_scope].add(target)
-        return {
-            scope: sorted(targets)
-            for scope, targets in merged.items()
-        }
+        return {scope: sorted(targets) for scope, targets in merged.items()}
 
     def _collect_import_bindings(self, findings: list[Finding]) -> list[dict[str, object]]:
         """Collect structured import bindings from finding metadata."""
@@ -1765,17 +2122,19 @@ class Correlator:
                 if not source or not local or key in seen:
                     continue
                 seen.add(key)
-                bindings.append({
-                    "source": source,
-                    "local": local,
-                    "imported": imported,
-                    "kind": kind,
-                    "scope": scope,
-                    "is_dynamic": is_dynamic,
-                    "is_reexport": is_reexport,
-                    "is_reexport_all": is_reexport_all,
-                    "is_commonjs_reexport": is_commonjs_reexport,
-                })
+                bindings.append(
+                    {
+                        "source": source,
+                        "local": local,
+                        "imported": imported,
+                        "kind": kind,
+                        "scope": scope,
+                        "is_dynamic": is_dynamic,
+                        "is_reexport": is_reexport,
+                        "is_reexport_all": is_reexport_all,
+                        "is_commonjs_reexport": is_commonjs_reexport,
+                    }
+                )
         return bindings
 
     def _collect_scoped_calls(self, findings: list[Finding]) -> dict[str, list[str]]:
@@ -1791,10 +2150,7 @@ class Correlator:
                 for call_name in calls or []:
                     if isinstance(call_name, str) and call_name:
                         merged[scope].add(call_name)
-        return {
-            scope: sorted(call_names)
-            for scope, call_names in merged.items()
-        }
+        return {scope: sorted(call_names) for scope, call_names in merged.items()}
 
     def _collect_export_scopes(self, findings: list[Finding]) -> dict[str, list[str]]:
         """Collect exported-symbol entry scopes from finding metadata."""
@@ -1809,10 +2165,7 @@ class Correlator:
                 for scope in scopes or []:
                     if isinstance(scope, str) and scope:
                         merged[export_name].add(scope)
-        return {
-            export_name: sorted(scopes)
-            for export_name, scopes in merged.items()
-        }
+        return {export_name: sorted(scopes) for export_name, scopes in merged.items()}
 
     def _collect_default_object_exports(self, findings: list[Finding]) -> set[str]:
         """Collect callable members exposed through a module's default object export."""
@@ -1852,8 +2205,7 @@ class Correlator:
                 if not isinstance(scope, str):
                     continue
                 normalized_parents = [
-                    parent for parent in (parents or [])
-                    if isinstance(parent, str) and parent
+                    parent for parent in (parents or []) if isinstance(parent, str) and parent
                 ]
                 if not normalized_parents:
                     continue
@@ -1884,19 +2236,23 @@ class Correlator:
         scope_calls: list[str],
     ) -> tuple[str, str, bool]:
         """Resolve which exported symbol a scope invokes and how it was accessed."""
-        local = binding.get("local", "")
-        kind = binding.get("kind", "")
+        local = str(binding.get("local") or "")
+        kind = str(binding.get("kind") or "")
         if not local:
             return "", "", False
 
         for call_name in scope_calls:
             if call_name == local:
-                imported = binding.get("imported", "")
+                imported = str(binding.get("imported") or "")
                 if imported and imported not in {"*", "default"}:
                     return imported, imported, False
-                return local if kind != "default" else "default", self._requested_export_name_for_binding(binding), False
+                return (
+                    local if kind != "default" else "default",
+                    self._requested_export_name_for_binding(binding),
+                    False,
+                )
             if call_name.startswith(f"{local}."):
-                member_name = call_name[len(local) + 1:].split(".", 1)[0]
+                member_name = call_name[len(local) + 1 :].split(".", 1)[0]
                 if member_name:
                     return member_name, self._requested_export_name_for_binding(binding), True
 
@@ -2041,9 +2397,11 @@ class Correlator:
                         scope_parents,
                     ):
                         continue
-                    target_symbol, target_export, target_member_access = self._resolve_imported_call_symbol(
-                        binding,
-                        scope_calls,
+                    target_symbol, target_export, target_member_access = (
+                        self._resolve_imported_call_symbol(
+                            binding,
+                            scope_calls,
+                        )
                     )
                     if not target_symbol and requested_symbol:
                         target_symbol = self._resolve_reexported_symbol(
@@ -2079,28 +2437,29 @@ class Correlator:
                     ):
                         continue
 
-                    import_source = binding.get("source", "")
-                    import_aliases = self._normalize_import_source(import_source)
-                    if not import_aliases:
-                        continue
-
+                    import_source = str(binding.get("source") or "")
                     import_prefix = "dynamic:" if binding.get("is_dynamic") else ""
 
-                    for target_url, target_findings in by_file.items():
-                        if target_url == file_url:
-                            continue
-                        if not self._import_matches(import_aliases, file_aliases[target_url]):
-                            continue
+                    target_urls = self._resolve_import_targets(
+                        import_source,
+                        file_url,
+                        file_aliases,
+                    )
+                    for target_url in target_urls:
+                        target_findings = by_file[target_url]
                         effective_target_symbol = target_symbol
                         if (
                             not effective_target_symbol
                             and can_forward_default_object_member
-                            and requested_symbol in self._collect_default_object_exports(target_findings)
+                            and requested_symbol
+                            in self._collect_default_object_exports(target_findings)
                         ):
                             effective_target_symbol = requested_symbol
                         if not effective_target_symbol and can_forward_named_object_member:
                             imported_symbol = str(binding.get("imported") or "").strip()
-                            if requested_symbol in self._collect_named_object_exports(target_findings).get(imported_symbol, set()):
+                            if requested_symbol in self._collect_named_object_exports(
+                                target_findings
+                            ).get(imported_symbol, set()):
                                 effective_target_symbol = requested_symbol
                         if not effective_target_symbol:
                             continue
@@ -2119,7 +2478,9 @@ class Correlator:
                             effective_target_symbol,
                         )
                         for target_finding, target_chain in matched_targets:
-                            effective_import_step = f"{import_prefix}{import_source}:{effective_target_symbol}"
+                            effective_import_step = (
+                                f"{import_prefix}{import_source}:{effective_target_symbol}"
+                            )
                             chain = [*scope_prefix, effective_import_step, *target_chain]
                             self._store_shortest_target_chain(
                                 resolved,
@@ -2143,7 +2504,9 @@ class Correlator:
                                 requested_member_access=next_requested_member_access,
                             )
                             for target_finding, downstream_chain in downstream_targets:
-                                effective_import_step = f"{import_prefix}{import_source}:{effective_target_symbol}"
+                                effective_import_step = (
+                                    f"{import_prefix}{import_source}:{effective_target_symbol}"
+                                )
                                 chain = [*scope_prefix, effective_import_step, *downstream_chain]
                                 self._store_shortest_target_chain(
                                     resolved,
@@ -2166,10 +2529,9 @@ class Correlator:
             return True
         if normalized in {current_scope, entry_scope}:
             return True
-        return (
-            normalized in scope_parents.get(current_scope, [])
-            or normalized in scope_parents.get(entry_scope, [])
-        )
+        return normalized in scope_parents.get(
+            current_scope, []
+        ) or normalized in scope_parents.get(entry_scope, [])
 
     def _store_shortest_target_chain(
         self,
@@ -2192,21 +2554,22 @@ class Correlator:
 
     def _store_shortest_path_group(
         self,
-        resolved: dict[str, list[list[str]]],
-        key: str,
+        resolved: dict[_T, list[list[str]]],
+        key: _T,
         chain: list[str],
         max_chains: int = 3,
-    ) -> None:
-        """Keep a small set of distinct shortest paths for a string key."""
+    ) -> bool:
+        """Keep a bounded set of shortest paths and report whether `chain` survived."""
         existing = resolved.get(key)
         if existing is None:
             resolved[key] = [chain]
-            return
+            return True
         if chain in existing:
-            return
+            return False
         existing.append(chain)
         existing.sort(key=len)
         del existing[max_chains:]
+        return chain in existing
 
     def _flatten_resolved_target_chains(
         self,
@@ -2298,7 +2661,8 @@ class Correlator:
         for finding in findings:
             scope = (finding.metadata.get("enclosing_scope") or "global").strip() or "global"
             exports = {
-                export_name for export_name in finding.metadata.get("exports", [])
+                export_name
+                for export_name in finding.metadata.get("exports", [])
                 if isinstance(export_name, str) and export_name
             }
             for entry_scope in entry_scopes:
@@ -2403,7 +2767,9 @@ class Correlator:
         """Collect direct and transitive initiator chains for a target file."""
         return self._cache_result(
             ("initiator_ancestor_chains", file_url, id(initiator_map), max_depth),
-            lambda: self._collect_initiator_ancestor_chains_uncached(file_url, initiator_map, max_depth),
+            lambda: self._collect_initiator_ancestor_chains_uncached(
+                file_url, initiator_map, max_depth
+            ),
         )
 
     def _collect_initiator_ancestor_chains_uncached(
@@ -2464,18 +2830,23 @@ class Correlator:
     ) -> dict[str, list[list[str]]]:
         """Collect direct and transitive initiator-descendant paths from a root file."""
         paths: dict[str, list[list[str]]] = {}
-        queue: list[tuple[str, list[str], set[str], int]] = [(source_url, [], {source_url}, 0)]
+        queue: deque[tuple[str, list[str], set[str], int]] = deque(
+            [(source_url, [], {source_url}, 0)]
+        )
 
         while queue:
-            current_url, current_path, visited, depth = queue.pop(0)
+            current_url, current_path, visited, depth = queue.popleft()
             if depth >= max_depth:
                 continue
             for child_url in sorted(initiator_children.get(current_url, set())):
                 if child_url in visited:
                     continue
                 next_path = [*current_path, f"initiator:{child_url}"]
-                self._store_shortest_path_group(paths, child_url, next_path, max_chains=max_paths_per_target)
-                queue.append((child_url, next_path, {child_url, *visited}, depth + 1))
+                retained = self._store_shortest_path_group(
+                    paths, child_url, next_path, max_chains=max_paths_per_target
+                )
+                if retained:
+                    queue.append((child_url, next_path, {child_url, *visited}, depth + 1))
 
         return paths
 
@@ -2504,10 +2875,10 @@ class Correlator:
             return {}
 
         paths: dict[str, list[list[str]]] = {entry_scope: [[]]}
-        queue: list[tuple[str, list[str], int]] = [(entry_scope, [], 0)]
+        queue: deque[tuple[str, list[str], int]] = deque([(entry_scope, [], 0)])
 
         while queue:
-            current_scope, current_path, depth = queue.pop(0)
+            current_scope, current_path, depth = queue.popleft()
             if depth >= max_depth:
                 continue
             for target_scope in call_graph.get(current_scope, []):
@@ -2517,8 +2888,8 @@ class Correlator:
                     continue
                 if any(len(path) < len(next_path) for path in existing):
                     continue
-                self._store_shortest_path_group(paths, target_scope, next_path)
-                queue.append((target_scope, next_path, depth + 1))
+                if self._store_shortest_path_group(paths, target_scope, next_path):
+                    queue.append((target_scope, next_path, depth + 1))
 
         paths.pop(entry_scope, None)
         return paths
@@ -2545,6 +2916,9 @@ class Correlator:
         }
         if path.stem == "index" and path.parent.name:
             aliases.add(path.parent.name.lower())
+            # DQ-G01: expose the full parent-directory path so an implicit directory-index import
+            # ("./x/y" -> "/x/y/index.js") matches the directory, not just its last segment.
+            aliases.add(str(path.parent).lower())
         if path.suffix:
             aliases.add(str(path.with_suffix("")).lower())
         return {alias for alias in aliases if alias}
@@ -2553,7 +2927,27 @@ class Correlator:
         """Normalize an import source into comparable aliases."""
         value = import_source.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
         path = PurePosixPath(value)
+        parts = [p for p in path.parts if p not in (".", "..", "/")]
 
+        if len(parts) > 1:
+            # DQ-G01: a MULTI-segment specifier ("./admin/api") must be matched against the target's
+            # PATH TAIL, never its bare basename -- otherwise it links any file whose basename is
+            # 'api' (e.g. public/api.js). Emit the relative tail plus its trailing sub-suffixes of
+            # length >= 2 (so a path-alias rewrite like "@/components/Button" still matches
+            # "src/components/Button.js" via "components/button"), the ext-stripped variant, and the
+            # index->dir variant. Deliberately NO length-1 basename alias (that is the FP being fixed).
+            last = PurePosixPath(parts[-1])
+            noext = parts[:-1] + [last.stem] if last.suffix else list(parts)
+            aliases = {"/".join(parts).lower(), "/".join(noext).lower()}
+            for k in range(2, len(noext)):
+                aliases.add("/".join(noext[-k:]).lower())
+            if last.stem == "index" and len(noext) >= 2:
+                aliases.add("/".join(noext[:-1]).lower())
+                for k in range(2, len(noext) - 1):
+                    aliases.add("/".join(noext[:-1][-k:]).lower())
+            return {alias for alias in aliases if alias}
+
+        # single-segment specifier ("./api", "api", "react") -- unchanged
         aliases = {
             value.lower(),
             path.name.lower(),
@@ -2565,15 +2959,164 @@ class Correlator:
             aliases.add(str(path.with_suffix("")).lower())
         return {alias for alias in aliases if alias}
 
+    def _resolve_import_targets(
+        self,
+        import_source: str,
+        importer_url: str,
+        file_aliases: dict[str, set[str]],
+    ) -> list[str]:
+        """Cached import target resolution for one importer/source/file-set tuple."""
+        return self._cache_result(
+            (
+                "import_targets",
+                import_source,
+                importer_url,
+                tuple(sorted(file_aliases)),
+            ),
+            lambda: self._resolve_import_targets_uncached(
+                import_source,
+                importer_url,
+                file_aliases,
+            ),
+        )
+
+    def _resolve_import_targets_uncached(
+        self,
+        import_source: str,
+        importer_url: str,
+        file_aliases: dict[str, set[str]],
+    ) -> list[str]:
+        """Resolve one import without turning an ambiguous basename into confirmed edges.
+
+        Relative and root-relative sources first use the importer's directory and normal
+        file/extension/index precedence. Alias matching remains a fallback for package aliases and
+        rewritten paths, but it must identify exactly one target.
+        """
+        from bundleInspector.core.url_utils import safe_urlparse as urlparse
+
+        value = import_source.split("?", 1)[0].split("#", 1)[0].replace("\\", "/")
+        is_path_relative = value.startswith(("./", "../", "/"))
+        if is_path_relative:
+            importer = urlparse(importer_url)
+            importer_path = importer.path or importer_url
+            if value.startswith("/"):
+                resolved_path = posixpath.normpath(value)
+            else:
+                resolved_path = posixpath.normpath(
+                    posixpath.join(posixpath.dirname(importer_path), value)
+                )
+            resolved_path = "/" + resolved_path.lstrip("/")
+            ranked: dict[int, list[str]] = defaultdict(list)
+            requested_has_suffix = bool(posixpath.splitext(resolved_path)[1])
+            for target_url in sorted(file_aliases):
+                if target_url == importer_url:
+                    continue
+                (
+                    target_scheme,
+                    target_netloc,
+                    target_path,
+                    target_without_suffix,
+                    target_parent,
+                    target_is_index,
+                ) = self._import_target_record(target_url)
+                if (importer.scheme, importer.netloc) != (target_scheme, target_netloc):
+                    continue
+                rank: int | None = None
+                if target_path.lower() == resolved_path.lower():
+                    rank = 0
+                elif (
+                    not requested_has_suffix
+                    and target_without_suffix != target_path
+                    and target_without_suffix.lower() == resolved_path.lower()
+                ):
+                    rank = 1
+                elif (
+                    not requested_has_suffix
+                    and target_is_index
+                    and target_parent.lower() == resolved_path.lower()
+                ):
+                    rank = 2
+                if rank is not None:
+                    ranked[rank].append(target_url)
+
+            if ranked:
+                best_targets = sorted(ranked[min(ranked)])
+                if len(best_targets) == 1:
+                    return best_targets
+                self._record_ambiguous_import(importer_url, import_source, best_targets)
+                return []
+
+        normalized_import = self._normalize_import_source(import_source)
+        if not normalized_import:
+            return []
+        matched = sorted(
+            target_url
+            for target_url, target_aliases in file_aliases.items()
+            if target_url != importer_url
+            and self._import_matches(normalized_import, target_aliases)
+        )
+        if len(matched) == 1:
+            return matched
+        if len(matched) > 1:
+            self._record_ambiguous_import(importer_url, import_source, matched)
+        return []
+
+    def _import_target_record(self, target_url: str) -> tuple[str, str, str, str, str, bool]:
+        """Cache normalized target URL/path fields used by relative import resolution."""
+        from bundleInspector.core.url_utils import safe_urlparse as urlparse
+
+        def build() -> tuple[str, str, str, str, str, bool]:
+            target = urlparse(target_url)
+            target_path = "/" + posixpath.normpath(target.path or target_url).lstrip("/")
+            target_without_suffix = posixpath.splitext(target_path)[0]
+            target_name = posixpath.basename(target_without_suffix).lower()
+            return (
+                target.scheme,
+                target.netloc,
+                target_path,
+                target_without_suffix,
+                posixpath.dirname(target_path),
+                target_name == "index",
+            )
+
+        return self._cache_result(("import_target_record", target_url), build)
+
+    def _record_ambiguous_import(
+        self,
+        importer_url: str,
+        import_source: str,
+        targets: list[str],
+    ) -> None:
+        """Store one deterministic unresolved-import diagnostic for graph telemetry."""
+        self._ambiguous_import_resolutions.add(
+            (importer_url, import_source, tuple(sorted(targets)))
+        )
+
     def _import_matches(self, import_aliases: set[str], target_aliases: set[str]) -> bool:
         """Check whether an import source likely refers to a target file."""
         for import_alias in import_aliases:
+            import_multi = "/" in import_alias
             for target_alias in target_aliases:
                 if import_alias == target_alias:
                     return True
-                if target_alias.endswith(import_alias) or import_alias.endswith(target_alias):
+                # The target PATH ends with the import alias on a '/' boundary (import "./api" ->
+                # file "api.js", "./admin/api" -> ".../admin/api.js").
+                if self._alias_path_suffix(target_alias, import_alias):
+                    return True
+                # Reverse (import alias ends with the target's short alias) ONLY for a SINGLE-segment
+                # import: a multi-segment import tail must be a genuine path suffix of the target and
+                # must NOT be satisfied by the target's bare basename (DQ-G01: 'admin/api' ends with
+                # '/api', but that must not link 'public/api.js'). A raw endswith is boundary-gated so
+                # "./auth" still does not link "oauth.js".
+                if not import_multi and self._alias_path_suffix(import_alias, target_alias):
                     return True
         return False
+
+    @staticmethod
+    def _alias_path_suffix(alias: str, suffix: str) -> bool:
+        """True when `suffix` is a strict path-segment suffix of `alias` (the character before the
+        match is a '/'), so 'oauth' does NOT match 'auth' but '/src/api' matches 'api'."""
+        return len(suffix) < len(alias) and ("/" + alias).endswith("/" + suffix)
 
     def _build_dependency_graph(
         self,
@@ -2599,30 +3142,40 @@ class Correlator:
         reachable: dict[str, dict[str, list[list[str]]]] = {}
         for source_url in by_file:
             source_reachable: dict[str, list[list[str]]] = {}
-            queue: list[tuple[str, list[str], int]] = [
-                (target_url, [label], 1)
+            queue: deque[tuple[str, list[str], int, set[str]]] = deque(
+                (
+                    target_url,
+                    [label],
+                    1,
+                    {source_url, target_url},
+                )
                 for target_url, label in direct_edges.get(source_url, [])
-            ]
+            )
             while queue:
-                current_url, chain, depth = queue.pop(0)
+                current_url, chain, depth, visited = queue.popleft()
                 if depth > max_depth:
                     continue
-                existing = source_reachable.setdefault(current_url, [])
-                if chain not in existing:
-                    existing.append(chain)
-                    existing.sort(key=len)
-                    del existing[max_paths_per_target:]
+                retained = self._store_shortest_path_group(
+                    source_reachable,
+                    current_url,
+                    chain,
+                    max_chains=max_paths_per_target,
+                )
+                if not retained:
+                    continue
                 if depth == max_depth:
                     continue
                 for next_url, label in direct_edges.get(current_url, []):
-                    if next_url == source_url:
+                    if next_url in visited:
                         continue
-                    if next_url in {
-                        step_target
-                        for step_target, _ in self._chain_targets(source_url, chain, direct_edges)
-                    }:
-                        continue
-                    queue.append((next_url, [*chain, label], depth + 1))
+                    queue.append(
+                        (
+                            next_url,
+                            [*chain, label],
+                            depth + 1,
+                            {next_url, *visited},
+                        )
+                    )
             reachable[source_url] = source_reachable
 
         return reachable
@@ -2642,16 +3195,12 @@ class Correlator:
         by_file: dict[str, list[Finding]],
     ) -> dict[str, list[tuple[str, str]]]:
         """Build direct dependency edges between files from import and binding metadata."""
-        file_aliases = {
-            file_url: self._build_file_aliases(file_url)
-            for file_url in by_file
-        }
+        file_aliases = {file_url: self._build_file_aliases(file_url) for file_url in by_file}
         direct_edges: dict[str, list[tuple[str, str]]] = defaultdict(list)
 
         for file_url, source_findings in by_file.items():
             imports = {
-                (import_source, False)
-                for import_source in self._collect_imports(source_findings)
+                (import_source, False) for import_source in self._collect_imports(source_findings)
             }
             imports.update(
                 (import_source, True)
@@ -2664,16 +3213,18 @@ class Correlator:
                 imports.add((import_source, bool(binding.get("is_dynamic"))))
 
             for import_source, is_dynamic in sorted(imports):
-                normalized_import = self._normalize_import_source(import_source)
-                if not normalized_import:
-                    continue
-                for target_url, target_aliases in file_aliases.items():
-                    if target_url == file_url:
-                        continue
-                    if self._import_matches(normalized_import, target_aliases):
-                        direct_edges[file_url].append(
-                            (target_url, f"dynamic:{import_source}" if is_dynamic else import_source)
+                target_urls = self._resolve_import_targets(
+                    import_source,
+                    file_url,
+                    file_aliases,
+                )
+                for target_url in target_urls:
+                    direct_edges[file_url].append(
+                        (
+                            target_url,
+                            f"dynamic:{import_source}" if is_dynamic else import_source,
                         )
+                    )
 
         return direct_edges
 
@@ -2714,12 +3265,15 @@ class Correlator:
     ) -> dict[str, list[list[str]]]:
         """Collect mixed import/initiator execution paths that start from one root file."""
         resolved: dict[str, list[list[str]]] = {}
-        queue: list[tuple[str, list[str], bool, bool, set[str], int]] = [
-            (source_url, [], False, False, {source_url}, 0)
-        ]
+        queued_paths: dict[tuple[str, bool, bool], list[list[str]]] = {
+            (source_url, False, False): [[]]
+        }
+        queue: deque[tuple[str, list[str], bool, bool, set[str], int]] = deque(
+            [(source_url, [], False, False, {source_url}, 0)]
+        )
 
         while queue:
-            current_url, chain, saw_import, saw_initiator, visited, depth = queue.pop(0)
+            current_url, chain, saw_import, saw_initiator, visited, depth = queue.popleft()
             if depth >= max_depth:
                 continue
 
@@ -2739,11 +3293,20 @@ class Correlator:
                 next_saw_import = saw_import or is_import
                 next_saw_initiator = saw_initiator or is_initiator
                 if next_saw_import and next_saw_initiator:
-                    existing = resolved.setdefault(next_url, [])
-                    if next_chain not in existing:
-                        existing.append(next_chain)
-                        existing.sort(key=len)
-                        del existing[max_paths_per_target:]
+                    self._store_shortest_path_group(
+                        resolved,
+                        next_url,
+                        next_chain,
+                        max_chains=max_paths_per_target,
+                    )
+                state_key = (next_url, next_saw_import, next_saw_initiator)
+                if not self._store_shortest_path_group(
+                    queued_paths,
+                    state_key,
+                    next_chain,
+                    max_chains=max_paths_per_target,
+                ):
+                    continue
                 queue.append(
                     (
                         next_url,
@@ -2794,12 +3357,12 @@ class Correlator:
     ) -> dict[str, list[list[str]]]:
         """Collect transitive runtime execution paths across any practical import/dynamic/initiator mix."""
         resolved: dict[str, list[list[str]]] = {}
-        queue: list[tuple[str, list[str], set[str], int]] = [
-            (source_url, [], {source_url}, 0)
-        ]
+        queue: deque[tuple[str, list[str], set[str], int]] = deque(
+            [(source_url, [], {source_url}, 0)]
+        )
 
         while queue:
-            current_url, chain, visited, depth = queue.pop(0)
+            current_url, chain, visited, depth = queue.popleft()
             if depth >= max_depth:
                 continue
 
@@ -2816,12 +3379,14 @@ class Correlator:
                 if next_url in visited:
                     continue
                 next_chain = [*chain, step_label]
-                self._store_shortest_path_group(
+                retained = self._store_shortest_path_group(
                     resolved,
                     next_url,
                     next_chain,
                     max_chains=max_paths_per_target,
                 )
+                if not retained:
+                    continue
                 queue.append(
                     (
                         next_url,
@@ -2856,4 +3421,3 @@ class Correlator:
             visited.append(next_match)
             current_url = next_match[0]
         return visited
-

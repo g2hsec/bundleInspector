@@ -4,33 +4,46 @@ Base reporter class.
 
 from __future__ import annotations
 
+import hashlib
 from abc import ABC, abstractmethod
 from pathlib import Path
-from typing import Optional
 
-from bundleInspector.storage.models import Category, Report
+from bundleInspector.storage.atomic import atomic_publish_text
+from bundleInspector.storage.identifiers import is_portable_component
+from bundleInspector.storage.models import Report
 
 
 def mask_secret_findings(report: Report, visible_chars: int = 4) -> None:
-    """Redact raw secret values from SECRET findings IN PLACE so NO report format leaks the
-    secret in clear text: masks extracted_value, the evidence snippet (the source line that
-    literally contains the secret), and snippet-bearing metadata. Idempotent."""
-    for finding in report.findings:
-        if finding.category != Category.SECRET:
-            continue
-        raw = finding.extracted_value
-        if not raw:
-            continue
-        masked = finding.masked_value or finding.mask_value(visible_chars)
-        finding.extracted_value = masked
-        finding.masked_value = masked
-        if finding.evidence is not None and finding.evidence.snippet:
-            finding.evidence.snippet = finding.evidence.snippet.replace(raw, masked)
-        # Sweep the whole metadata tree: the raw secret can hide in matched_text, original_snippet,
-        # normalized_evidence.snippet, extracted_fields.*, etc. -- redact every string so no report
-        # format (incl. the HTML report's embedded JSON) can leak it. Per-field handling missed
-        # matched_text.
-        _redact_raw_in_tree(finding.metadata, raw, masked)
+    """Redact raw secret values from the WHOLE report IN PLACE so NO report format leaks a secret in
+    clear text. Two passes: (1) mask each SECRET finding's own value and collect (raw -> masked);
+    (2) sweep EVERY finding of ANY category -- extracted_value, evidence snippet, and metadata tree.
+    A secret literally appears in a co-located NON-secret finding's snippet (e.g. an ENDPOINT
+    `fetch(...Authorization: Bearer <secret>...)`), which a per-SECRET-only pass would leak.
+    Idempotent."""
+    from bundleInspector.reporter.redaction import sanitize_report_copy
+
+    sanitized = sanitize_report_copy(
+        report,
+        visible_chars=visible_chars,
+        include_raw_assets=True,
+        honor_existing_mask=False,
+    )
+    # Preserve references to existing findings/assets for callers that hold them while still
+    # replacing every report-level field with its sanitized value.
+    for current_finding, replacement_finding in zip(
+        report.findings,
+        sanitized.findings,
+        strict=True,
+    ):
+        for field_name in type(current_finding).model_fields:
+            setattr(current_finding, field_name, getattr(replacement_finding, field_name))
+    sanitized.findings = report.findings
+    for current_asset, replacement_asset in zip(report.assets, sanitized.assets, strict=True):
+        for field_name in type(current_asset).model_fields:
+            setattr(current_asset, field_name, getattr(replacement_asset, field_name))
+    sanitized.assets = report.assets
+    for field_name in Report.model_fields:
+        setattr(report, field_name, getattr(sanitized, field_name))
 
 
 def _redact_raw_in_tree(obj: object, raw: str, masked: str) -> None:
@@ -74,7 +87,7 @@ class BaseReporter(ABC):
     async def write(
         self,
         report: Report,
-        output_path: Optional[Path] = None,
+        output_path: Path | None = None,
     ) -> Path:
         """
         Write report to file.
@@ -89,10 +102,14 @@ class BaseReporter(ABC):
         content = self.generate(report)
 
         if output_path is None:
-            output_path = Path(f"bundleInspector_report_{report.id[:8]}{self.extension}")
+            if is_portable_component(report.id):
+                filename_token = report.id
+            else:
+                filename_token = hashlib.sha256(
+                    report.id.encode("utf-8", "surrogatepass")
+                ).hexdigest()
+            output_path = Path(f"bundleInspector_report_{filename_token}{self.extension}")
 
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(content, encoding="utf-8")
+        atomic_publish_text(output_path, content)
 
         return output_path
-

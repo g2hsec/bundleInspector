@@ -1,88 +1,75 @@
-run:
-  profile: deep
-  output_dir: artifacts/runs
-  max_depth: 4
-  concurrency:
-    fetch: 20
-    parse: 8
-  timeouts:
-    request_sec: 20
-    headless_nav_sec: 30
-  retries:
-    fetch: 2
-  user_agent: "jsintel/1.0"
+# BundleInspector reference configuration.
+# This mirrors the real Config schema (bundleInspector.config.Config) so it loads without error via
+# `Config.from_file(...)`. Unknown or legacy fields are rejected by the strict schema.
 
 scope:
-  allow_domains:
+  allowed_domains:
     - "example.com"
     - "*.example.com"
-  deny_domains:
+  denied_domains:
     - "analytics.example"
-  allow_paths_prefix:
+  include_subdomains: true
+  allowed_paths:
     - "/"
-  deny_paths_regex:
-    - ".*\\.map$"   # 필요하면 sourcemap은 별도 단계에서만
-  third_party_policy: "collect_and_tag" # drop / collect_and_tag / collect_only_initiators
+  denied_paths:
+    - ".*\\.map$"
+  third_party_policy: "tag_only"   # analyze | skip | tag_only
+  allow_private_ips: false
 
-collection:
-  static_html: true
-  headless: true
-  headless_scenarios:
-    - type: "route_walk"
-      max_routes: 15
-    - type: "click_common"
-      selectors:
-        - "a"
-        - "button"
-      max_clicks: 20
-
-acquisition:
-  max_js_size_mb: 10
-  accept_types:
-    - "application/javascript"
-    - "text/javascript"
-    - "application/x-javascript"
+crawler:
+  max_depth: 2
+  max_pages: 50
+  max_js_files: 200
+  rate_limit: 0.0
+  max_concurrent: 5
+  request_timeout: 20.0
+  page_timeout: 30.0
   follow_redirects: true
+  use_headless: true
+  explore_routes: true
+  max_route_exploration: 15
+  interactive_clicking: false
+  block_state_changing_requests: true
+  max_retries: 2
+  retry_delay: 1.0
+  max_file_size: 10485760          # 10 MiB
+  user_agent: "bundleInspector/1.0"
 
-sourcemap:
-  enabled: true
-  fetch_maps: true
-  max_map_size_mb: 20
-
-normalize:
-  beautify: true
-  deobfuscate_lite: true
-  preserve_evidence: true
-
-parse:
-  engine: "node_babel"   # node_babel / python_esprima / fallback
+parser:
   tolerant: true
+  partial_on_error: true
+  extract_strings: true
+  extract_calls: true
+  extract_imports: true
+  build_call_graph: true
+  beautify: true
+  resolve_sourcemaps: true
+  beautify_max_bytes: 1000000
+  analysis_worker_timeout: 30.0
 
 rules:
-  ruleset: "rulesets/pack_default"
-  enable_categories:
-    - endpoints
-    - secrets
-    - domains
-    - feature_flags
+  enabled_categories:
+    - endpoint
+    - secret
+    - domain
+    - flag
     - debug
-  min_confidence: "low"  # low/medium/high
+    - sink
+    - upload
+  min_confidence: "low"            # low | medium | high
+  mask_secrets: true
+  secret_visible_chars: 4
+  entropy_threshold: 4.0
+  extract_headers: true
+  extract_parameters: true
+  dormant_endpoint_detection_enabled: true
+  runtime_endpoint_surfacing_enabled: true
 
-correlation:
-  enabled: true
-  edges:
-    - same_file
-    - config
-    - import_graph
-    - runtime_initiator
-  clustering:
-    enabled: true
-
-risk:
-  enabled: true
-  scoring_model: "impact_likelihood_confidence"
-  thresholds:
-    P0: 85
-    P1: 70
-    P2: 50
-    P3: 20
+output:
+  format: "json"                   # json | html | sarif
+  include_raw_content: false
+  include_ast: false
+  include_snippets: true
+  snippet_context_lines: 3
+  min_severity: "info"             # info | low | medium | high
+  min_risk_tier: "P3"              # P0 | P1 | P2 | P3

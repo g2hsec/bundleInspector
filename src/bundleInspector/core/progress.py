@@ -4,10 +4,10 @@ Progress tracking.
 
 from __future__ import annotations
 
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import Callable, Optional
 
 
 class PipelineStage(Enum):
@@ -32,8 +32,8 @@ class StageProgress:
     completed: int = 0
     failed: int = 0
     detail: str = ""
-    started_at: Optional[datetime] = None
-    completed_at: Optional[datetime] = None
+    started_at: datetime | None = None
+    completed_at: datetime | None = None
 
     @property
     def percent(self) -> float:
@@ -55,13 +55,14 @@ class ProgressTracker:
     current_stage: PipelineStage = PipelineStage.INIT
     stages: dict[PipelineStage, StageProgress] = field(default_factory=dict)
     started_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
-    completed_at: Optional[datetime] = None
+    completed_at: datetime | None = None
+    cancelled_at: datetime | None = None
 
     # Callbacks
-    on_stage_start: Optional[Callable[[PipelineStage], None]] = None
-    on_stage_complete: Optional[Callable[[PipelineStage, StageProgress], None]] = None
-    on_progress: Optional[Callable[[PipelineStage, int, int], None]] = None
-    on_stage_detail: Optional[Callable[[PipelineStage, str], None]] = None
+    on_stage_start: Callable[[PipelineStage], None] | None = None
+    on_stage_complete: Callable[[PipelineStage, StageProgress], None] | None = None
+    on_progress: Callable[[PipelineStage, int, int], None] | None = None
+    on_stage_detail: Callable[[PipelineStage, str], None] | None = None
 
     def start_stage(self, stage: PipelineStage, total: int = 0) -> None:
         """Start a pipeline stage."""
@@ -118,13 +119,24 @@ class ProgressTracker:
 
     def complete(self) -> None:
         """Complete the entire pipeline."""
+        if self.cancelled_at is not None:
+            return
         self.completed_at = datetime.now(timezone.utc)
         self.current_stage = PipelineStage.COMPLETE
+
+    def cancel(self) -> None:
+        """Mark progress cancelled without misreporting the pipeline as complete."""
+        if self.completed_at is None and self.cancelled_at is None:
+            self.cancelled_at = datetime.now(timezone.utc)
+
+    @property
+    def is_cancelled(self) -> bool:
+        return self.cancelled_at is not None
 
     @property
     def duration(self) -> float:
         """Total duration in seconds."""
-        end = self.completed_at or datetime.now(timezone.utc)
+        end = self.completed_at or self.cancelled_at or datetime.now(timezone.utc)
         return (end - self.started_at).total_seconds()
 
     @property
@@ -146,6 +158,7 @@ class ProgressTracker:
             "current_stage": self.current_stage.value,
             "overall_percent": self.overall_percent,
             "duration_seconds": self.duration,
+            "cancelled": self.is_cancelled,
             "stages": {
                 stage.value: {
                     "total": progress.total,

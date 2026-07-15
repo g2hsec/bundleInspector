@@ -26,12 +26,14 @@ class _FakeRequest:
         method: str = "GET",
         resource_type: str = "document",
         url: str = "https://example.com/api",
+        redirected_from: _FakeRequest | None = None,
     ):
         self.frame = _FakeFrame(frame_url) if frame_url else None
         self.headers = headers or {}
         self.method = method
         self.resource_type = resource_type
         self.url = url
+        self.redirected_from = redirected_from
 
 
 class _FakeResponse:
@@ -157,6 +159,25 @@ class _FakeBrowser:
         return self._context
 
 
+class _FakeSocksProxy:
+    instances: list[_FakeSocksProxy] = []
+
+    def __init__(self, *, allow_private_ips: bool, connect_timeout: float, max_clients: int):
+        self.allow_private_ips = allow_private_ips
+        self.connect_timeout = connect_timeout
+        self.max_clients = max_clients
+        self.started = False
+        self.closed = False
+        self.url = "socks5://127.0.0.1:43123"
+        self.instances.append(self)
+
+    async def start(self) -> None:
+        self.started = True
+
+    async def close(self) -> None:
+        self.closed = True
+
+
 def _scope() -> ScopePolicy:
     config = ScopeConfig(
         allowed_domains=["example.com", "*.example.com"],
@@ -168,6 +189,13 @@ def _scope() -> ScopePolicy:
 @pytest.fixture
 def _enable_headless(monkeypatch):
     monkeypatch.setattr(headless_module, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(headless_module, "ValidatingSocksProxy", _FakeSocksProxy)
+    monkeypatch.setattr(
+        headless_module,
+        "is_url_safe",
+        lambda url, resolve_dns=True, allow_private_ips=False: (True, "OK"),
+    )
+    _FakeSocksProxy.instances.clear()
 
 
 @pytest.mark.asyncio
@@ -183,16 +211,21 @@ async def test_headless_create_context_applies_cookies_and_auth_headers(_enable_
     collector = HeadlessCollector(CrawlerConfig(), auth)
     collector._browser = browser
 
-    created = await collector._create_context("https://example.com/app")
+    created = await collector._create_context("https://example.com/app", _scope())
 
     assert created is context
     assert browser.new_context_calls
-    assert browser.new_context_calls[0]["ignore_https_errors"] is True
+    assert browser.new_context_calls[0]["ignore_https_errors"] is False
+    assert browser.new_context_calls[0]["service_workers"] == "block"
+    assert browser.new_context_calls[0]["proxy"] == {
+        "server": "socks5://127.0.0.1:43123",
+        "bypass": "<-loopback>",
+    }
     assert context.cookies_added == [{
         "name": "session",
         "value": "abc123",
-        "domain": "example.com",
-        "path": "/",
+        "url": "https://example.com/",
+        "secure": True,
     }]
     assert context.routes and context.routes[0][0] == "**/*"
 
@@ -252,14 +285,21 @@ def test_headless_observed_requests_survive_reset_resume_state(_enable_headless)
     assert ("GET", "https://example.com/api/x") in collector.observed_requests
 
 
-async def _route_handler_for(config, auth=None):
+async def _route_handler_for(
+    config,
+    auth=None,
+    *,
+    scope=None,
+    target_url="https://example.com/app",
+    **collector_kwargs,
+):
     """Build a context via _create_context and return (collector, installed route handler)."""
     page = _FakePage()
     context = _FakeContext(page)
     browser = _FakeBrowser(context)
-    collector = HeadlessCollector(config, auth)
+    collector = HeadlessCollector(config, auth, **collector_kwargs)
     collector._browser = browser
-    created = await collector._create_context("https://example.com/app")
+    created = await collector._create_context(target_url, scope or _scope())
     handler = created.routes[-1][1] if created.routes else None
     return collector, handler
 
@@ -273,18 +313,21 @@ async def test_state_change_guard_installed_by_default(_enable_headless):
     browser = _FakeBrowser(context)
     collector = HeadlessCollector(CrawlerConfig())
     collector._browser = browser
-    created = await collector._create_context("https://example.com/app")
+    created = await collector._create_context("https://example.com/app", _scope())
     assert created.routes and created.routes[-1][0] == "**/*"
     assert browser.new_context_calls[0].get("service_workers") == "block"
     assert collector.config.interactive_clicking is False
 
 
 @pytest.mark.asyncio
-async def test_guard_not_installed_when_disabled_and_no_auth(_enable_headless):
+async def test_security_route_remains_installed_when_mutation_guard_and_auth_are_disabled(
+    _enable_headless,
+):
     collector, handler = await _route_handler_for(
         CrawlerConfig(block_state_changing_requests=False)
     )
-    assert handler is None
+    assert handler is not None
+    assert collector._browser.new_context_calls[0]["service_workers"] == "block"
 
 
 @pytest.mark.asyncio
@@ -355,6 +398,249 @@ async def test_async_confirm_handler_can_deny_state_change(_enable_headless):
 
 
 @pytest.mark.asyncio
+async def test_auth_headers_are_injected_only_on_the_exact_origin(_enable_headless):
+    collector, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False),
+        auth=AuthConfig(headers={"X-Scan-Auth": "custom"}, bearer_token="s3cr3t"),
+        scope=ScopePolicy(ScopeConfig(third_party_policy=ThirdPartyPolicy.ANALYZE)),
+    )
+    assert handler is not None
+    for url in ("https://example.com/api/x", "https://EXAMPLE.com:443/y"):
+        route = _FakeRoute()
+        await handler(route, _FakeRequest(method="GET", resource_type="xhr", url=url))
+        assert route.continued
+        assert "s3cr3t" in (route.continued_headers or {}).get("Authorization", ""), url
+        assert (route.continued_headers or {}).get("X-Scan-Auth") == "custom"
+    for url in (
+        "https://api.example.com/y",
+        "https://sibling.example.com/y",
+        "http://example.com/y",
+        "https://example.com:8443/y",
+        "https://attacker.co.uk/y",
+        "https://attacker.com.au/y",
+    ):
+        route = _FakeRoute()
+        inherited = {
+            "authorization": "Bearer s3cr3t",
+            "x-scan-auth": "custom",
+            "Accept": "*/*",
+        }
+        await handler(
+            route,
+            _FakeRequest(method="GET", resource_type="xhr", url=url, headers=inherited),
+        )
+        assert route.continued
+        lowered = {name.lower(): value for name, value in (route.continued_headers or {}).items()}
+        assert "authorization" not in lowered, url
+        assert "x-scan-auth" not in lowered, url
+        assert lowered["accept"] == "*/*"
+
+
+@pytest.mark.asyncio
+async def test_public_suffix_sibling_never_receives_target_credentials(_enable_headless):
+    _, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False),
+        auth=AuthConfig(bearer_token="s3cr3t"),
+        target_url="https://victim.co.uk/app",
+        scope=ScopePolicy(ScopeConfig(third_party_policy=ThirdPartyPolicy.ANALYZE)),
+    )
+    route = _FakeRoute()
+    await handler(
+        route,
+        _FakeRequest(
+            url="https://attacker.co.uk/collect",
+            headers={"Authorization": "Bearer s3cr3t"},
+        ),
+    )
+    lowered = {name.lower(): value for name, value in (route.continued_headers or {}).items()}
+    assert "authorization" not in lowered
+
+
+@pytest.mark.asyncio
+async def test_idna_equivalent_exact_origin_receives_credentials(_enable_headless):
+    _, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False),
+        auth=AuthConfig(bearer_token="s3cr3t"),
+        target_url="https://b\u00fccher.example/app",
+        scope=ScopePolicy(ScopeConfig(third_party_policy=ThirdPartyPolicy.ANALYZE)),
+    )
+    route = _FakeRoute()
+    await handler(route, _FakeRequest(url="https://xn--bcher-kva.example/api"))
+    assert (route.continued_headers or {})["Authorization"] == "Bearer s3cr3t"
+
+
+@pytest.mark.asyncio
+async def test_route_blocks_unsafe_document_subresources_and_websockets(
+    _enable_headless,
+    monkeypatch,
+):
+    validated: list[tuple[str, bool, bool]] = []
+
+    def validate(url, resolve_dns=True, allow_private_ips=False):
+        validated.append((url, resolve_dns, allow_private_ips))
+        return False, "Resolved IP is blocked"
+
+    monkeypatch.setattr(headless_module, "is_url_safe", validate)
+    collector, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False),
+        scope=ScopePolicy(ScopeConfig(third_party_policy=ThirdPartyPolicy.ANALYZE)),
+    )
+    for resource_type, url in (
+        ("document", "http://127.0.0.1/admin"),
+        ("script", "http://169.254.169.254/latest/meta-data/app.js"),
+        ("image", "http://10.0.0.7/pixel"),
+        ("xhr", "http://localhost/api"),
+        ("fetch", "http://[::1]/api"),
+        ("websocket", "ws://192.168.1.5/live"),
+        ("websocket", "wss://metadata.google.internal/live"),
+    ):
+        route = _FakeRoute()
+        await handler(route, _FakeRequest(url=url, resource_type=resource_type))
+        assert route.aborted and not route.continued, (resource_type, url)
+
+    assert collector.blocked_request_count == 7
+    assert len(collector.blocked_requests) == 7
+    # DNS is validated and pinned by the SOCKS dial itself; route preflight performs syntax/IP-
+    # literal policy only, avoiding duplicate DNS egress before scope rejection.
+    assert all(not resolve_dns for _, resolve_dns, _ in validated)
+    assert all(not allow_private for _, _, allow_private in validated)
+    assert any(url.startswith("http://192.168.1.5") for url, _, _ in validated)
+    assert any(url.startswith("https://metadata.google.internal") for url, _, _ in validated)
+
+
+@pytest.mark.asyncio
+async def test_allow_private_policy_reaches_route_validator_and_pinning_proxy(
+    _enable_headless,
+    monkeypatch,
+):
+    calls: list[tuple[str, bool]] = []
+
+    def validate(url, resolve_dns=True, allow_private_ips=False):
+        calls.append((url, allow_private_ips))
+        return allow_private_ips, "private blocked"
+
+    monkeypatch.setattr(headless_module, "is_url_safe", validate)
+    scope = ScopePolicy(
+        ScopeConfig(
+            allow_private_ips=True,
+            third_party_policy=ThirdPartyPolicy.ANALYZE,
+        )
+    )
+    collector, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False),
+        scope=scope,
+        allow_private_ips=True,
+    )
+    route = _FakeRoute()
+    await handler(route, _FakeRequest(url="http://10.10.1.5/app.js", resource_type="script"))
+
+    assert route.continued and not route.aborted
+    assert calls == [("http://10.10.1.5/app.js", True)]
+    assert _FakeSocksProxy.instances[-1].allow_private_ips is True
+    assert collector.allow_private_ips is True
+
+
+@pytest.mark.asyncio
+async def test_route_validation_exception_and_unsupported_scheme_fail_closed(
+    _enable_headless,
+    monkeypatch,
+):
+    def explode(*args, **kwargs):
+        raise OSError("resolver failure token=secret")
+
+    monkeypatch.setattr(headless_module, "is_url_safe", explode)
+    collector, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False)
+    )
+    for url in ("https://example.com/api", "file:///etc/passwd", "ftp://example.com/a"):
+        route = _FakeRoute()
+        await handler(route, _FakeRequest(url=url))
+        assert route.aborted and not route.continued
+
+    local_route = _FakeRoute()
+    await handler(local_route, _FakeRequest(url="blob:https://example.com/id"))
+    assert local_route.continued and not local_route.aborted
+    assert collector.blocked_request_count == 3
+    assert collector.blocked_requests[0]["reason"] == "request validation failed: OSError"
+    assert "secret" not in str(collector.blocked_requests)
+
+
+@pytest.mark.asyncio
+async def test_redirect_policy_is_enforced_for_every_hop(_enable_headless):
+    open_scope = ScopePolicy(ScopeConfig(third_party_policy=ThirdPartyPolicy.ANALYZE))
+    _, no_follow = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False, follow_redirects=False),
+        scope=open_scope,
+    )
+    first = _FakeRequest(url="https://example.com/start")
+    redirected = _FakeRequest(url="https://example.com/next", redirected_from=first)
+    blocked = _FakeRoute()
+    await no_follow(blocked, redirected)
+    assert blocked.aborted
+
+    _, capped = await _route_handler_for(
+        CrawlerConfig(
+            block_state_changing_requests=False,
+            follow_redirects=True,
+            max_redirects=1,
+        ),
+        scope=open_scope,
+    )
+    allowed = _FakeRoute()
+    await capped(allowed, redirected)
+    assert allowed.continued
+    second = _FakeRequest(url="https://example.com/two", redirected_from=redirected)
+    over_limit = _FakeRoute()
+    await capped(over_limit, second)
+    assert over_limit.aborted
+
+
+@pytest.mark.asyncio
+async def test_safe_network_requests_share_existing_rate_limiter(_enable_headless):
+    class Limiter:
+        def __init__(self):
+            self.urls: list[str] = []
+
+        async def acquire(self, url: str) -> None:
+            self.urls.append(url)
+
+    limiter = Limiter()
+    _, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False),
+        rate_limiter=limiter,
+    )
+    route = _FakeRoute()
+    await handler(route, _FakeRequest(url="wss://example.com/live", resource_type="websocket"))
+
+    assert route.continued
+    assert limiter.urls == ["https://example.com/live"]
+
+
+@pytest.mark.asyncio
+async def test_blocked_request_telemetry_is_bounded(_enable_headless, monkeypatch):
+    monkeypatch.setattr(
+        headless_module,
+        "is_url_safe",
+        lambda *args, **kwargs: (False, "blocked"),
+    )
+    collector, handler = await _route_handler_for(
+        CrawlerConfig(block_state_changing_requests=False)
+    )
+    for index in range(HeadlessCollector._MAX_BLOCKED_REQUESTS + 5):
+        route = _FakeRoute()
+        await handler(
+            route,
+            _FakeRequest(url=f"https://example.com/private/{index}?token=secret"),
+        )
+
+    assert collector.blocked_request_count == HeadlessCollector._MAX_BLOCKED_REQUESTS + 5
+    assert len(collector.blocked_requests) == HeadlessCollector._MAX_BLOCKED_REQUESTS
+    assert collector.blocked_requests_dropped == 5
+    assert "token" not in str(collector.blocked_requests)
+    assert "secret" not in str(collector.blocked_requests)
+
+
+@pytest.mark.asyncio
 async def test_explore_routes_arms_guard_for_route_link_clicks(_enable_headless):
     # Regression: route-link clicks must run with the guard armed (route-link-induced
     # mutations are covered, not just interactive-element clicks).
@@ -381,7 +667,9 @@ async def test_explore_routes_arms_guard_for_route_link_clicks(_enable_headless)
     await collector._explore_routes(page, "https://example.com/app", _scope())
     assert probe.click_count == 1
     assert armed["during_click"] is True          # armed while the route link was clicked
-    assert collector._suppress_mutations is False  # disarmed after the phase
+    # The guard now STAYS armed after exploration (reset per-page in _create_context) so a
+    # click-scheduled deferred mutation fired after the settle is still suppressed.
+    assert collector._suppress_mutations is True
 
 
 @pytest.mark.asyncio
@@ -415,11 +703,13 @@ async def test_interactive_clicking_enabled_arms_and_disarms_suppression(_enable
     await collector._explore_routes(page, "https://example.com/app", _scope())
     assert clickable.click_count == 1
     assert collector._interactive_complete is True
-    assert collector._suppress_mutations is False  # window closed after the phase
+    # The guard STAYS armed after the phase (reset per-page in _create_context) so a click-
+    # scheduled deferred mutation firing after the settle is still suppressed.
+    assert collector._suppress_mutations is True
 
 
 @pytest.mark.asyncio
-async def test_headless_create_context_restores_browser_storage_state(_enable_headless):
+async def test_headless_create_context_ignores_legacy_plaintext_browser_storage_state(_enable_headless):
     page = _FakePage()
     context = _FakeContext(page)
     browser = _FakeBrowser(context)
@@ -432,12 +722,9 @@ async def test_headless_create_context_restores_browser_storage_state(_enable_he
         }
     })
 
-    await collector._create_context("https://example.com/app")
+    await collector._create_context("https://example.com/app", _scope())
 
-    assert browser.new_context_calls[0]["storage_state"] == {
-        "cookies": [{"name": "session", "value": "abc123"}],
-        "origins": [{"origin": "https://example.com", "localStorage": []}],
-    }
+    assert "storage_state" not in browser.new_context_calls[0]
 
 
 @pytest.mark.asyncio
@@ -534,7 +821,7 @@ async def test_headless_multipage_find_page_links_filters_external_and_static_re
     context = _FakeContext(page)
     collector = HeadlessMultiPageCollector(CrawlerConfig(max_depth=2, use_headless=True))
 
-    async def _create_context(url: str):
+    async def _create_context(url: str, scope: ScopePolicy):
         return context
 
     collector._collector._browser = object()
@@ -1077,8 +1364,8 @@ def test_headless_collector_exports_and_restores_discovered_ref_resume_state(_en
     assert state["route_links"] == ["/next"]
 
 
-def test_headless_collector_exports_and_restores_browser_runtime_resume_state(_enable_headless):
-    """Nested headless checkpoints should carry browser storage and current page URL state."""
+def test_headless_checkpoint_redacts_browser_runtime_credentials(_enable_headless):
+    """Checkpoints expose omission telemetry, never cookie/local-storage names or values."""
     collector = HeadlessCollector(CrawlerConfig(explore_routes=True))
     collector.load_resume_state({
         "browser_storage_state": {
@@ -1089,13 +1376,26 @@ def test_headless_collector_exports_and_restores_browser_runtime_resume_state(_e
         "interactive_pending_selector_index": 1,
         "interactive_pending_element_index": 3,
     })
+    collector._browser_storage_state = {
+        "cookies": [{"name": "session", "value": "abc123"}],
+        "origins": [{
+            "origin": "https://example.com",
+            "localStorage": [{"name": "access_token", "value": "secret-token"}],
+        }],
+    }
 
     state = collector.export_resume_state()
 
-    assert state["browser_storage_state"] == {
-        "cookies": [{"name": "session", "value": "abc123"}],
-        "origins": [{"origin": "https://example.com", "localStorage": []}],
+    assert "browser_storage_state" not in state
+    assert state["browser_storage_state_redacted"] == {
+        "persisted": False,
+        "cookie_count": 1,
+        "origin_count": 1,
+        "local_storage_entry_count": 1,
     }
+    assert "abc123" not in repr(state)
+    assert "secret-token" not in repr(state)
+    assert "access_token" not in repr(state)
     assert state["current_page_url"] == "https://example.com/app?step=2"
     assert state["interactive_pending_selector_index"] == 1
     assert state["interactive_pending_element_index"] == 3
@@ -1193,3 +1493,132 @@ async def test_headless_collector_replays_pending_interactive_click_before_conti
     assert "interactive_pending_selector_index" not in state
     assert "interactive_pending_element_index" not in state
 
+
+@pytest.mark.asyncio
+async def test_route_dispatch_respects_configured_concurrency(_enable_headless):
+    active = 0
+    peak = 0
+
+    class SlowRoute(_FakeRoute):
+        async def continue_(self, headers=None) -> None:
+            nonlocal active, peak
+            active += 1
+            peak = max(peak, active)
+            await asyncio.sleep(0.01)
+            active -= 1
+            await super().continue_(headers=headers)
+
+    collector, handler = await _route_handler_for(
+        CrawlerConfig(max_concurrent=1, block_state_changing_requests=False)
+    )
+    routes = [SlowRoute(), SlowRoute()]
+    await asyncio.gather(*(
+        handler(route, _FakeRequest(url=f"https://example.com/{index}.js", resource_type="script"))
+        for index, route in enumerate(routes)
+    ))
+
+    assert peak == 1
+    assert all(route.continued for route in routes)
+    assert _FakeSocksProxy.instances[-1].max_clients == 1
+    await collector._close_socks_proxy()
+
+
+@pytest.mark.asyncio
+async def test_navigation_policy_block_is_terminal_and_not_retried(_enable_headless):
+    collector: HeadlessCollector
+
+    class PolicyBlockedPage(_FakePage):
+        async def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.goto_calls.append((url, wait_until, timeout))
+            collector._terminal_navigation_block = "URL is outside configured scope"
+            raise RuntimeError("request aborted")
+
+    page = PolicyBlockedPage()
+    context = _FakeContext(page)
+    collector = HeadlessCollector(CrawlerConfig(
+        max_retries=3,
+        retry_delay=0,
+        page_timeout=1,
+        headless_wait_time=0,
+        explore_routes=False,
+    ))
+    collector._browser = _FakeBrowser(context)
+
+    assert [ref async for ref in collector.collect("https://example.com/app", _scope())] == []
+    assert len(page.goto_calls) == 1
+    assert collector.retryable_failures == []
+    assert collector.terminal_failures[0]["code"] == "navigation_policy_blocked"
+
+
+@pytest.mark.asyncio
+async def test_navigation_transient_failure_uses_configured_retry_count(_enable_headless):
+    class FailingPage(_FakePage):
+        async def goto(self, url: str, wait_until: str, timeout: int) -> None:
+            self.goto_calls.append((url, wait_until, timeout))
+            raise RuntimeError("temporary network failure")
+
+    page = FailingPage()
+    collector = HeadlessCollector(CrawlerConfig(
+        max_retries=2,
+        retry_delay=0,
+        page_timeout=1,
+        headless_wait_time=0,
+        explore_routes=False,
+    ))
+    collector._browser = _FakeBrowser(_FakeContext(page))
+
+    assert [ref async for ref in collector.collect("https://example.com/app", _scope())] == []
+    assert [wait_until for _, wait_until, _ in page.goto_calls] == [
+        "networkidle", "domcontentloaded",
+        "networkidle", "domcontentloaded",
+        "networkidle", "domcontentloaded",
+    ]
+    assert collector.retryable_failures[0]["reason"] == "navigation failed"
+    assert collector.terminal_failures == []
+
+
+def test_headless_resume_state_round_trips_captured_browser_body(_enable_headless):
+    captured = b"authenticated-body"
+    collector = HeadlessCollector(CrawlerConfig())
+    collector._discovered_refs = [JSReference(
+        url="https://example.com/private.js",
+        method=LoadMethod.NETWORK_CAPTURE,
+        captured_content=captured,
+        captured_status_code=206,
+    )]
+    state = collector.export_resume_state()
+    restored = HeadlessCollector(CrawlerConfig())
+    restored.load_resume_state(state)
+
+    assert restored._discovered_refs[0].captured_content == captured
+    assert restored._discovered_refs[0].captured_status_code == 206
+
+
+@pytest.mark.asyncio
+async def test_headless_body_capture_rejects_declared_and_actual_oversize(_enable_headless):
+    calls = 0
+
+    class Response:
+        def __init__(self, declared: str, body: bytes):
+            self.headers = {"content-length": declared}
+            self._body = body
+            self.status = 200
+
+        async def body(self) -> bytes:
+            nonlocal calls
+            calls += 1
+            return self._body
+
+    collector = HeadlessCollector(CrawlerConfig(max_file_size=4))
+    declared_ref = JSReference(url="https://example.com/declared.js")
+    await collector._capture_response_body(Response("5", b"small"), declared_ref)
+    assert declared_ref.captured_content is None
+    assert calls == 0
+
+    actual_ref = JSReference(url="https://example.com/actual.js")
+    await collector._capture_response_body(Response("1", b"oversized"), actual_ref)
+    assert actual_ref.captured_content is None
+    assert calls == 1
+    assert {item["code"] for item in collector.terminal_failures} == {
+        "browser_response_too_large"
+    }

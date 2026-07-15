@@ -6,17 +6,213 @@ from __future__ import annotations
 
 import json
 import re
+import threading
+from collections.abc import Callable, Iterator
 from copy import deepcopy
+from dataclasses import dataclass
+from functools import wraps
 from pathlib import Path
-from typing import Any, Iterator, Literal, Optional
+from typing import Any, Literal
 from urllib.parse import urlunsplit
-from bundleInspector.core.url_utils import safe_urlsplit as urlsplit
 
+import regex
+import structlog
 from pydantic import BaseModel, Field, model_validator
 
+from bundleInspector.core.security import MAX_PATTERN_LENGTH
+from bundleInspector.core.url_utils import safe_urlsplit as urlsplit
 from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
-from bundleInspector.storage.models import Category, Confidence, IntermediateRepresentation, Severity
+from bundleInspector.storage.models import (
+    Category,
+    Confidence,
+    IntermediateRepresentation,
+    Severity,
+)
 from bundleInspector.utils.yaml_loader import load_yaml
+
+logger = structlog.get_logger(__name__)
+
+# DQ-R01: defensive per-rule regex match cap. A pathological user pattern (zero-width or
+# catastrophic-backtracking) can emit a match at nearly every position of a large string,
+# exhausting memory with RuleResults. Legitimate rules never approach this bound; when the cap
+# truncates we log once so the truncation is disclosed, not silent (INV-06).
+_MAX_MATCHES_PER_RULE = 50_000
+
+# Public runtime contract for every user-controlled regular expression in this module. The
+# third-party ``regex`` engine applies this wall-clock budget to each search/iteration operation;
+# stdlib ``re`` has no equivalent interruption mechanism.
+CUSTOM_REGEX_TIMEOUT_SECONDS = 0.05
+
+
+class CustomRegexTimeout(RuntimeError):
+    """Raised after a user-controlled regex exceeds its execution budget."""
+
+
+@dataclass(frozen=True)
+class CustomRuleLoadDiagnostic:
+    """Structured disclosure for a configured custom rule that was not registered."""
+
+    rule_id: str
+    reason: str
+    error: str = ""
+
+    def as_analysis_incomplete(self) -> dict[str, Any]:
+        """Convert the loader diagnostic to the shared completeness metadata schema."""
+        event: dict[str, Any] = {
+            "component": "custom_rule_loader",
+            "rule_id": self.rule_id,
+            "reason": self.reason,
+            "partial_results": True,
+        }
+        if self.error:
+            event["error"] = self.error
+        return event
+
+
+_custom_regex_state = threading.local()
+
+
+def _record_custom_rule_partial(reason: str, pattern: str | None = None) -> None:
+    """Record one disclosed partial-analysis event for the active custom rule."""
+    rule_id = str(getattr(_custom_regex_state, "rule_id", "custom_rule"))
+    event_key = (rule_id, reason, pattern or "")
+    recorded = getattr(_custom_regex_state, "recorded_events", None)
+    if not isinstance(recorded, set):
+        recorded = set()
+        _custom_regex_state.recorded_events = recorded
+    if event_key in recorded:
+        return
+    recorded.add(event_key)
+
+    event: dict[str, Any] = {
+        "component": "custom_rule",
+        "rule_id": rule_id,
+        "reason": reason,
+        "partial_results": True,
+    }
+    if reason == "regex_timeout":
+        event["timeout_seconds"] = CUSTOM_REGEX_TIMEOUT_SECONDS
+
+    context = getattr(_custom_regex_state, "context", None)
+    if isinstance(context, AnalysisContext):
+        incomplete = context.metadata.setdefault("analysis_incomplete", [])
+        if isinstance(incomplete, list):
+            incomplete.append(event)
+
+    logger.warning(
+        "custom_rule_analysis_incomplete",
+        **event,
+    )
+
+
+class SafeCustomRegex:
+    """Compiled user regex whose matching operations have a hard execution timeout."""
+
+    def __init__(self, pattern: str, flags: int = 0):
+        self.pattern = pattern
+        self._compiled = regex.compile(pattern, flags)
+        self.groups = int(self._compiled.groups)
+
+    def search(self, value: str) -> Any | None:
+        """Search ``value`` or raise ``CustomRegexTimeout`` after the public budget."""
+        try:
+            return self._compiled.search(value, timeout=CUSTOM_REGEX_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            _record_custom_rule_partial("regex_timeout", self.pattern)
+            raise CustomRegexTimeout(
+                f"custom regex exceeded {CUSTOM_REGEX_TIMEOUT_SECONDS}s"
+            ) from exc
+
+    def finditer(self, value: str) -> Iterator[Any]:
+        """Iterate matches under one bounded regex operation."""
+        try:
+            yield from self._compiled.finditer(value, timeout=CUSTOM_REGEX_TIMEOUT_SECONDS)
+        except TimeoutError as exc:
+            _record_custom_rule_partial("regex_timeout", self.pattern)
+            raise CustomRegexTimeout(
+                f"custom regex exceeded {CUSTOM_REGEX_TIMEOUT_SECONDS}s"
+            ) from exc
+
+
+def compile_custom_regex(pattern: str, flags: int = 0) -> SafeCustomRegex:
+    """Compile a user-controlled regex into the mandatory timeout wrapper."""
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        raise ValueError(f"regex pattern length exceeds maximum of {MAX_PATTERN_LENGTH} characters")
+    return SafeCustomRegex(pattern, flags)
+
+
+def safe_custom_regex_search(pattern: str, value: str, flags: int = 0) -> Any | None:
+    """Search with a user-controlled regex under ``CUSTOM_REGEX_TIMEOUT_SECONDS``."""
+    return compile_custom_regex(pattern, flags).search(value)
+
+
+_CustomMatchMethod = Callable[
+    [Any, IntermediateRepresentation, AnalysisContext],
+    Iterator[RuleResult],
+]
+
+
+def _with_custom_regex_runtime(method: _CustomMatchMethod) -> _CustomMatchMethod:
+    """Bind per-rule timeout telemetry while a custom-rule generator is consumed."""
+
+    @wraps(method)
+    def wrapped(
+        rule: Any,
+        ir: IntermediateRepresentation,
+        context: AnalysisContext,
+    ) -> Iterator[RuleResult]:
+        def iterate() -> Iterator[RuleResult]:
+            previous = {
+                name: getattr(_custom_regex_state, name, None)
+                for name in ("context", "rule_id", "recorded_events", "match_count", "cap_reached")
+            }
+            _custom_regex_state.context = context
+            _custom_regex_state.rule_id = str(getattr(rule, "id", "custom_rule"))
+            _custom_regex_state.recorded_events = set()
+            _custom_regex_state.match_count = 0
+            _custom_regex_state.cap_reached = False
+            try:
+                yield from method(rule, ir, context)
+            except CustomRegexTimeout:
+                return
+            finally:
+                for name, value in previous.items():
+                    if value is None:
+                        try:
+                            delattr(_custom_regex_state, name)
+                        except AttributeError:
+                            pass
+                    else:
+                        setattr(_custom_regex_state, name, value)
+
+        return iterate()
+
+    return wrapped
+
+
+def _bounded_matches(matches: Iterator[Any], rule_id: str) -> Iterator[Any]:
+    """Yield regex matches up to _MAX_MATCHES_PER_RULE, logging once if the cap truncates."""
+    runtime_active = isinstance(getattr(_custom_regex_state, "context", None), AnalysisContext)
+    if runtime_active and bool(getattr(_custom_regex_state, "cap_reached", False)):
+        return
+    count = int(getattr(_custom_regex_state, "match_count", 0)) if runtime_active else 0
+    for match in matches:
+        count += 1
+        if runtime_active:
+            _custom_regex_state.match_count = count
+        if count > _MAX_MATCHES_PER_RULE:
+            if runtime_active:
+                _custom_regex_state.cap_reached = True
+                _record_custom_rule_partial("regex_match_cap")
+            else:
+                logger.warning(
+                    "custom_rule_match_cap_reached",
+                    rule_id=rule_id,
+                    cap=_MAX_MATCHES_PER_RULE,
+                )
+            return
+        yield match
+
 
 _CATEGORY_ALIASES = {
     "endpoint": Category.ENDPOINT,
@@ -38,6 +234,8 @@ _CATEGORY_ALIASES = {
 class CustomRuleSpec(BaseModel):
     """Schema for a custom regex rule."""
 
+    model_config = {"extra": "forbid"}
+
     id: str
     title: str
     description: str = ""
@@ -47,65 +245,79 @@ class CustomRuleSpec(BaseModel):
     value_type: str = "custom_match"
     pattern: str
     scope: Literal["source", "string_literal"] = "source"
-    extract_group: int = 0
+    extract_group: int = Field(default=0, ge=0)
     flags: list[str] = Field(default_factory=list)
     tags: list[str] = Field(default_factory=list)
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_regex(self) -> CustomRuleSpec:
+        _validate_regex_pattern(self.pattern, self.flags, self.extract_group)
+        return self
 
 
 class AstPatternArgSpec(BaseModel):
     """Single positional argument matcher for AST-pattern rules."""
 
-    type: Literal["LiteralString", "TemplateLiteral", "IdentifierString", "IdentifierName", "MemberPath", "Any"] = "Any"
-    index: Optional[int] = None
+    type: Literal[
+        "LiteralString",
+        "TemplateLiteral",
+        "IdentifierString",
+        "IdentifierName",
+        "MemberPath",
+        "Any",
+    ] = "Any"
+    index: int | None = None
     index_any_of: list[int] = Field(default_factory=list)
     any_of: list[str] = Field(default_factory=list)
     not_any_of: list[str] = Field(default_factory=list)
     contains_any_of: list[str] = Field(default_factory=list)
     not_contains_any_of: list[str] = Field(default_factory=list)
-    regex: Optional[str] = None
-    not_regex: Optional[str] = None
-    index_capture_as: Optional[str] = None
-    capture_as: Optional[str] = None
+    regex: str | None = None
+    not_regex: str | None = None
+    index_capture_as: str | None = None
+    capture_as: str | None = None
     capture_group: int = 0
 
 
 class AstPatternSpec(BaseModel):
     """Minimal AST pattern supported by shipped custom rules."""
 
-    kind: Literal["CallExpression", "NewExpression", "VariableDeclarator", "AssignmentExpression", "Property"] = "CallExpression"
+    kind: Literal[
+        "CallExpression", "NewExpression", "VariableDeclarator", "AssignmentExpression", "Property"
+    ] = "CallExpression"
     callee_any_of: list[str] = Field(default_factory=list)
     not_callee_any_of: list[str] = Field(default_factory=list)
     callee_contains_any_of: list[str] = Field(default_factory=list)
     not_callee_contains_any_of: list[str] = Field(default_factory=list)
     callee_regex_any_of: list[str] = Field(default_factory=list)
     not_callee_regex_any_of: list[str] = Field(default_factory=list)
-    callee_capture_as: Optional[str] = None
+    callee_capture_as: str | None = None
     args: list[AstPatternArgSpec] = Field(default_factory=list)
     id_name_any_of: list[str] = Field(default_factory=list)
     not_id_name_any_of: list[str] = Field(default_factory=list)
     id_name_contains_any_of: list[str] = Field(default_factory=list)
     not_id_name_contains_any_of: list[str] = Field(default_factory=list)
-    id_name_regex: Optional[str] = None
-    not_id_name_regex: Optional[str] = None
-    id_name_capture_as: Optional[str] = None
+    id_name_regex: str | None = None
+    not_id_name_regex: str | None = None
+    id_name_capture_as: str | None = None
     left_any_of: list[str] = Field(default_factory=list)
     not_left_any_of: list[str] = Field(default_factory=list)
     left_contains_any_of: list[str] = Field(default_factory=list)
     not_left_contains_any_of: list[str] = Field(default_factory=list)
     left_regex_any_of: list[str] = Field(default_factory=list)
     not_left_regex_any_of: list[str] = Field(default_factory=list)
-    left_capture_as: Optional[str] = None
+    left_capture_as: str | None = None
     property_path_any_of: list[str] = Field(default_factory=list)
     not_property_path_any_of: list[str] = Field(default_factory=list)
     property_path_contains_any_of: list[str] = Field(default_factory=list)
     not_property_path_contains_any_of: list[str] = Field(default_factory=list)
     property_path_regex_any_of: list[str] = Field(default_factory=list)
     not_property_path_regex_any_of: list[str] = Field(default_factory=list)
-    property_path_capture_as: Optional[str] = None
-    init: Optional[AstPatternArgSpec] = None
-    right: Optional[AstPatternArgSpec] = None
-    value: Optional[AstPatternArgSpec] = None
+    property_path_capture_as: str | None = None
+    init: AstPatternArgSpec | None = None
+    right: AstPatternArgSpec | None = None
+    value: AstPatternArgSpec | None = None
 
 
 class MatcherSpec(BaseModel):
@@ -113,26 +325,33 @@ class MatcherSpec(BaseModel):
 
     model_config = {"extra": "allow"}
     type: Literal["ast_pattern", "regex", "semantic"]
-    pattern: Optional[AstPatternSpec] = None
+    pattern: AstPatternSpec | None = None
 
 
 class RegexMatcherSpec(BaseModel):
     """Declarative regex matcher definition."""
 
+    model_config = {"extra": "forbid"}
+
     type: Literal["regex"] = "regex"
     pattern: str
-    capture_as: Optional[str] = None
-    capture_group: int = 0
+    capture_as: str | None = None
+    capture_group: int = Field(default=0, ge=0)
     scope: Literal["source", "string_literal"] = "source"
     flags: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_regex(self) -> RegexMatcherSpec:
+        _validate_regex_pattern(self.pattern, self.flags, self.capture_group)
+        return self
 
 
 class ExtractFieldSpec(BaseModel):
     """Field extraction definition for declarative rules."""
 
-    from_capture: Optional[str] = None
-    static: Optional[str] = None
-    mask: Optional[str] = None
+    from_capture: str | None = None
+    static: str | None = None
+    mask: str | None = None
 
 
 class ExtractSpec(BaseModel):
@@ -164,6 +383,8 @@ class EvidenceSpec(BaseModel):
 class CustomDeclarativeRuleSpec(BaseModel):
     """Schema for declarative custom matcher rules."""
 
+    model_config = {"extra": "forbid"}
+
     id: str
     title: str
     description: str = ""
@@ -177,6 +398,12 @@ class CustomDeclarativeRuleSpec(BaseModel):
     evidence: EvidenceSpec = Field(default_factory=EvidenceSpec)
     tags: list[str] = Field(default_factory=list)
     enabled: bool = True
+
+    @model_validator(mode="after")
+    def validate_embedded_regexes(self) -> CustomDeclarativeRuleSpec:
+        """Validate every nested regex-bearing matcher field before rule registration."""
+        _validate_embedded_regexes(self.matcher)
+        return self
 
 
 class CustomAstRuleSpec(BaseModel):
@@ -210,53 +437,60 @@ class MemberMatchSpec(BaseModel):
 class SemanticAstConditionSpec(BaseModel):
     """Supported AST condition for semantic matching."""
 
-    kind: Literal["AssignmentExpression", "CallExpression", "NewExpression", "VariableDeclarator", "Property"] = "AssignmentExpression"
+    kind: Literal[
+        "AssignmentExpression", "CallExpression", "NewExpression", "VariableDeclarator", "Property"
+    ] = "AssignmentExpression"
     left_matches: MemberMatchSpec = Field(default_factory=MemberMatchSpec)
-    left_capture_as: Optional[str] = None
+    left_capture_as: str | None = None
     callee_any_of: list[str] = Field(default_factory=list)
     not_callee_any_of: list[str] = Field(default_factory=list)
     callee_contains_any_of: list[str] = Field(default_factory=list)
     not_callee_contains_any_of: list[str] = Field(default_factory=list)
     callee_regex_any_of: list[str] = Field(default_factory=list)
     not_callee_regex_any_of: list[str] = Field(default_factory=list)
-    callee_capture_as: Optional[str] = None
+    callee_capture_as: str | None = None
     id_name_any_of: list[str] = Field(default_factory=list)
     not_id_name_any_of: list[str] = Field(default_factory=list)
     id_name_contains_any_of: list[str] = Field(default_factory=list)
     not_id_name_contains_any_of: list[str] = Field(default_factory=list)
     id_name_regex_any_of: list[str] = Field(default_factory=list)
     not_id_name_regex_any_of: list[str] = Field(default_factory=list)
-    id_name_capture_as: Optional[str] = None
+    id_name_capture_as: str | None = None
     property_path_any_of: list[str] = Field(default_factory=list)
     not_property_path_any_of: list[str] = Field(default_factory=list)
     property_path_contains_any_of: list[str] = Field(default_factory=list)
     not_property_path_contains_any_of: list[str] = Field(default_factory=list)
     property_path_regex_any_of: list[str] = Field(default_factory=list)
     not_property_path_regex_any_of: list[str] = Field(default_factory=list)
-    property_path_capture_as: Optional[str] = None
+    property_path_capture_as: str | None = None
 
 
 class RegexConditionSpec(BaseModel):
     """Regex condition applied to a resolved right-hand value."""
 
     pattern: str
-    capture_as: Optional[str] = None
-    capture_group: int = 0
+    capture_as: str | None = None
+    capture_group: int = Field(default=0, ge=0)
     flags: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_regex(self) -> RegexConditionSpec:
+        _validate_regex_pattern(self.pattern, self.flags, self.capture_group)
+        return self
 
 
 class ExactValueConditionSpec(BaseModel):
     """Exact-string condition applied to a resolved string value."""
 
     any_of: list[str] = Field(default_factory=list)
-    capture_as: Optional[str] = None
+    capture_as: str | None = None
 
 
 class ContainsValueConditionSpec(BaseModel):
     """Substring condition applied to a resolved string value."""
 
     any_of: list[str] = Field(default_factory=list)
-    capture_as: Optional[str] = None
+    capture_as: str | None = None
 
 
 class RegexArgConditionSpec(BaseModel):
@@ -265,10 +499,15 @@ class RegexArgConditionSpec(BaseModel):
     index: int = 0
     index_any_of: list[int] = Field(default_factory=list)
     pattern: str
-    index_capture_as: Optional[str] = None
-    capture_as: Optional[str] = None
-    capture_group: int = 0
+    index_capture_as: str | None = None
+    capture_as: str | None = None
+    capture_group: int = Field(default=0, ge=0)
     flags: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_regex(self) -> RegexArgConditionSpec:
+        _validate_regex_pattern(self.pattern, self.flags, self.capture_group)
+        return self
 
 
 class ExactArgConditionSpec(BaseModel):
@@ -277,8 +516,8 @@ class ExactArgConditionSpec(BaseModel):
     index: int = 0
     index_any_of: list[int] = Field(default_factory=list)
     any_of: list[str] = Field(default_factory=list)
-    index_capture_as: Optional[str] = None
-    capture_as: Optional[str] = None
+    index_capture_as: str | None = None
+    capture_as: str | None = None
 
 
 class ContainsArgConditionSpec(BaseModel):
@@ -287,8 +526,8 @@ class ContainsArgConditionSpec(BaseModel):
     index: int = 0
     index_any_of: list[int] = Field(default_factory=list)
     any_of: list[str] = Field(default_factory=list)
-    index_capture_as: Optional[str] = None
-    capture_as: Optional[str] = None
+    index_capture_as: str | None = None
+    capture_as: str | None = None
 
 
 class RegexObjectArgPropertyConditionSpec(BaseModel):
@@ -296,7 +535,7 @@ class RegexObjectArgPropertyConditionSpec(BaseModel):
 
     index: int = 0
     index_any_of: list[int] = Field(default_factory=list)
-    path: Optional[str] = None
+    path: str | None = None
     path_any_of: list[str] = Field(default_factory=list)
     not_path_any_of: list[str] = Field(default_factory=list)
     path_contains_any_of: list[str] = Field(default_factory=list)
@@ -304,11 +543,16 @@ class RegexObjectArgPropertyConditionSpec(BaseModel):
     path_regex_any_of: list[str] = Field(default_factory=list)
     not_path_regex_any_of: list[str] = Field(default_factory=list)
     pattern: str
-    index_capture_as: Optional[str] = None
-    path_capture_as: Optional[str] = None
-    capture_as: Optional[str] = None
-    capture_group: int = 0
+    index_capture_as: str | None = None
+    path_capture_as: str | None = None
+    capture_as: str | None = None
+    capture_group: int = Field(default=0, ge=0)
     flags: list[str] = Field(default_factory=list)
+
+    @model_validator(mode="after")
+    def validate_regex(self) -> RegexObjectArgPropertyConditionSpec:
+        _validate_regex_pattern(self.pattern, self.flags, self.capture_group)
+        return self
 
 
 class ExactObjectArgPropertyConditionSpec(BaseModel):
@@ -316,7 +560,7 @@ class ExactObjectArgPropertyConditionSpec(BaseModel):
 
     index: int = 0
     index_any_of: list[int] = Field(default_factory=list)
-    path: Optional[str] = None
+    path: str | None = None
     path_any_of: list[str] = Field(default_factory=list)
     not_path_any_of: list[str] = Field(default_factory=list)
     path_contains_any_of: list[str] = Field(default_factory=list)
@@ -324,9 +568,9 @@ class ExactObjectArgPropertyConditionSpec(BaseModel):
     path_regex_any_of: list[str] = Field(default_factory=list)
     not_path_regex_any_of: list[str] = Field(default_factory=list)
     any_of: list[str] = Field(default_factory=list)
-    index_capture_as: Optional[str] = None
-    path_capture_as: Optional[str] = None
-    capture_as: Optional[str] = None
+    index_capture_as: str | None = None
+    path_capture_as: str | None = None
+    capture_as: str | None = None
 
 
 class ContainsObjectArgPropertyConditionSpec(BaseModel):
@@ -334,7 +578,7 @@ class ContainsObjectArgPropertyConditionSpec(BaseModel):
 
     index: int = 0
     index_any_of: list[int] = Field(default_factory=list)
-    path: Optional[str] = None
+    path: str | None = None
     path_any_of: list[str] = Field(default_factory=list)
     not_path_any_of: list[str] = Field(default_factory=list)
     path_contains_any_of: list[str] = Field(default_factory=list)
@@ -342,45 +586,45 @@ class ContainsObjectArgPropertyConditionSpec(BaseModel):
     path_regex_any_of: list[str] = Field(default_factory=list)
     not_path_regex_any_of: list[str] = Field(default_factory=list)
     any_of: list[str] = Field(default_factory=list)
-    index_capture_as: Optional[str] = None
-    path_capture_as: Optional[str] = None
-    capture_as: Optional[str] = None
+    index_capture_as: str | None = None
+    path_capture_as: str | None = None
+    capture_as: str | None = None
 
 
 class SemanticConditionSpec(BaseModel):
     """Single condition in a semantic AND clause."""
 
-    ast: Optional[SemanticAstConditionSpec] = None
-    right_any_of: Optional[ExactValueConditionSpec] = None
-    not_right_any_of: Optional[ExactValueConditionSpec] = None
-    right_contains_any_of: Optional[ContainsValueConditionSpec] = None
-    not_right_contains_any_of: Optional[ContainsValueConditionSpec] = None
-    regex_on_right: Optional[RegexConditionSpec] = None
-    not_regex_on_right: Optional[RegexConditionSpec] = None
-    init_any_of: Optional[ExactValueConditionSpec] = None
-    not_init_any_of: Optional[ExactValueConditionSpec] = None
-    init_contains_any_of: Optional[ContainsValueConditionSpec] = None
-    not_init_contains_any_of: Optional[ContainsValueConditionSpec] = None
-    regex_on_init: Optional[RegexConditionSpec] = None
-    not_regex_on_init: Optional[RegexConditionSpec] = None
-    value_any_of: Optional[ExactValueConditionSpec] = None
-    not_value_any_of: Optional[ExactValueConditionSpec] = None
-    value_contains_any_of: Optional[ContainsValueConditionSpec] = None
-    not_value_contains_any_of: Optional[ContainsValueConditionSpec] = None
-    regex_on_value: Optional[RegexConditionSpec] = None
-    not_regex_on_value: Optional[RegexConditionSpec] = None
-    arg_any_of: Optional[ExactArgConditionSpec] = None
-    not_arg_any_of: Optional[ExactArgConditionSpec] = None
-    arg_contains_any_of: Optional[ContainsArgConditionSpec] = None
-    not_arg_contains_any_of: Optional[ContainsArgConditionSpec] = None
-    regex_on_arg: Optional[RegexArgConditionSpec] = None
-    not_regex_on_arg: Optional[RegexArgConditionSpec] = None
-    object_arg_property_any_of: Optional[ExactObjectArgPropertyConditionSpec] = None
-    not_object_arg_property_any_of: Optional[ExactObjectArgPropertyConditionSpec] = None
-    object_arg_property_contains_any_of: Optional[ContainsObjectArgPropertyConditionSpec] = None
-    not_object_arg_property_contains_any_of: Optional[ContainsObjectArgPropertyConditionSpec] = None
-    regex_on_object_arg_property: Optional[RegexObjectArgPropertyConditionSpec] = None
-    not_regex_on_object_arg_property: Optional[RegexObjectArgPropertyConditionSpec] = None
+    ast: SemanticAstConditionSpec | None = None
+    right_any_of: ExactValueConditionSpec | None = None
+    not_right_any_of: ExactValueConditionSpec | None = None
+    right_contains_any_of: ContainsValueConditionSpec | None = None
+    not_right_contains_any_of: ContainsValueConditionSpec | None = None
+    regex_on_right: RegexConditionSpec | None = None
+    not_regex_on_right: RegexConditionSpec | None = None
+    init_any_of: ExactValueConditionSpec | None = None
+    not_init_any_of: ExactValueConditionSpec | None = None
+    init_contains_any_of: ContainsValueConditionSpec | None = None
+    not_init_contains_any_of: ContainsValueConditionSpec | None = None
+    regex_on_init: RegexConditionSpec | None = None
+    not_regex_on_init: RegexConditionSpec | None = None
+    value_any_of: ExactValueConditionSpec | None = None
+    not_value_any_of: ExactValueConditionSpec | None = None
+    value_contains_any_of: ContainsValueConditionSpec | None = None
+    not_value_contains_any_of: ContainsValueConditionSpec | None = None
+    regex_on_value: RegexConditionSpec | None = None
+    not_regex_on_value: RegexConditionSpec | None = None
+    arg_any_of: ExactArgConditionSpec | None = None
+    not_arg_any_of: ExactArgConditionSpec | None = None
+    arg_contains_any_of: ContainsArgConditionSpec | None = None
+    not_arg_contains_any_of: ContainsArgConditionSpec | None = None
+    regex_on_arg: RegexArgConditionSpec | None = None
+    not_regex_on_arg: RegexArgConditionSpec | None = None
+    object_arg_property_any_of: ExactObjectArgPropertyConditionSpec | None = None
+    not_object_arg_property_any_of: ExactObjectArgPropertyConditionSpec | None = None
+    object_arg_property_contains_any_of: ContainsObjectArgPropertyConditionSpec | None = None
+    not_object_arg_property_contains_any_of: ContainsObjectArgPropertyConditionSpec | None = None
+    regex_on_object_arg_property: RegexObjectArgPropertyConditionSpec | None = None
+    not_regex_on_object_arg_property: RegexObjectArgPropertyConditionSpec | None = None
 
 
 class SemanticClauseSpec(BaseModel):
@@ -437,6 +681,9 @@ class SemanticMatcherSpec(BaseModel):
 class _CustomRuleBase(BaseRule):
     """Common helpers for custom rule implementations."""
 
+    confidence: Confidence = Confidence.MEDIUM
+    tags: list[str] = []
+
     def _base_result(
         self,
         extracted_value: str,
@@ -444,7 +691,7 @@ class _CustomRuleBase(BaseRule):
         line: int,
         column: int,
         ast_node_type: str,
-        metadata: Optional[dict[str, Any]] = None,
+        metadata: dict[str, Any] | None = None,
     ) -> RuleResult:
         return RuleResult(
             rule_id=self.id,
@@ -467,6 +714,7 @@ class _CustomDeclarativeRuleBase(_CustomRuleBase):
     """Shared extract/normalize helpers for declarative custom rules."""
 
     spec: CustomDeclarativeRuleSpec
+    value_type: str = "custom_match"
 
     def _extract_fields(self, captures: dict[str, str]) -> dict[str, str]:
         """Materialize configured extracted fields from captures/static values."""
@@ -500,7 +748,7 @@ class _CustomDeclarativeRuleBase(_CustomRuleBase):
     def _build_metadata(
         self,
         raw_fields: dict[str, str],
-        ast_path: Optional[str] = None,
+        ast_path: str | None = None,
         **extra: Any,
     ) -> dict[str, Any]:
         """Build rule metadata with masked extracted fields when configured."""
@@ -566,8 +814,9 @@ class CustomRegexRule(_CustomRuleBase):
         self.value_type = spec.value_type
         self.tags = spec.tags
         self.enabled = spec.enabled
-        self._pattern = re.compile(spec.pattern, _compile_flags(spec.flags))
+        self._pattern = _validate_regex_pattern(spec.pattern, spec.flags, spec.extract_group)
 
+    @_with_custom_regex_runtime
     def match(
         self,
         ir: IntermediateRepresentation,
@@ -578,7 +827,7 @@ class CustomRegexRule(_CustomRuleBase):
 
         if self.spec.scope == "string_literal":
             for literal in ir.string_literals:
-                for match in self._pattern.finditer(literal.value):
+                for match in _bounded_matches(self._pattern.finditer(literal.value), self.id):
                     extracted = _extract_match_value(match, self.spec.extract_group)
                     key = (extracted, literal.line, literal.column)
                     if key in seen:
@@ -594,7 +843,7 @@ class CustomRegexRule(_CustomRuleBase):
             return
 
         source = context.source_content
-        for match in self._pattern.finditer(source):
+        for match in _bounded_matches(self._pattern.finditer(source), self.id):
             extracted = _extract_match_value(match, self.spec.extract_group)
             line, column = _offset_to_line_column(source, match.start())
             key = (extracted, line, column)
@@ -625,8 +874,13 @@ class CustomRegexMatcherRule(_CustomDeclarativeRuleBase):
         self.tags = spec.tags
         self.enabled = spec.enabled
         self.matcher = RegexMatcherSpec.model_validate(spec.matcher)
-        self._pattern = re.compile(self.matcher.pattern, _compile_flags(self.matcher.flags))
+        self._pattern = _validate_regex_pattern(
+            self.matcher.pattern,
+            self.matcher.flags,
+            self.matcher.capture_group,
+        )
 
+    @_with_custom_regex_runtime
     def match(
         self,
         ir: IntermediateRepresentation,
@@ -637,7 +891,7 @@ class CustomRegexMatcherRule(_CustomDeclarativeRuleBase):
 
         if self.matcher.scope == "string_literal":
             for literal in ir.string_literals:
-                for match in self._pattern.finditer(literal.value):
+                for match in _bounded_matches(self._pattern.finditer(literal.value), self.id):
                     result = self._resolve_match(match)
                     if not result:
                         continue
@@ -657,7 +911,7 @@ class CustomRegexMatcherRule(_CustomDeclarativeRuleBase):
             return
 
         source = context.source_content
-        for match in self._pattern.finditer(source):
+        for match in _bounded_matches(self._pattern.finditer(source), self.id):
             line, column = _offset_to_line_column(source, match.start())
             result = self._resolve_match(match)
             if not result:
@@ -678,8 +932,8 @@ class CustomRegexMatcherRule(_CustomDeclarativeRuleBase):
 
     def _resolve_match(
         self,
-        match: re.Match[str],
-    ) -> Optional[tuple[str, str, dict[str, Any]]]:
+        match: Any,
+    ) -> tuple[str, str, dict[str, Any]] | None:
         """Build an extracted value and metadata from a regex match."""
         captures: dict[str, str] = {}
         extracted = _extract_match_value(match, self.matcher.capture_group)
@@ -713,13 +967,13 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
         self.enabled = spec.enabled
         self.pattern = AstPatternSpec.model_validate(spec.matcher.get("pattern", {}))
 
+    @_with_custom_regex_runtime
     def match(
         self,
         ir: IntermediateRepresentation,
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Match the supported declarative AST-pattern subset."""
-        del context
         seen: set[tuple[str, int, int]] = set()
         constants = _build_constant_table(ir.raw_ast or {})
 
@@ -740,7 +994,9 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                 ):
                     continue
 
-                captures = self._match_call_args(node.get("arguments", []), self.pattern.args, constants)
+                captures = self._match_call_args(
+                    node.get("arguments", []), self.pattern.args, constants
+                )
                 if captures is None:
                     continue
                 if self.pattern.callee_capture_as:
@@ -798,7 +1054,9 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
             return False
         if contains_denied and _call_name_contains(call_name, contains_denied):
             return False
-        if regex_denied and any(re.search(pattern, call_name) for pattern in regex_denied):
+        if regex_denied and any(
+            safe_custom_regex_search(pattern, call_name) for pattern in regex_denied
+        ):
             return False
         return True
 
@@ -807,7 +1065,7 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
         arguments: list[Any],
         patterns: list[AstPatternArgSpec],
         constants: dict[str, str],
-    ) -> Optional[dict[str, str]]:
+    ) -> dict[str, str] | None:
         """Match positional call arguments and return captured values."""
         captures: dict[str, str] = {}
         used_indices: set[int] = set()
@@ -837,15 +1095,10 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                     used_indices.add(index)
                     matched = True
                     break
-                if (
-                    arg_pattern.type == "Any"
-                    and not arg_pattern.regex
-                    and not arg_pattern.capture_as
-                    and not arg_pattern.index_capture_as
-                ):
-                    used_indices.add(index)
-                    matched = True
-                    break
+                # NB: an `Any` arg carrying value gates (any_of / not_any_of / contains_any_of /
+                # not_contains_any_of / not_regex) must NOT short-circuit as a match here -- fall
+                # through to _match_ast_value, the ONLY place those gates are enforced. (The removed
+                # duplicate block matched such gated Any args unconditionally -> false positives.)
                 value = _match_ast_value(arg, arg_pattern, constants)
                 if value is None:
                     continue
@@ -893,9 +1146,9 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
         seen: set[tuple[str, int, int]],
     ) -> Iterator[RuleResult]:
         """Match a minimal VariableDeclarator subset from the raw AST."""
-        id_regex = re.compile(self.pattern.id_name_regex or ".*", re.IGNORECASE)
+        id_regex = compile_custom_regex(self.pattern.id_name_regex or ".*", re.IGNORECASE)
         not_id_regex = (
-            re.compile(self.pattern.not_id_name_regex, re.IGNORECASE)
+            compile_custom_regex(self.pattern.not_id_name_regex, re.IGNORECASE)
             if self.pattern.not_id_name_regex
             else None
         )
@@ -913,7 +1166,10 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
             identifier_name = identifier.get("name", "")
             if self.pattern.id_name_any_of and identifier_name not in self.pattern.id_name_any_of:
                 continue
-            if self.pattern.not_id_name_any_of and identifier_name in self.pattern.not_id_name_any_of:
+            if (
+                self.pattern.not_id_name_any_of
+                and identifier_name in self.pattern.not_id_name_any_of
+            ):
                 continue
             if self.pattern.id_name_contains_any_of and not _contains_any(
                 identifier_name,
@@ -1000,12 +1256,12 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
             ):
                 continue
             if self.pattern.left_regex_any_of and not any(
-                re.search(pattern, left_path)
+                safe_custom_regex_search(pattern, left_path)
                 for pattern in self.pattern.left_regex_any_of
             ):
                 continue
             if self.pattern.not_left_regex_any_of and any(
-                re.search(pattern, left_path)
+                safe_custom_regex_search(pattern, left_path)
                 for pattern in self.pattern.not_left_regex_any_of
             ):
                 continue
@@ -1067,9 +1323,15 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                 object_ast_path,
                 constants=constants,
             ):
-                if self.pattern.property_path_any_of and property_path not in self.pattern.property_path_any_of:
+                if (
+                    self.pattern.property_path_any_of
+                    and property_path not in self.pattern.property_path_any_of
+                ):
                     continue
-                if self.pattern.not_property_path_any_of and property_path in self.pattern.not_property_path_any_of:
+                if (
+                    self.pattern.not_property_path_any_of
+                    and property_path in self.pattern.not_property_path_any_of
+                ):
                     continue
                 if self.pattern.property_path_contains_any_of and not _contains_any(
                     property_path,
@@ -1082,12 +1344,12 @@ class CustomAstPatternRule(_CustomDeclarativeRuleBase):
                 ):
                     continue
                 if self.pattern.property_path_regex_any_of and not any(
-                    re.search(pattern, property_path)
+                    safe_custom_regex_search(pattern, property_path)
                     for pattern in self.pattern.property_path_regex_any_of
                 ):
                     continue
                 if self.pattern.not_property_path_regex_any_of and any(
-                    re.search(pattern, property_path)
+                    safe_custom_regex_search(pattern, property_path)
                     for pattern in self.pattern.not_property_path_regex_any_of
                 ):
                     continue
@@ -1147,13 +1409,13 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         self.enabled = spec.enabled
         self.matcher = SemanticMatcherSpec.model_validate(spec.matcher)
 
+    @_with_custom_regex_runtime
     def match(
         self,
         ir: IntermediateRepresentation,
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Match the supported semantic subset against raw AST nodes."""
-        del context
         if not ir.raw_ast:
             return
 
@@ -1226,7 +1488,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         yield from self.matcher.logic.all
         yield from self.matcher.logic.none
 
-    def _iter_clause_conditions(self, clause: SemanticClauseSpec) -> Iterator[SemanticConditionSpec]:
+    def _iter_clause_conditions(
+        self, clause: SemanticClauseSpec
+    ) -> Iterator[SemanticConditionSpec]:
         """Iterate all conditions that can influence clause matching."""
         yield from clause.conditions
         yield from clause.any_conditions
@@ -1238,47 +1502,55 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
 
         if condition.ast:
             candidate_types.add(condition.ast.kind)
-        if any((
-            condition.right_any_of,
-            condition.not_right_any_of,
-            condition.right_contains_any_of,
-            condition.not_right_contains_any_of,
-            condition.regex_on_right,
-            condition.not_regex_on_right,
-        )):
+        if any(
+            (
+                condition.right_any_of,
+                condition.not_right_any_of,
+                condition.right_contains_any_of,
+                condition.not_right_contains_any_of,
+                condition.regex_on_right,
+                condition.not_regex_on_right,
+            )
+        ):
             candidate_types.add("AssignmentExpression")
-        if any((
-            condition.init_any_of,
-            condition.not_init_any_of,
-            condition.init_contains_any_of,
-            condition.not_init_contains_any_of,
-            condition.regex_on_init,
-            condition.not_regex_on_init,
-        )):
+        if any(
+            (
+                condition.init_any_of,
+                condition.not_init_any_of,
+                condition.init_contains_any_of,
+                condition.not_init_contains_any_of,
+                condition.regex_on_init,
+                condition.not_regex_on_init,
+            )
+        ):
             candidate_types.add("VariableDeclarator")
-        if any((
-            condition.value_any_of,
-            condition.not_value_any_of,
-            condition.value_contains_any_of,
-            condition.not_value_contains_any_of,
-            condition.regex_on_value,
-            condition.not_regex_on_value,
-        )):
+        if any(
+            (
+                condition.value_any_of,
+                condition.not_value_any_of,
+                condition.value_contains_any_of,
+                condition.not_value_contains_any_of,
+                condition.regex_on_value,
+                condition.not_regex_on_value,
+            )
+        ):
             candidate_types.add("Property")
-        if any((
-            condition.arg_any_of,
-            condition.not_arg_any_of,
-            condition.arg_contains_any_of,
-            condition.not_arg_contains_any_of,
-            condition.regex_on_arg,
-            condition.not_regex_on_arg,
-            condition.object_arg_property_any_of,
-            condition.not_object_arg_property_any_of,
-            condition.object_arg_property_contains_any_of,
-            condition.not_object_arg_property_contains_any_of,
-            condition.regex_on_object_arg_property,
-            condition.not_regex_on_object_arg_property,
-        )):
+        if any(
+            (
+                condition.arg_any_of,
+                condition.not_arg_any_of,
+                condition.arg_contains_any_of,
+                condition.not_arg_contains_any_of,
+                condition.regex_on_arg,
+                condition.not_regex_on_arg,
+                condition.object_arg_property_any_of,
+                condition.not_object_arg_property_any_of,
+                condition.object_arg_property_contains_any_of,
+                condition.not_object_arg_property_contains_any_of,
+                condition.regex_on_object_arg_property,
+                condition.not_regex_on_object_arg_property,
+            )
+        ):
             candidate_types.update({"CallExpression", "NewExpression"})
 
         return candidate_types
@@ -1288,8 +1560,8 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         node: dict[str, Any],
         constants: dict[str, str],
         function_returns: dict[str, dict[str, Any]],
-        property_path: Optional[str] = None,
-    ) -> Optional[dict[str, str]]:
+        property_path: str | None = None,
+    ) -> dict[str, str] | None:
         """Match the top-level semantic boolean structure against a single AST node."""
         if not (self.matcher.logic.any or self.matcher.logic.all or self.matcher.logic.none):
             return None
@@ -1325,13 +1597,16 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
 
             blocked = False
             for clause in self.matcher.logic.none:
-                if self._match_clause(
-                    node,
-                    clause,
-                    constants,
-                    function_returns,
-                    property_path,
-                ) is not None:
+                if (
+                    self._match_clause(
+                        node,
+                        clause,
+                        constants,
+                        function_returns,
+                        property_path,
+                    )
+                    is not None
+                ):
                     blocked = True
                     break
             if blocked:
@@ -1347,8 +1622,8 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         clause: SemanticClauseSpec,
         constants: dict[str, str],
         function_returns: dict[str, dict[str, Any]],
-        property_path: Optional[str] = None,
-    ) -> Optional[dict[str, str]]:
+        property_path: str | None = None,
+    ) -> dict[str, str] | None:
         """Match a semantic boolean clause against a single AST node."""
         captures: dict[str, str] = {}
 
@@ -1358,9 +1633,15 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.ast and condition.ast.kind == "Property":
                 if not property_path:
                     return None
-                if condition.ast.property_path_any_of and property_path not in condition.ast.property_path_any_of:
+                if (
+                    condition.ast.property_path_any_of
+                    and property_path not in condition.ast.property_path_any_of
+                ):
                     return None
-                if condition.ast.not_property_path_any_of and property_path in condition.ast.not_property_path_any_of:
+                if (
+                    condition.ast.not_property_path_any_of
+                    and property_path in condition.ast.not_property_path_any_of
+                ):
                     return None
                 if condition.ast.property_path_contains_any_of and not _contains_any(
                     property_path,
@@ -1373,12 +1654,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 ):
                     return None
                 if condition.ast.property_path_regex_any_of and not any(
-                    re.search(pattern, property_path)
+                    safe_custom_regex_search(pattern, property_path)
                     for pattern in condition.ast.property_path_regex_any_of
                 ):
                     return None
                 if condition.ast.not_property_path_regex_any_of and any(
-                    re.search(pattern, property_path)
+                    safe_custom_regex_search(pattern, property_path)
                     for pattern in condition.ast.not_property_path_regex_any_of
                 ):
                     return None
@@ -1394,7 +1675,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.right_any_of:
                 if node.get("type") != "AssignmentExpression":
                     return None
-                right_value = _resolve_semantic_value_expr(node.get("right"), constants, function_returns)
+                right_value = _resolve_semantic_value_expr(
+                    node.get("right"), constants, function_returns
+                )
                 if right_value is None or right_value not in condition.right_any_of.any_of:
                     return None
                 if condition.right_any_of.capture_as:
@@ -1402,7 +1685,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.not_right_any_of:
                 if node.get("type") != "AssignmentExpression":
                     return None
-                right_value = _resolve_semantic_value_expr(node.get("right"), constants, function_returns)
+                right_value = _resolve_semantic_value_expr(
+                    node.get("right"), constants, function_returns
+                )
                 if right_value is None:
                     return None
                 if right_value in condition.not_right_any_of.any_of:
@@ -1410,7 +1695,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.right_contains_any_of:
                 if node.get("type") != "AssignmentExpression":
                     return None
-                right_value = _resolve_semantic_value_expr(node.get("right"), constants, function_returns)
+                right_value = _resolve_semantic_value_expr(
+                    node.get("right"), constants, function_returns
+                )
                 if right_value is None or not _contains_any(
                     right_value,
                     condition.right_contains_any_of.any_of,
@@ -1421,7 +1708,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.not_right_contains_any_of:
                 if node.get("type") != "AssignmentExpression":
                     return None
-                right_value = _resolve_semantic_value_expr(node.get("right"), constants, function_returns)
+                right_value = _resolve_semantic_value_expr(
+                    node.get("right"), constants, function_returns
+                )
                 if right_value is None:
                     return None
                 if _contains_any(right_value, condition.not_right_contains_any_of.any_of):
@@ -1429,10 +1718,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.regex_on_right:
                 if node.get("type") != "AssignmentExpression":
                     return None
-                right_value = _resolve_semantic_value_expr(node.get("right"), constants, function_returns)
+                right_value = _resolve_semantic_value_expr(
+                    node.get("right"), constants, function_returns
+                )
                 if right_value is None:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.regex_on_right.pattern,
                     _compile_flags(condition.regex_on_right.flags),
                 )
@@ -1447,10 +1738,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.not_regex_on_right:
                 if node.get("type") != "AssignmentExpression":
                     return None
-                right_value = _resolve_semantic_value_expr(node.get("right"), constants, function_returns)
+                right_value = _resolve_semantic_value_expr(
+                    node.get("right"), constants, function_returns
+                )
                 if right_value is None:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.not_regex_on_right.pattern,
                     _compile_flags(condition.not_regex_on_right.flags),
                 )
@@ -1459,7 +1752,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.init_any_of:
                 if node.get("type") != "VariableDeclarator":
                     return None
-                init_value = _resolve_semantic_value_expr(node.get("init"), constants, function_returns)
+                init_value = _resolve_semantic_value_expr(
+                    node.get("init"), constants, function_returns
+                )
                 if init_value is None or init_value not in condition.init_any_of.any_of:
                     return None
                 if condition.init_any_of.capture_as:
@@ -1467,7 +1762,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.not_init_any_of:
                 if node.get("type") != "VariableDeclarator":
                     return None
-                init_value = _resolve_semantic_value_expr(node.get("init"), constants, function_returns)
+                init_value = _resolve_semantic_value_expr(
+                    node.get("init"), constants, function_returns
+                )
                 if init_value is None:
                     return None
                 if init_value in condition.not_init_any_of.any_of:
@@ -1475,7 +1772,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.init_contains_any_of:
                 if node.get("type") != "VariableDeclarator":
                     return None
-                init_value = _resolve_semantic_value_expr(node.get("init"), constants, function_returns)
+                init_value = _resolve_semantic_value_expr(
+                    node.get("init"), constants, function_returns
+                )
                 if init_value is None or not _contains_any(
                     init_value,
                     condition.init_contains_any_of.any_of,
@@ -1486,7 +1785,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.not_init_contains_any_of:
                 if node.get("type") != "VariableDeclarator":
                     return None
-                init_value = _resolve_semantic_value_expr(node.get("init"), constants, function_returns)
+                init_value = _resolve_semantic_value_expr(
+                    node.get("init"), constants, function_returns
+                )
                 if init_value is None:
                     return None
                 if _contains_any(init_value, condition.not_init_contains_any_of.any_of):
@@ -1494,10 +1795,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.regex_on_init:
                 if node.get("type") != "VariableDeclarator":
                     return None
-                init_value = _resolve_semantic_value_expr(node.get("init"), constants, function_returns)
+                init_value = _resolve_semantic_value_expr(
+                    node.get("init"), constants, function_returns
+                )
                 if init_value is None:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.regex_on_init.pattern,
                     _compile_flags(condition.regex_on_init.flags),
                 )
@@ -1512,10 +1815,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             if condition.not_regex_on_init:
                 if node.get("type") != "VariableDeclarator":
                     return None
-                init_value = _resolve_semantic_value_expr(node.get("init"), constants, function_returns)
+                init_value = _resolve_semantic_value_expr(
+                    node.get("init"), constants, function_returns
+                )
                 if init_value is None:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.not_regex_on_init.pattern,
                     _compile_flags(condition.not_regex_on_init.flags),
                 )
@@ -1562,7 +1867,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 value = _resolve_semantic_value_expr(node.get("value"), constants, function_returns)
                 if value is None:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.regex_on_value.pattern,
                     _compile_flags(condition.regex_on_value.flags),
                 )
@@ -1580,7 +1885,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 value = _resolve_semantic_value_expr(node.get("value"), constants, function_returns)
                 if value is None:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.not_regex_on_value.pattern,
                     _compile_flags(condition.not_regex_on_value.flags),
                 )
@@ -1594,24 +1899,27 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 if not indices:
                     return None
                 matched_index = -1
-                arg_value: Optional[str] = None
+                exact_arg_value: str | None = None
                 for index in indices:
                     candidate_value = _resolve_invocation_argument_value(
                         arguments[index],
                         constants,
                         function_returns,
                     )
-                    if candidate_value is None or candidate_value not in condition.arg_any_of.any_of:
+                    if (
+                        candidate_value is None
+                        or candidate_value not in condition.arg_any_of.any_of
+                    ):
                         continue
                     matched_index = index
-                    arg_value = candidate_value
+                    exact_arg_value = candidate_value
                     break
-                if matched_index < 0 or arg_value is None:
+                if matched_index < 0 or exact_arg_value is None:
                     return None
                 if condition.arg_any_of.index_capture_as:
                     captures[condition.arg_any_of.index_capture_as] = str(matched_index)
                 if condition.arg_any_of.capture_as:
-                    captures[condition.arg_any_of.capture_as] = arg_value
+                    captures[condition.arg_any_of.capture_as] = exact_arg_value
             if condition.not_arg_any_of:
                 if not _is_invocation_expression(node):
                     return None
@@ -1621,15 +1929,15 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                     return None
                 resolved_any = False
                 for index in indices:
-                    arg_value = _resolve_invocation_argument_value(
+                    denied_arg_value = _resolve_invocation_argument_value(
                         arguments[index],
                         constants,
                         function_returns,
                     )
-                    if arg_value is None:
+                    if denied_arg_value is None:
                         continue
                     resolved_any = True
-                    if arg_value in condition.not_arg_any_of.any_of:
+                    if denied_arg_value in condition.not_arg_any_of.any_of:
                         return None
                 if not resolved_any:
                     return None
@@ -1641,7 +1949,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 if not indices:
                     return None
                 matched_index = -1
-                arg_value: Optional[str] = None
+                contains_arg_value: str | None = None
                 for index in indices:
                     candidate_value = _resolve_invocation_argument_value(
                         arguments[index],
@@ -1654,14 +1962,14 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                     ):
                         continue
                     matched_index = index
-                    arg_value = candidate_value
+                    contains_arg_value = candidate_value
                     break
-                if matched_index < 0 or arg_value is None:
+                if matched_index < 0 or contains_arg_value is None:
                     return None
                 if condition.arg_contains_any_of.index_capture_as:
                     captures[condition.arg_contains_any_of.index_capture_as] = str(matched_index)
                 if condition.arg_contains_any_of.capture_as:
-                    captures[condition.arg_contains_any_of.capture_as] = arg_value
+                    captures[condition.arg_contains_any_of.capture_as] = contains_arg_value
             if condition.not_arg_contains_any_of:
                 if not _is_invocation_expression(node):
                     return None
@@ -1690,12 +1998,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 indices = _resolve_match_indices(condition.regex_on_arg, len(arguments))
                 if not indices:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.regex_on_arg.pattern,
                     _compile_flags(condition.regex_on_arg.flags),
                 )
                 matched_index = -1
-                match: Optional[re.Match[str]] = None
+                arg_regex_match: Any | None = None
                 for index in indices:
                     arg_value = _resolve_invocation_argument_value(
                         arguments[index],
@@ -1708,15 +2016,15 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                     if not candidate_match:
                         continue
                     matched_index = index
-                    match = candidate_match
+                    arg_regex_match = candidate_match
                     break
-                if matched_index < 0 or match is None:
+                if matched_index < 0 or arg_regex_match is None:
                     return None
                 if condition.regex_on_arg.index_capture_as:
                     captures[condition.regex_on_arg.index_capture_as] = str(matched_index)
                 if condition.regex_on_arg.capture_as:
                     captures[condition.regex_on_arg.capture_as] = _extract_match_value(
-                        match,
+                        arg_regex_match,
                         condition.regex_on_arg.capture_group,
                     )
             if condition.not_regex_on_arg:
@@ -1726,7 +2034,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 indices = _resolve_match_indices(condition.not_regex_on_arg, len(arguments))
                 if not indices:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.not_regex_on_arg.pattern,
                     _compile_flags(condition.not_regex_on_arg.flags),
                 )
@@ -1748,12 +2056,14 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 if not _is_invocation_expression(node):
                     return None
                 arguments = _get_invocation_arguments(node)
-                indices = _resolve_match_indices(condition.object_arg_property_any_of, len(arguments))
+                indices = _resolve_match_indices(
+                    condition.object_arg_property_any_of, len(arguments)
+                )
                 if not indices:
                     return None
                 matched_index = -1
-                property_path: Optional[str] = None
-                property_value: Optional[str] = None
+                exact_property_path: str | None = None
+                exact_property_value: str | None = None
                 for index in indices:
                     property_match = self._resolve_object_arg_property_match(
                         arguments[index],
@@ -1767,22 +2077,28 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                     if candidate_value not in condition.object_arg_property_any_of.any_of:
                         continue
                     matched_index = index
-                    property_path = candidate_path
-                    property_value = candidate_value
+                    exact_property_path = candidate_path
+                    exact_property_value = candidate_value
                     break
-                if matched_index < 0 or property_path is None or property_value is None:
+                if matched_index < 0 or exact_property_path is None or exact_property_value is None:
                     return None
                 if condition.object_arg_property_any_of.index_capture_as:
-                    captures[condition.object_arg_property_any_of.index_capture_as] = str(matched_index)
+                    captures[condition.object_arg_property_any_of.index_capture_as] = str(
+                        matched_index
+                    )
                 if condition.object_arg_property_any_of.path_capture_as:
-                    captures[condition.object_arg_property_any_of.path_capture_as] = property_path
+                    captures[condition.object_arg_property_any_of.path_capture_as] = (
+                        exact_property_path
+                    )
                 if condition.object_arg_property_any_of.capture_as:
-                    captures[condition.object_arg_property_any_of.capture_as] = property_value
+                    captures[condition.object_arg_property_any_of.capture_as] = exact_property_value
             if condition.not_object_arg_property_any_of:
                 if not _is_invocation_expression(node):
                     return None
                 arguments = _get_invocation_arguments(node)
-                indices = _resolve_match_indices(condition.not_object_arg_property_any_of, len(arguments))
+                indices = _resolve_match_indices(
+                    condition.not_object_arg_property_any_of, len(arguments)
+                )
                 if not indices:
                     return None
                 resolved_any = False
@@ -1805,12 +2121,14 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 if not _is_invocation_expression(node):
                     return None
                 arguments = _get_invocation_arguments(node)
-                indices = _resolve_match_indices(condition.object_arg_property_contains_any_of, len(arguments))
+                indices = _resolve_match_indices(
+                    condition.object_arg_property_contains_any_of, len(arguments)
+                )
                 if not indices:
                     return None
                 matched_index = -1
-                property_path: Optional[str] = None
-                property_value: Optional[str] = None
+                contains_property_path: str | None = None
+                contains_property_value: str | None = None
                 for index in indices:
                     property_match = self._resolve_object_arg_property_match(
                         arguments[index],
@@ -1827,22 +2145,34 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                     ):
                         continue
                     matched_index = index
-                    property_path = candidate_path
-                    property_value = candidate_value
+                    contains_property_path = candidate_path
+                    contains_property_value = candidate_value
                     break
-                if matched_index < 0 or property_path is None or property_value is None:
+                if (
+                    matched_index < 0
+                    or contains_property_path is None
+                    or contains_property_value is None
+                ):
                     return None
                 if condition.object_arg_property_contains_any_of.index_capture_as:
-                    captures[condition.object_arg_property_contains_any_of.index_capture_as] = str(matched_index)
+                    captures[condition.object_arg_property_contains_any_of.index_capture_as] = str(
+                        matched_index
+                    )
                 if condition.object_arg_property_contains_any_of.path_capture_as:
-                    captures[condition.object_arg_property_contains_any_of.path_capture_as] = property_path
+                    captures[condition.object_arg_property_contains_any_of.path_capture_as] = (
+                        contains_property_path
+                    )
                 if condition.object_arg_property_contains_any_of.capture_as:
-                    captures[condition.object_arg_property_contains_any_of.capture_as] = property_value
+                    captures[condition.object_arg_property_contains_any_of.capture_as] = (
+                        contains_property_value
+                    )
             if condition.not_object_arg_property_contains_any_of:
                 if not _is_invocation_expression(node):
                     return None
                 arguments = _get_invocation_arguments(node)
-                indices = _resolve_match_indices(condition.not_object_arg_property_contains_any_of, len(arguments))
+                indices = _resolve_match_indices(
+                    condition.not_object_arg_property_contains_any_of, len(arguments)
+                )
                 if not indices:
                     return None
                 resolved_any = False
@@ -1857,7 +2187,9 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                         continue
                     resolved_any = True
                     _, property_value = property_match
-                    if _contains_any(property_value, condition.not_object_arg_property_contains_any_of.any_of):
+                    if _contains_any(
+                        property_value, condition.not_object_arg_property_contains_any_of.any_of
+                    ):
                         return None
                 if not resolved_any:
                     return None
@@ -1865,16 +2197,18 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                 if not _is_invocation_expression(node):
                     return None
                 arguments = _get_invocation_arguments(node)
-                indices = _resolve_match_indices(condition.regex_on_object_arg_property, len(arguments))
+                indices = _resolve_match_indices(
+                    condition.regex_on_object_arg_property, len(arguments)
+                )
                 if not indices:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.regex_on_object_arg_property.pattern,
                     _compile_flags(condition.regex_on_object_arg_property.flags),
                 )
                 matched_index = -1
-                property_path: Optional[str] = None
-                match: Optional[re.Match[str]] = None
+                regex_property_path: str | None = None
+                property_regex_match: Any | None = None
                 for index in indices:
                     property_match = self._resolve_object_arg_property_match(
                         arguments[index],
@@ -1889,28 +2223,36 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                     if not candidate_match:
                         continue
                     matched_index = index
-                    property_path = candidate_path
-                    match = candidate_match
+                    regex_property_path = candidate_path
+                    property_regex_match = candidate_match
                     break
-                if matched_index < 0 or property_path is None or match is None:
+                if matched_index < 0 or regex_property_path is None or property_regex_match is None:
                     return None
                 if condition.regex_on_object_arg_property.index_capture_as:
-                    captures[condition.regex_on_object_arg_property.index_capture_as] = str(matched_index)
+                    captures[condition.regex_on_object_arg_property.index_capture_as] = str(
+                        matched_index
+                    )
                 if condition.regex_on_object_arg_property.path_capture_as:
-                    captures[condition.regex_on_object_arg_property.path_capture_as] = property_path
+                    captures[condition.regex_on_object_arg_property.path_capture_as] = (
+                        regex_property_path
+                    )
                 if condition.regex_on_object_arg_property.capture_as:
-                    captures[condition.regex_on_object_arg_property.capture_as] = _extract_match_value(
-                        match,
-                        condition.regex_on_object_arg_property.capture_group,
+                    captures[condition.regex_on_object_arg_property.capture_as] = (
+                        _extract_match_value(
+                            property_regex_match,
+                            condition.regex_on_object_arg_property.capture_group,
+                        )
                     )
             if condition.not_regex_on_object_arg_property:
                 if not _is_invocation_expression(node):
                     return None
                 arguments = _get_invocation_arguments(node)
-                indices = _resolve_match_indices(condition.not_regex_on_object_arg_property, len(arguments))
+                indices = _resolve_match_indices(
+                    condition.not_regex_on_object_arg_property, len(arguments)
+                )
                 if not indices:
                     return None
-                pattern = re.compile(
+                pattern = compile_custom_regex(
                     condition.not_regex_on_object_arg_property.pattern,
                     _compile_flags(condition.not_regex_on_object_arg_property.flags),
                 )
@@ -1932,7 +2274,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
                     return None
 
         if clause.any_conditions:
-            any_captures: Optional[dict[str, str]] = None
+            any_captures: dict[str, str] | None = None
             for condition in clause.any_conditions:
                 candidate = self._match_clause(
                     node,
@@ -1971,7 +2313,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         ),
         constants: dict[str, str],
         function_returns: dict[str, dict[str, Any]],
-    ) -> Optional[tuple[str, str]]:
+    ) -> tuple[str, str] | None:
         """Resolve an object-argument property match as `(path, value)`."""
         if condition.path:
             value = _resolve_object_property_expr(
@@ -2011,8 +2353,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
 
         if condition.path_regex_any_of:
             compiled_patterns = [
-                re.compile(pattern)
-                for pattern in condition.path_regex_any_of
+                compile_custom_regex(pattern) for pattern in condition.path_regex_any_of
             ]
             candidates = {
                 path: value
@@ -2021,8 +2362,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             }
         if condition.not_path_regex_any_of:
             denied_patterns = [
-                re.compile(pattern)
-                for pattern in condition.not_path_regex_any_of
+                compile_custom_regex(pattern) for pattern in condition.not_path_regex_any_of
             ]
             candidates = {
                 path: value
@@ -2057,7 +2397,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         ),
         constants: dict[str, str],
         function_returns: dict[str, dict[str, Any]],
-    ) -> Optional[str]:
+    ) -> str | None:
         """Resolve an object-argument property value only."""
         property_match = self._resolve_object_arg_property_match(
             argument_node,
@@ -2095,20 +2435,24 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             ):
                 return False
             if condition.left_matches.regex_any_of and not any(
-                re.search(pattern, left_path)
+                safe_custom_regex_search(pattern, left_path)
                 for pattern in condition.left_matches.regex_any_of
             ):
                 return False
             if condition.left_matches.not_regex_any_of and any(
-                re.search(pattern, left_path)
+                safe_custom_regex_search(pattern, left_path)
                 for pattern in condition.left_matches.not_regex_any_of
             ):
                 return False
         if condition.kind in {"CallExpression", "NewExpression"}:
             call_name = _get_call_expression_name(node.get("callee", {}))
-            if condition.callee_any_of and not _call_name_matches(call_name, condition.callee_any_of):
+            if condition.callee_any_of and not _call_name_matches(
+                call_name, condition.callee_any_of
+            ):
                 return False
-            if condition.not_callee_any_of and _call_name_matches(call_name, condition.not_callee_any_of):
+            if condition.not_callee_any_of and _call_name_matches(
+                call_name, condition.not_callee_any_of
+            ):
                 return False
             if condition.callee_contains_any_of and not _call_name_contains(
                 call_name,
@@ -2121,12 +2465,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             ):
                 return False
             if condition.callee_regex_any_of and not any(
-                re.search(pattern, call_name)
+                safe_custom_regex_search(pattern, call_name)
                 for pattern in condition.callee_regex_any_of
             ):
                 return False
             if condition.not_callee_regex_any_of and any(
-                re.search(pattern, call_name)
+                safe_custom_regex_search(pattern, call_name)
                 for pattern in condition.not_callee_regex_any_of
             ):
                 return False
@@ -2148,12 +2492,12 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
             ):
                 return False
             if condition.id_name_regex_any_of and not any(
-                re.search(pattern, identifier_name)
+                safe_custom_regex_search(pattern, identifier_name)
                 for pattern in condition.id_name_regex_any_of
             ):
                 return False
             if condition.not_id_name_regex_any_of and any(
-                re.search(pattern, identifier_name)
+                safe_custom_regex_search(pattern, identifier_name)
                 for pattern in condition.not_id_name_regex_any_of
             ):
                 return False
@@ -2174,7 +2518,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         node: dict[str, Any],
         condition: SemanticAstConditionSpec,
         constants: dict[str, str],
-        property_path: Optional[str] = None,
+        property_path: str | None = None,
     ) -> dict[str, str]:
         """Capture AST-side match context for semantic rules."""
         captures: dict[str, str] = {}
@@ -2201,7 +2545,7 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         self,
         node: dict[str, Any],
         constants: dict[str, str],
-        property_path: Optional[str] = None,
+        property_path: str | None = None,
     ) -> dict[str, Any]:
         """Attach semantic-node metadata useful for debugging custom matches."""
         node_type = node.get("type")
@@ -2219,32 +2563,102 @@ class CustomSemanticRule(_CustomDeclarativeRuleBase):
         return {}
 
 
-def load_custom_rules(path: Path) -> list[BaseRule]:
+def load_custom_rules(
+    path: Path,
+    diagnostics: list[CustomRuleLoadDiagnostic] | None = None,
+) -> list[BaseRule]:
     """Load custom rules from a JSON/YAML file, rules directory, or meta pack file."""
     rules: list[BaseRule] = []
-    for data in _load_rule_documents(path):
-        raw_rules = data if isinstance(data, list) else data.get("rules", [])
+    seen_rule_ids: set[str] = set()
+    try:
+        documents = _load_rule_documents(path)
+    except Exception as exc:
+        if diagnostics is not None:
+            diagnostics.append(
+                CustomRuleLoadDiagnostic(
+                    rule_id="?",
+                    reason="custom_rule_document_load_error",
+                    error=str(exc),
+                )
+            )
+        raise
+
+    for data in documents:
+        if isinstance(data, list):
+            raw_rules = data
+        elif isinstance(data, dict):
+            raw_rules = data.get("rules", [])
+        else:
+            error = "custom rule document must be an object or list"
+            logger.warning("custom_rule_document_load_error", error=error)
+            if diagnostics is not None:
+                diagnostics.append(
+                    CustomRuleLoadDiagnostic(
+                        rule_id="?",
+                        reason="custom_rule_document_load_error",
+                        error=error,
+                    )
+                )
+            continue
+        if not isinstance(raw_rules, list):
+            error = "custom rule document 'rules' must be a list"
+            logger.warning("custom_rule_document_load_error", error=error)
+            if diagnostics is not None:
+                diagnostics.append(
+                    CustomRuleLoadDiagnostic(
+                        rule_id="?",
+                        reason="custom_rule_document_load_error",
+                        error=error,
+                    )
+                )
+            continue
         rule_defaults = _extract_rule_defaults(data)
 
         for raw_rule in raw_rules:
-            prepared_rule = _prepare_rule_payload(raw_rule, rule_defaults)
-            matcher = prepared_rule.get("matcher", {})
-            if isinstance(matcher, dict) and matcher.get("type") == "ast_pattern":
-                rules.append(
-                    CustomAstPatternRule(CustomDeclarativeRuleSpec.model_validate(prepared_rule))
-                )
-            elif isinstance(matcher, dict) and matcher.get("type") == "regex":
-                rules.append(
-                    CustomRegexMatcherRule(CustomDeclarativeRuleSpec.model_validate(prepared_rule))
-                )
-            elif isinstance(matcher, dict) and matcher.get("type") == "semantic":
-                rules.append(
-                    CustomSemanticRule(CustomDeclarativeRuleSpec.model_validate(prepared_rule))
-                )
-            else:
-                rules.append(
-                    CustomRegexRule(CustomRuleSpec.model_validate(prepared_rule))
-                )
+            # DQ-R04: isolate per-rule construction so ONE malformed rule (bad schema / uncompilable
+            # regex) cannot abort the whole pack (which would discard every valid rule too). Log and
+            # skip the offending rule; keep loading the rest.
+            try:
+                prepared_rule = _prepare_rule_payload(raw_rule, rule_defaults)
+                matcher = prepared_rule.get("matcher", {})
+                if isinstance(matcher, dict) and matcher.get("type") == "ast_pattern":
+                    rule: BaseRule = CustomAstPatternRule(
+                        CustomDeclarativeRuleSpec.model_validate(prepared_rule)
+                    )
+                elif isinstance(matcher, dict) and matcher.get("type") == "regex":
+                    rule = CustomRegexMatcherRule(
+                        CustomDeclarativeRuleSpec.model_validate(prepared_rule)
+                    )
+                elif isinstance(matcher, dict) and matcher.get("type") == "semantic":
+                    rule = CustomSemanticRule(
+                        CustomDeclarativeRuleSpec.model_validate(prepared_rule)
+                    )
+                else:
+                    rule = CustomRegexRule(CustomRuleSpec.model_validate(prepared_rule))
+                if rule.id in seen_rule_ids:
+                    logger.warning("custom_rule_duplicate_id_skipped", rule_id=rule.id)
+                    if diagnostics is not None:
+                        diagnostics.append(
+                            CustomRuleLoadDiagnostic(
+                                rule_id=rule.id,
+                                reason="custom_rule_duplicate_id",
+                            )
+                        )
+                    continue
+                seen_rule_ids.add(rule.id)
+                rules.append(rule)
+            except Exception as e:
+                rid = raw_rule.get("id", "?") if isinstance(raw_rule, dict) else "?"
+                logger.warning("custom_rule_load_skipped", rule_id=rid, error=str(e))
+                if diagnostics is not None:
+                    diagnostics.append(
+                        CustomRuleLoadDiagnostic(
+                            rule_id=str(rid),
+                            reason="custom_rule_invalid",
+                            error=str(e),
+                        )
+                    )
+                continue
     return rules
 
 
@@ -2301,10 +2715,7 @@ def _prepare_rule_payload(
                     merged_tags.append(tag)
             prepared["tags"] = merged_tags
         elif "tags" not in prepared:
-            prepared["tags"] = [
-                tag for tag in default_tags
-                if isinstance(tag, str) and tag
-            ]
+            prepared["tags"] = [tag for tag in default_tags if isinstance(tag, str) and tag]
 
     default_flags = defaults.get("flags", [])
     rule_flags = prepared.get("flags", [])
@@ -2380,10 +2791,7 @@ def _extract_rule_defaults(data: Any) -> dict[str, Any]:
         defaults["category"] = _normalize_category_value(defaults["category"])
 
     if isinstance(defaults.get("tags"), list):
-        defaults["tags"] = [
-            tag for tag in defaults["tags"]
-            if isinstance(tag, str) and tag
-        ]
+        defaults["tags"] = [tag for tag in defaults["tags"] if isinstance(tag, str) and tag]
     if isinstance(defaults.get("flags"), list):
         defaults["flags"] = [
             flag.strip().lower()
@@ -2439,15 +2847,70 @@ def _compile_flags(flags: list[str]) -> int:
     }
     value = 0
     for flag in flags:
-        value |= flag_map.get(flag.lower(), 0)
+        normalized = flag.lower()
+        if normalized not in flag_map:
+            raise ValueError(f"unsupported regex flag: {flag!r}")
+        value |= flag_map[normalized]
     return value
 
 
-def _extract_match_value(match: re.Match[str], extract_group: int) -> str:
+def _validate_regex_pattern(
+    pattern: str, flags: list[str], capture_group: int = 0
+) -> SafeCustomRegex:
+    """Compile a custom regex and reject common catastrophic nested-repeat shapes."""
+    if len(pattern) > MAX_PATTERN_LENGTH:
+        raise ValueError(f"regex pattern length exceeds maximum of {MAX_PATTERN_LENGTH} characters")
+    scrubbed = re.sub(r"\\.", "L", pattern)
+    scrubbed = re.sub(r"\[(?:\\.|[^]\\])*\]", "C", scrubbed)
+    quantifier = r"(?:[*+]|\{\d+(?:,\d*)?\})"
+    if re.search(rf"\([^)]*{quantifier}\??\)\s*{quantifier}", scrubbed):
+        raise ValueError("unsafe regex: nested quantified group")
+    if re.search(r"\.\*\s*\.\*|\.\+\s*\.\+", scrubbed):
+        raise ValueError("unsafe regex: overlapping wildcard repetitions")
+    compiled = compile_custom_regex(pattern, _compile_flags(flags))
+    if capture_group > compiled.groups:
+        raise ValueError(
+            f"capture group {capture_group} exceeds pattern group count {compiled.groups}"
+        )
+    return compiled
+
+
+def _validate_embedded_regexes(value: Any, parent_key: str = "") -> None:
+    """Recursively validate regex strings in AST/semantic declarative matcher payloads."""
+    if isinstance(value, list):
+        if "regex" in parent_key:
+            for pattern in value:
+                if isinstance(pattern, str):
+                    _validate_regex_pattern(pattern, [])
+            return
+        for item in value:
+            _validate_embedded_regexes(item, parent_key)
+        return
+    if not isinstance(value, dict):
+        if isinstance(value, str) and "regex" in parent_key:
+            _validate_regex_pattern(value, [])
+        return
+
+    for key, nested in value.items():
+        if key == "pattern" and isinstance(nested, str):
+            raw_flags = value.get("flags", [])
+            flags = (
+                [flag for flag in raw_flags if isinstance(flag, str)]
+                if isinstance(raw_flags, list)
+                else []
+            )
+            raw_group = value.get("capture_group", value.get("extract_group", 0))
+            capture_group = raw_group if isinstance(raw_group, int) else 0
+            _validate_regex_pattern(nested, flags, capture_group)
+            continue
+        _validate_embedded_regexes(nested, key)
+
+
+def _extract_match_value(match: Any, extract_group: int) -> str:
     """Extract the configured value from a regex match."""
     if extract_group > 0 and match.lastindex and match.lastindex >= extract_group:
-        return match.group(extract_group)
-    return match.group(0)
+        return str(match.group(extract_group))
+    return str(match.group(0))
 
 
 def _contains_any(value: str, candidates: list[str]) -> bool:
@@ -2486,8 +2949,8 @@ def _resolve_match_indices(spec: Any, arg_count: int) -> list[int]:
 def _call_name_matches(
     call_name: str,
     allowed: list[str],
-    regex_allowed: Optional[list[str]] = None,
-    contains_allowed: Optional[list[str]] = None,
+    regex_allowed: list[str] | None = None,
+    contains_allowed: list[str] | None = None,
 ) -> bool:
     """Check whether a call-expression name matches a configured allowlist."""
     short_name = call_name.split(".")[-1] if call_name else ""
@@ -2496,7 +2959,8 @@ def _call_name_matches(
     if contains_allowed and _call_name_contains(call_name, contains_allowed):
         return True
     if regex_allowed and any(
-        re.search(pattern, call_name) or re.search(pattern, short_name)
+        safe_custom_regex_search(pattern, call_name)
+        or safe_custom_regex_search(pattern, short_name)
         for pattern in regex_allowed
     ):
         return True
@@ -2513,7 +2977,7 @@ def _match_ast_value(
     node: Any,
     spec: AstPatternArgSpec,
     constants: dict[str, str],
-) -> Optional[str]:
+) -> str | None:
     """Resolve and optionally regex-filter a supported AST value."""
     value = _extract_argument_value(node, spec.type, constants)
     if value is None:
@@ -2526,10 +2990,10 @@ def _match_ast_value(
         return None
     if spec.not_contains_any_of and _contains_any(value, spec.not_contains_any_of):
         return None
-    if spec.not_regex and re.search(spec.not_regex, value):
+    if spec.not_regex and safe_custom_regex_search(spec.not_regex, value):
         return None
     if spec.regex:
-        match = re.search(spec.regex, value)
+        match = safe_custom_regex_search(spec.regex, value)
         if not match:
             return None
         return _extract_match_value(match, spec.capture_group)
@@ -2540,7 +3004,7 @@ def _extract_argument_value(
     node: Any,
     arg_type: str,
     constants: dict[str, str],
-) -> Optional[str]:
+) -> str | None:
     """Extract a supported argument value from a raw AST node."""
     if arg_type == "LiteralString":
         return _extract_literal_string(node)
@@ -2569,8 +3033,8 @@ def _extract_argument_value(
 def _resolve_invocation_argument_value(
     node: Any,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-) -> Optional[str]:
+    function_returns: dict[str, dict[str, Any]] | None = None,
+) -> str | None:
     """Resolve a practical semantic invocation argument as a string or static member path."""
     return _first_resolved_value(
         _resolve_string_expr(node, constants, function_returns),
@@ -2582,8 +3046,8 @@ def _resolve_invocation_argument_value(
 def _resolve_semantic_value_expr(
     node: Any,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-) -> Optional[str]:
+    function_returns: dict[str, dict[str, Any]] | None = None,
+) -> str | None:
     """Resolve a practical semantic assignment/init/property value as a string or static member path."""
     return _first_resolved_value(
         _resolve_string_expr(node, constants, function_returns),
@@ -2592,7 +3056,7 @@ def _resolve_semantic_value_expr(
     )
 
 
-def _first_resolved_value(*candidates: Optional[str]) -> Optional[str]:
+def _first_resolved_value(*candidates: str | None) -> str | None:
     """Return the first resolved value, preserving empty strings as valid matches."""
     for candidate in candidates:
         if candidate is not None:
@@ -2600,7 +3064,7 @@ def _first_resolved_value(*candidates: Optional[str]) -> Optional[str]:
     return None
 
 
-def _extract_literal_string(node: Any) -> Optional[str]:
+def _extract_literal_string(node: Any) -> str | None:
     """Extract a string literal value from a raw AST node."""
     if not isinstance(node, dict):
         return None
@@ -2614,10 +3078,10 @@ def _extract_literal_string(node: Any) -> Optional[str]:
 def _extract_template_literal(
     node: Any,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Extract a simple template literal string value."""
     if not isinstance(node, dict) or node.get("type") != "TemplateLiteral":
         return None
@@ -2626,7 +3090,8 @@ def _extract_template_literal(
     expressions = node.get("expressions", [])
     if not expressions:
         if len(quasis) == 1:
-            return quasis[0].get("value", {}).get("cooked")
+            cooked = quasis[0].get("value", {}).get("cooked")
+            return cooked if isinstance(cooked, str) else None
         return ""
 
     if len(quasis) != len(expressions) + 1:
@@ -2652,14 +3117,14 @@ def _extract_template_literal(
 def _extract_identifier_string(
     node: Any,
     constants: dict[str, str],
-) -> Optional[str]:
+) -> str | None:
     """Extract a resolved string value from an identifier argument."""
     if not isinstance(node, dict) or node.get("type") != "Identifier":
         return None
     return constants.get(node.get("name", ""))
 
 
-def _extract_member_path(node: Any) -> Optional[str]:
+def _extract_member_path(node: Any) -> str | None:
     """Extract a dotted member-expression path when statically known."""
     if not isinstance(node, dict):
         return None
@@ -2673,7 +3138,9 @@ def _extract_member_path(node: Any) -> Optional[str]:
     object_path = _extract_member_path(node.get("object"))
     property_node = node.get("property", {})
     if node.get("computed"):
-        if property_node.get("type") == "Literal" and isinstance(property_node.get("value"), (str, int)):
+        if property_node.get("type") == "Literal" and isinstance(
+            property_node.get("value"), (str, int)
+        ):
             property_name = str(property_node.get("value"))
         else:
             return None
@@ -2687,9 +3154,9 @@ def _extract_member_path(node: Any) -> Optional[str]:
 
 def _resolve_member_path_expr(
     node: Any,
-    constants: Optional[dict[str, str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    constants: dict[str, str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a member-expression path, including constant-key computed lookups."""
     resolved = _extract_member_path(node)
     if resolved is not None:
@@ -2715,15 +3182,41 @@ def _normalize_value(value: str, spec: NormalizeFieldSpec) -> str:
     return result
 
 
+# DQ-R02: hard cap on constant-table fixpoint passes. Each pass propagates one more hop of an
+# alias/member-path chain; the loop exits early via the fixpoint `break` as soon as a pass makes
+# no change, so real bundles (chains a few hops deep) cost only 2-4 passes. This cap merely bounds
+# a pathologically deep chain so a huge/adversarial bundle cannot force unbounded O(passes * nodes)
+# work. It replaced a fixed 5 passes, which silently under-resolved chains deeper than 5 (note:
+# resolution depth is NOT bounded by the declarator count -- object member-path shadow-references
+# form chains longer than the number of declarators -- so the cap keys off passes alone).
+_MAX_CONSTANT_TABLE_PASSES = 50
+
+
 def _build_constant_table(
     ast: dict[str, Any],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
+    function_returns: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, str]:
-    """Build a simple constant table from top-level const/let assignments."""
+    """Build a simple constant table from top-level const/let assignments.
+
+    Iterates to a fixpoint so multi-hop alias chains (a = b; b = c; c = "x") fully resolve,
+    stopping as soon as a pass makes no change and hard-capped at _MAX_CONSTANT_TABLE_PASSES
+    (DQ-R02: a fixed 5 passes silently under-resolved chains deeper than 5)."""
     constants: dict[str, str] = {}
-    for _ in range(5):
+    nodes = list(_iter_nodes(ast))
+    declaration_counts: dict[str, int] = {}
+    for node in nodes:
+        if node.get("type") != "VariableDeclarator":
+            continue
+        identifier = node.get("id") or {}
+        if isinstance(identifier, dict) and identifier.get("type") == "Identifier":
+            name = identifier.get("name")
+            if isinstance(name, str) and name:
+                declaration_counts[name] = declaration_counts.get(name, 0) + 1
+    ambiguous_names = {name for name, count in declaration_counts.items() if count > 1}
+    for _ in range(_MAX_CONSTANT_TABLE_PASSES):
+        before_pass = dict(constants)
         changed = False
-        for node in _iter_nodes(ast):
+        for node in nodes:
             if node.get("type") != "VariableDeclarator":
                 continue
             identifier = node.get("id", {})
@@ -2733,7 +3226,7 @@ def _build_constant_table(
                     identifier,
                     init,
                     constants,
-                    function_returns,
+                    function_returns or {},
                     bindings=constants,
                 ):
                     changed = True
@@ -2741,10 +3234,12 @@ def _build_constant_table(
             if identifier.get("type") != "Identifier":
                 continue
             name = identifier.get("name", "")
-            if not name or not isinstance(init, dict):
+            if not name or name in ambiguous_names or not isinstance(init, dict):
                 continue
             if init.get("type") == "ObjectExpression":
-                object_values = _extract_object_string_values(name, init, constants, function_returns)
+                object_values = _extract_object_string_values(
+                    name, init, constants, function_returns
+                )
                 for key, value in object_values.items():
                     if constants.get(key) != value:
                         constants[key] = value
@@ -2763,11 +3258,16 @@ def _build_constant_table(
                     constants[name] = value
                     changed = True
                 continue
-            value = _resolve_string_expr(init, constants, function_returns)
-            if value is not None and constants.get(name) != value:
-                constants[name] = value
+            resolved_value = _resolve_string_expr(init, constants, function_returns)
+            if resolved_value is not None and constants.get(name) != resolved_value:
+                constants[name] = resolved_value
                 changed = True
-        if not changed:
+        # Converge on the accumulator itself: the destructuring bind helpers report `changed`
+        # even when they re-bind an already-known value, which would otherwise prevent the
+        # fixpoint from ever converging and burn all _MAX_CONSTANT_TABLE_PASSES passes on every
+        # bundle that uses `const {a} = ...` (DQ-R02). `not changed` short-circuits the common
+        # fully-settled pass; the dict compare catches the destructuring no-op case.
+        if not changed or constants == before_pass:
             break
     return constants
 
@@ -2776,30 +3276,32 @@ def _build_constant_table(
 # nest only a few deep; a pathological/obfuscated bundle could otherwise blow the recursion
 # limit, which the engine would catch and use to drop this custom rule's matches for the file.
 _MAX_CUSTOM_RESOLVE_DEPTH = 250
-_custom_resolve_state = {"depth": 0}
+# Thread-local so the recursion budget is per-thread -- a module-global dict shared the budget across
+# concurrent same-process scans, letting one scan's deep resolve starve another's (DQ-R03).
+_custom_resolve_state = threading.local()
 
 
-def _resolve_string_expr(*args, **kwargs) -> Optional[str]:
+def _resolve_string_expr(*args: Any, **kwargs: Any) -> str | None:
     """Depth-guarded entry (shares the module resolve budget with
     _extract_object_string_values). Degrades to None on pathologically deep nesting instead
     of raising RecursionError."""
-    depth = _custom_resolve_state["depth"] + 1
+    depth = getattr(_custom_resolve_state, "depth", 0) + 1
     if depth > _MAX_CUSTOM_RESOLVE_DEPTH:
         return None
-    _custom_resolve_state["depth"] = depth
+    _custom_resolve_state.depth = depth
     try:
         return _resolve_string_expr_impl(*args, **kwargs)
     finally:
-        _custom_resolve_state["depth"] = depth - 1
+        _custom_resolve_state.depth = depth - 1
 
 
 def _resolve_string_expr_impl(
     node: Any,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a minimal string expression subset."""
     if not isinstance(node, dict):
         return None
@@ -2851,10 +3353,10 @@ def _resolve_object_property_expr(
     node: Any,
     path: str,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a string-valued property from an object expression or object identifier."""
     if not isinstance(node, dict) or not path:
         return None
@@ -2902,10 +3404,10 @@ def _resolve_object_expression_path(
     node: dict[str, Any],
     path: str,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a dotted property path from an object expression."""
     if not path:
         return None
@@ -2920,26 +3422,26 @@ def _resolve_object_expression_path(
     ).get(path)
 
 
-def _extract_object_string_values(*args, **kwargs) -> dict[str, str]:
+def _extract_object_string_values(*args: Any, **kwargs: Any) -> dict[str, str]:
     """Depth-guarded entry (shares the module resolve budget with _resolve_string_expr).
     Returns the partial mapping instead of raising RecursionError on deep object nesting."""
-    depth = _custom_resolve_state["depth"] + 1
+    depth = getattr(_custom_resolve_state, "depth", 0) + 1
     if depth > _MAX_CUSTOM_RESOLVE_DEPTH:
         return {}
-    _custom_resolve_state["depth"] = depth
+    _custom_resolve_state.depth = depth
     try:
         return _extract_object_string_values_impl(*args, **kwargs)
     finally:
-        _custom_resolve_state["depth"] = depth - 1
+        _custom_resolve_state.depth = depth - 1
 
 
 def _extract_object_string_values_impl(
     prefix: str,
     node: dict[str, Any],
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Flatten string-valued object properties into dotted constant paths."""
     values: dict[str, str] = {}
@@ -2992,13 +3494,17 @@ def _extract_object_string_values_impl(
                 )
             )
             continue
-        nested_values = _resolve_object_property_candidates_expr(
-            value_node,
-            constants,
-            function_returns,
-            seen=seen,
-            bindings=bindings,
-        ) if isinstance(value_node, dict) else {}
+        nested_values = (
+            _resolve_object_property_candidates_expr(
+                value_node,
+                constants,
+                function_returns,
+                seen=seen,
+                bindings=bindings,
+            )
+            if isinstance(value_node, dict)
+            else {}
+        )
         if nested_values:
             for nested_path, nested_value in nested_values.items():
                 nested_key = f"{path}.{nested_path}" if nested_path else path
@@ -3026,9 +3532,9 @@ def _extract_array_string_values(
     prefix: str,
     node: dict[str, Any],
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Flatten array string members into dotted constant-table keys."""
     values: dict[str, str] = {}
@@ -3084,8 +3590,8 @@ def _extract_array_string_values(
 def _resolve_member_lookup_path(
     node: Any,
     constants: dict[str, str],
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve computed member lookups such as CONFIGS[idx] into dotted paths."""
     if not isinstance(node, dict) or node.get("type") != "MemberExpression":
         return None
@@ -3112,8 +3618,8 @@ def _resolve_member_lookup_path(
 def _resolve_scalar_expr(
     node: Any,
     constants: dict[str, str],
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a minimal scalar value used in computed member lookups."""
     if not isinstance(node, dict):
         return None
@@ -3158,7 +3664,7 @@ def _build_function_return_table(ast: dict[str, Any]) -> dict[str, dict[str, Any
 
 def _extract_function_body_node(
     node: dict[str, Any],
-) -> tuple[str, list[dict[str, Any]], Optional[dict[str, Any]]]:
+) -> tuple[str, list[dict[str, Any]], dict[str, Any] | None]:
     """Extract a simple named helper function body."""
     node_type = node.get("type")
     if node_type == "FunctionDeclaration":
@@ -3227,7 +3733,7 @@ def _extract_object_method_bodies(
 
 def _extract_callable_body_node(
     node: dict[str, Any],
-) -> tuple[list[dict[str, Any]], Optional[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], dict[str, Any] | None]:
     """Extract params/body from a function expression or arrow function."""
     if not isinstance(node, dict):
         return [], None
@@ -3246,29 +3752,35 @@ def _extract_callable_body_node(
     return params, body_node
 
 
-def _extract_param_specs(params: list[Any]) -> Optional[list[dict[str, Any]]]:
+def _extract_param_specs(params: list[Any]) -> list[dict[str, Any]] | None:
     """Extract supported parameter names and defaults for helper resolution."""
     specs: list[dict[str, Any]] = []
     for param in params:
         if not isinstance(param, dict):
             return None
         if param.get("type") == "Identifier":
-            specs.append({
-                "name": param.get("name", ""),
-                "default": None,
-            })
+            specs.append(
+                {
+                    "name": param.get("name", ""),
+                    "default": None,
+                }
+            )
             continue
         if param.get("type") == "ObjectPattern":
-            specs.append({
-                "pattern": param,
-                "default": None,
-            })
+            specs.append(
+                {
+                    "pattern": param,
+                    "default": None,
+                }
+            )
             continue
         if param.get("type") == "ArrayPattern":
-            specs.append({
-                "pattern": param,
-                "default": None,
-            })
+            specs.append(
+                {
+                    "pattern": param,
+                    "default": None,
+                }
+            )
             continue
         if param.get("type") == "AssignmentPattern":
             left = param.get("left", {})
@@ -3276,22 +3788,28 @@ def _extract_param_specs(params: list[Any]) -> Optional[list[dict[str, Any]]]:
             if not isinstance(right, dict):
                 return None
             if left.get("type") == "Identifier":
-                specs.append({
-                    "name": left.get("name", ""),
-                    "default": right,
-                })
+                specs.append(
+                    {
+                        "name": left.get("name", ""),
+                        "default": right,
+                    }
+                )
                 continue
             if left.get("type") == "ObjectPattern":
-                specs.append({
-                    "pattern": left,
-                    "default": right,
-                })
+                specs.append(
+                    {
+                        "pattern": left,
+                        "default": right,
+                    }
+                )
                 continue
             if left.get("type") == "ArrayPattern":
-                specs.append({
-                    "pattern": left,
-                    "default": right,
-                })
+                specs.append(
+                    {
+                        "pattern": left,
+                        "default": right,
+                    }
+                )
                 continue
             return None
             continue
@@ -3299,7 +3817,7 @@ def _extract_param_specs(params: list[Any]) -> Optional[list[dict[str, Any]]]:
     return specs
 
 
-def _extract_return_expression(body_node: dict[str, Any]) -> Optional[dict[str, Any]]:
+def _extract_return_expression(body_node: dict[str, Any]) -> dict[str, Any] | None:
     """Extract the first returned expression from a block-bodied helper."""
     if body_node.get("type") != "BlockStatement":
         return None
@@ -3317,9 +3835,9 @@ def _resolve_function_call(
     arguments: list[Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a simple helper call by substituting static string arguments."""
     if not name:
         return None
@@ -3371,9 +3889,9 @@ def _resolve_function_object_property_call(
     path: str,
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a helper call that returns an object carrying a string-valued property."""
     if not name:
         return None
@@ -3426,8 +3944,8 @@ def _resolve_function_object_property_candidates_call(
     arguments: list[Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Resolve a helper call that returns an object carrying string-valued properties."""
     if not name:
@@ -3479,8 +3997,8 @@ def _bind_helper_param_spec(
     argument_node: Any,
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> bool:
     """Bind a supported helper parameter spec into local helper bindings."""
     local_bindings = bindings if bindings is not None else {}
@@ -3491,7 +4009,10 @@ def _bind_helper_param_spec(
     default_node = param_spec.get("default")
     effective_node = argument_node if isinstance(argument_node, dict) else default_node
 
-    if isinstance(pattern_node, dict) and pattern_node.get("type") in {"ObjectPattern", "ArrayPattern"}:
+    if isinstance(pattern_node, dict) and pattern_node.get("type") in {
+        "ObjectPattern",
+        "ArrayPattern",
+    }:
         if not isinstance(effective_node, dict):
             return False
         return _bind_pattern_alias_value(
@@ -3535,9 +4056,9 @@ def _resolve_block_string_body(
     body_node: dict[str, Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve straight-line block-bodied helpers with local bindings."""
     local_bindings = dict(bindings or {})
     result, did_return = _process_block_statements(
@@ -3555,9 +4076,9 @@ def _resolve_block_object_property_body(
     path: str,
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve straight-line block-bodied object-return helpers with local bindings."""
     local_bindings = dict(bindings or {})
     result, did_return = _process_block_statements(
@@ -3575,8 +4096,8 @@ def _resolve_block_object_candidates_body(
     body_node: dict[str, Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Resolve straight-line block-bodied object-return helpers into dotted property candidates."""
     local_bindings = dict(bindings or {})
@@ -3594,10 +4115,10 @@ def _process_block_statements(
     statements: list[Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    return_path: Optional[str] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> tuple[Optional[str], bool]:
+    return_path: str | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> tuple[str | None, bool]:
     """Process a conservative straight-line subset of helper block statements."""
     local_bindings = bindings if bindings is not None else {}
 
@@ -3676,8 +4197,8 @@ def _process_block_object_candidate_statements(
     statements: list[Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> tuple[dict[str, str], bool]:
     """Process a conservative straight-line helper block and return flattened object candidates."""
     local_bindings = bindings if bindings is not None else {}
@@ -3744,8 +4265,8 @@ def _bind_local_declarator(
     declarator: dict[str, Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> None:
     """Bind supported local declarations into helper-scope bindings."""
     local_bindings = bindings if bindings is not None else {}
@@ -3812,8 +4333,8 @@ def _apply_local_assignment(
     assignment: dict[str, Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> None:
     """Apply a supported local assignment into helper-scope bindings."""
     local_bindings = bindings if bindings is not None else {}
@@ -3823,7 +4344,8 @@ def _apply_local_assignment(
     target = (
         left.get("name", "")
         if left.get("type") == "Identifier"
-        else _extract_member_path(left) or _resolve_member_lookup_path(left, constants, local_bindings)
+        else _extract_member_path(left)
+        or _resolve_member_lookup_path(left, constants, local_bindings)
     )
     if not target:
         return
@@ -3875,8 +4397,8 @@ def _bind_local_object(
     node: dict[str, Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> None:
     """Flatten a local object literal into helper-scope dotted bindings."""
     local_bindings = bindings if bindings is not None else {}
@@ -3927,8 +4449,8 @@ def _bind_local_array(
     node: dict[str, Any],
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> None:
     """Flatten a local array literal into helper-scope dotted bindings."""
     local_bindings = bindings if bindings is not None else {}
@@ -3974,9 +4496,9 @@ def _resolve_local_binding_value(
     node: Any,
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Resolve a helper-scope local binding value used for straight-line blocks."""
     if not isinstance(node, dict):
         return None
@@ -3994,9 +4516,9 @@ def _resolve_local_binding_value(
 def _resolve_object_property_candidates_expr(
     node: Any,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> dict[str, str]:
     """Resolve all string-valued dotted properties from an object-like expression."""
     if not isinstance(node, dict):
@@ -4050,7 +4572,7 @@ def _resolve_object_property_candidates_expr(
     for key, value in flattened.items():
         if not isinstance(key, str) or not key.startswith(prefix) or value in {None, ""}:
             continue
-        candidates[key[len(prefix):]] = value
+        candidates[key[len(prefix) :]] = value
     return candidates
 
 
@@ -4059,8 +4581,8 @@ def _clone_local_object_binding(
     value_node: Any,
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> bool:
     """Clone flattened object-property bindings into a helper-local alias when possible."""
     if not target or not isinstance(value_node, dict):
@@ -4080,7 +4602,7 @@ def _clone_local_object_binding(
     for key, value in {**constants, **local_bindings}.items():
         if not isinstance(key, str) or not key.startswith(prefix) or value in {None, ""}:
             continue
-        suffix = key[len(source_path):]
+        suffix = key[len(source_path) :]
         local_bindings[f"{target}{suffix}"] = value
         cloned = True
     return cloned
@@ -4090,9 +4612,9 @@ def _bind_object_pattern_aliases(
     pattern: Any,
     init: Any,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> bool:
     """Bind object-destructuring aliases into constant or helper bindings."""
     local_bindings = bindings if bindings is not None else {}
@@ -4175,9 +4697,9 @@ def _bind_array_pattern_aliases(
     pattern: Any,
     init: Any,
     constants: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> bool:
     """Bind array-destructuring aliases into constant or helper bindings."""
     local_bindings = bindings if bindings is not None else {}
@@ -4227,7 +4749,7 @@ def _bind_array_pattern_aliases(
     return bound_any
 
 
-def _normalize_pattern_node(node: Any) -> Optional[dict[str, Any]]:
+def _normalize_pattern_node(node: Any) -> dict[str, Any] | None:
     """Unwrap destructuring-assignment nodes to the effective binding pattern."""
     if not isinstance(node, dict):
         return None
@@ -4237,7 +4759,7 @@ def _normalize_pattern_node(node: Any) -> Optional[dict[str, Any]]:
     return node
 
 
-def _extract_pattern_default_node(node: Any) -> Optional[dict[str, Any]]:
+def _extract_pattern_default_node(node: Any) -> dict[str, Any] | None:
     """Extract a destructuring default value when one is present."""
     if not isinstance(node, dict):
         return None
@@ -4252,8 +4774,8 @@ def _bind_pattern_alias_value(
     value_node: Any,
     constants: dict[str, str],
     function_returns: dict[str, dict[str, Any]],
-    seen: Optional[set[str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    seen: set[str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> bool:
     """Bind an identifier or nested object-pattern from a concrete AST value node."""
     local_bindings = bindings if bindings is not None else {}
@@ -4343,8 +4865,8 @@ def _bind_pattern_alias_path(
     source_path: str,
     constants: dict[str, str],
     bindings: dict[str, str],
-    function_returns: Optional[dict[str, dict[str, Any]]] = None,
-    seen: Optional[set[str]] = None,
+    function_returns: dict[str, dict[str, Any]] | None = None,
+    seen: set[str] | None = None,
 ) -> bool:
     """Bind an identifier or nested object-pattern from a flattened dotted source path."""
     default_node = _extract_pattern_default_node(pattern_node)
@@ -4425,7 +4947,7 @@ def _clone_flattened_binding_prefix(
     for key, value in merged.items():
         if not isinstance(key, str) or not key.startswith(prefix) or value in {None, ""}:
             continue
-        suffix = key[len(source_path):]
+        suffix = key[len(source_path) :]
         bindings[f"{target}{suffix}"] = value
         cloned = True
     return cloned
@@ -4434,9 +4956,9 @@ def _clone_flattened_binding_prefix(
 def _find_object_property_value(
     node: Any,
     key_name: str,
-    constants: Optional[dict[str, str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[dict[str, Any]]:
+    constants: dict[str, str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> dict[str, Any] | None:
     """Find a direct object-literal property value by key name."""
     if not isinstance(node, dict) or node.get("type") != "ObjectExpression":
         return None
@@ -4473,7 +4995,7 @@ def _extract_pattern_target_name(node: Any) -> str:
     return ""
 
 
-def _extract_property_name(node: Any) -> Optional[str]:
+def _extract_property_name(node: Any) -> str | None:
     """Extract a static property name from an object-property key node."""
     if not isinstance(node, dict):
         return None
@@ -4486,9 +5008,9 @@ def _extract_property_name(node: Any) -> Optional[str]:
 
 def _extract_property_name_with_lookup(
     prop: Any,
-    constants: Optional[dict[str, str]] = None,
-    bindings: Optional[dict[str, str]] = None,
-) -> Optional[str]:
+    constants: dict[str, str] | None = None,
+    bindings: dict[str, str] | None = None,
+) -> str | None:
     """Extract a property name, including constant-key computed object literals."""
     if not isinstance(prop, dict) or prop.get("type") != "Property":
         return None
@@ -4503,8 +5025,8 @@ def _iter_object_properties_with_path(
     node: Any,
     ast_path: str,
     prefix: str = "",
-    constants: Optional[dict[str, str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    constants: dict[str, str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> Iterator[tuple[dict[str, Any], str, str]]:
     """Yield nested object-literal properties with stable AST and property paths."""
     if not isinstance(node, dict) or node.get("type") != "ObjectExpression":
@@ -4533,8 +5055,8 @@ def _iter_object_properties_with_path(
 
 def _build_property_path_map(
     node: Any,
-    constants: Optional[dict[str, str]] = None,
-    bindings: Optional[dict[str, str]] = None,
+    constants: dict[str, str] | None = None,
+    bindings: dict[str, str] | None = None,
 ) -> dict[int, str]:
     """Build a lookup from Property node identity to its nested object-literal path."""
     paths: dict[int, str] = {}
@@ -4610,7 +5132,10 @@ def _mask_value(value: str, mask_spec: str) -> str:
         suffix = int(pattern.group(2))
         if len(value) <= prefix + suffix:
             return "*" * len(value)
-        return value[:prefix] + "*" * (len(value) - prefix - suffix) + value[-suffix:]
+        # value[-0:] is the WHOLE string, not an empty tail -- so `suffix == 0` would append the
+        # full plaintext secret after the mask. Guard it explicitly.
+        tail = value[-suffix:] if suffix else ""
+        return value[:prefix] + "*" * (len(value) - prefix - suffix) + tail
     if mask_spec == "full":
         return "*" * len(value)
     return value
@@ -4622,4 +5147,3 @@ def _offset_to_line_column(source: str, offset: int) -> tuple[int, int]:
     last_newline = source.rfind("\n", 0, offset)
     column = offset if last_newline == -1 else offset - last_newline - 1
     return line, column
-

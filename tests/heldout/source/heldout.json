@@ -1,0 +1,80 @@
+{
+  "baseline_sha256": "71e92c4250e2be14b8eb07b4629ef69b15746723a02c22ef2ef8f85121dd1796",
+  "cases": [
+    {
+      "asset_sha256": "364e4735f7b3cdf0950c2c6768ba62c309ac9766e1bb238cb464bcdebc4d4cae",
+      "case_id": "governance-confirmed-boundary",
+      "group_id": "frozen-confirmed-boundary",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "10e8f3cdf8a1cd607795fcc1fd181da97cbe45ff5295d97c974dbb6f4405633b",
+      "case_id": "governance-contract-batch-a",
+      "group_id": "frozen-contract-batch-a",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "959c8b961dbe97257abcbcecf19724f6dd6bab464424ca380f502c08d57ea29d",
+      "case_id": "governance-contract-batch-b",
+      "group_id": "frozen-contract-batch-b",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "a0ca81485dd20fef5d74d16bc8147c7eea6f946ecd4a5c1298aec84e9212e40a",
+      "case_id": "governance-contract-batch-c",
+      "group_id": "frozen-contract-batch-c",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "5cce9735ff5393de644278aec6356b752875cd6e3c3caf716a1f99152fc88b42",
+      "case_id": "governance-credential-object-a",
+      "group_id": "frozen-credential-object-a",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "c6d8adc84dc72d6e5c90cfb705316aaf06337667b0ed173d6c668574c8099b7c",
+      "case_id": "governance-credential-object-b",
+      "group_id": "frozen-credential-object-b",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "044dfdf8e0b08a290b5d01b79059b756ba2e19cb5014b0deb5f49125ce9ae442",
+      "case_id": "governance-endpoint-batch",
+      "group_id": "frozen-endpoint-batch",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "91a5a172eb6ac9c196ba48e12607933fc7af1f4859bb76d22d3de675c35b8b59",
+      "case_id": "governance-probable-a",
+      "group_id": "frozen-probable-a",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "45a14b86c1b652ded15105c4a6ec4eea3ed594e97479f0cfa514b13c7d047274",
+      "case_id": "governance-probable-b",
+      "group_id": "frozen-probable-b",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "cf8a9e131cccdd5fab6be1c3019144fc4bef8af3b590fec971ed9c2a575f1b41",
+      "case_id": "governance-surface-a",
+      "group_id": "frozen-detector-surface-a",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    },
+    {
+      "asset_sha256": "c19b91a4b737318e18d4e09a348bf71922e007dcbd593709d08ee3076f0675a7",
+      "case_id": "governance-surface-b",
+      "group_id": "frozen-detector-surface-b",
+      "vendor_family_id": "bundleinspector-frozen-governance-v1"
+    }
+  ],
+  "gates_sha256": "811a509890936629c4a78003a9d5397bb103f3dfb23ac1243a94e26feebaed15",
+  "held_out_case_count": 11,
+  "public_case_count": 45,
+  "public_partition_sha256": "f6fe113a803f21edb4754090a9f2f2754451e8ec4cef239d4bef3ea423c7194c",
+  "public_snapshot_sha256": "f7773c960625aaed1f6c4acd4c4fb3a0026d334af684ece50c9e0cc3b6c03db2",
+  "schema_version": 2,
+  "source_clone_policy_version": 1,
+  "split": "held-out",
+  "target_fraction": 0.2
+}

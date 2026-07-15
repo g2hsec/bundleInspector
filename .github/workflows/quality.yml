@@ -1,0 +1,467 @@
+name: Quality
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  schedule:
+    - cron: "17 3 * * 1"
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      run_heldout_governance:
+        description: Run the frozen governance release gate
+        required: false
+        default: false
+        type: boolean
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quality-${{ github.event_name }}-${{ github.ref }}
+  cancel-in-progress: >-
+    ${{ github.event_name == 'push' || github.event_name == 'pull_request' }}
+
+jobs:
+  tests:
+    name: Tests (Python ${{ matrix.python-version }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12", "3.13"]
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade "pip==26.1.2"
+          python -m pip install -c benchmarks/packaging-constraints.txt -e ".[dev,mcp]"
+          python -m pip check
+      - name: Run full test suite
+        run: python -m pytest -q -p no:cacheprovider --tb=short
+
+  windows-tests:
+    name: Windows filesystem and full regression suite
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install project and test dependencies
+        run: |
+          python -m pip install --upgrade "pip==26.1.2"
+          python -m pip install -c benchmarks/packaging-constraints.txt -e ".[dev,mcp]"
+          python -m pip check
+      - name: Run Windows full test suite
+        run: python -m pytest -q -p no:cacheprovider --tb=short
+      - name: Build and smoke-test the installed Windows wheel
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $dist = Join-Path $env:RUNNER_TEMP "bundleinspector-windows-dist"
+          $venv = Join-Path $env:RUNNER_TEMP "bundleinspector-windows-wheel"
+          python -m build --wheel --outdir $dist
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $wheels = @(Get-ChildItem -LiteralPath $dist -Filter "*.whl" -File)
+          if ($wheels.Count -ne 1) { throw "expected exactly one Windows wheel" }
+          $wheel = $wheels[0]
+          python -m venv $venv
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $wheelPython = Join-Path $venv "Scripts/python.exe"
+          $bundleCli = Join-Path $venv "Scripts/bundleInspector.exe"
+          $mcpCli = Join-Path $venv "Scripts/bundleInspector-mcp.exe"
+          & $wheelPython -m pip install --upgrade "pip==26.1.2"
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $wheelSpec = "$($wheel.FullName)[mcp]"
+          & $wheelPython -m pip install $wheelSpec
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $wheelPython -m pip check
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          if (-not (Test-Path -LiteralPath $bundleCli -PathType Leaf)) {
+            throw "installed bundleInspector.exe is missing"
+          }
+          if (-not (Test-Path -LiteralPath $mcpCli -PathType Leaf)) {
+            throw "installed bundleInspector-mcp.exe is missing"
+          }
+          & $bundleCli version
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $wheelPython -c 'from importlib.resources import files; assert files("bundleInspector.parser").joinpath("acorn_parse.js").is_file(); assert files("bundleInspector").joinpath("py.typed").is_file()'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          & $wheelPython -c 'from bundleInspector.parser.js_parser import parse_js; r=parse_js("const view: JSX.Element = <div />", language_hint="tsx"); assert r.success and not r.partial and r.parser_used == "tree-sitter-tsx"'
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          $env:MCP_ENTRYPOINT = $mcpCli
+          @'
+          import asyncio
+          import hashlib
+          import json
+          import os
+          import tempfile
+          from pathlib import Path
+
+          from mcp import ClientSession
+          from mcp.client.stdio import StdioServerParameters, stdio_client
+          from mcp.shared.exceptions import McpError
+
+          from bundleInspector.storage.finding_store import FindingStore
+          from bundleInspector.storage.job_repository import JobRepository
+          from bundleInspector.storage.models import (
+              AnalysisCompleteness,
+              CompletenessIssue,
+              CompletenessStatus,
+              Report,
+          )
+
+          def tree_hash(root: Path) -> str:
+              digest = hashlib.sha256()
+              for path in sorted(item for item in root.rglob("*") if item.is_file()):
+                  digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+                  digest.update(b"\0")
+                  digest.update(path.read_bytes())
+                  digest.update(b"\0")
+              return digest.hexdigest()
+
+          async def smoke() -> None:
+              with tempfile.TemporaryDirectory() as work_dir:
+                  work_path = Path(work_dir)
+                  cache_path = work_path / "cache"
+                  cache_path.mkdir()
+                  stderr_path = work_path / "mcp-stderr.log"
+                  repository = JobRepository(cache_path)
+                  repository.register_owner("wheel-job-1", "local")
+                  report = Report(
+                      id="wheel-report-1",
+                      job_id="wheel-job-1",
+                      seed_urls=[
+                          "https://example.invalid/private.js?token=WHEEL_PRIVATE_CANARY"
+                      ],
+                      completeness=AnalysisCompleteness(
+                          status=CompletenessStatus.PARTIAL,
+                          issues=[CompletenessIssue(
+                              code="WHEEL_PRIVATE_CODE_CANARY",
+                              stage="WHEEL_PRIVATE_STAGE_CANARY",
+                              message="WHEEL_PRIVATE_MESSAGE_CANARY",
+                          )],
+                      ),
+                  )
+                  await FindingStore(cache_path / "wheel-job-1").store_report(report)
+                  _ = repository.public_signing_key
+                  before = tree_hash(cache_path)
+                  params = StdioServerParameters(
+                      command=os.environ["MCP_ENTRYPOINT"],
+                      args=["--cache-dir", str(cache_path)],
+                  )
+                  with stderr_path.open("w", encoding="utf-8") as errlog:
+                      async with stdio_client(params, errlog=errlog) as streams:
+                          async with ClientSession(*streams) as client:
+                              await client.initialize()
+                              tools = await client.list_tools()
+                              names = {tool.name for tool in tools.tools}
+                              assert names == {
+                                  "list_jobs",
+                                  "get_report_page",
+                                  "get_job_status",
+                              }, names
+                              listed = await client.call_tool("list_jobs", {"limit": 10})
+                              assert not listed.isError
+                              listed_payload = json.loads("".join(
+                                  item.text
+                                  for item in listed.content
+                                  if hasattr(item, "text")
+                              ))
+                              public_job_id = listed_payload["jobs"][0]["job_id"]
+                              assert public_job_id != "wheel-job-1"
+                              templates = await client.list_resource_templates()
+                              assert len(templates.resourceTemplates) == 1
+                              template = templates.resourceTemplates[0]
+                              assert template.uriTemplate == "bundleinspector://jobs/{job_id}"
+                              assert template.mimeType == "application/json"
+                              resource = await client.read_resource(
+                                  f"bundleinspector://jobs/{public_job_id}"
+                              )
+                              assert len(resource.contents) == 1
+                              content = resource.contents[0]
+                              assert hasattr(content, "text")
+                              assert content.mimeType == "application/json"
+                              payload = json.loads(content.text)
+                              assert payload["job_id"] == public_job_id
+                              encoded = json.dumps(payload, sort_keys=True)
+                              assert "wheel-job-1" not in encoded
+                              assert "wheel-report-1" not in encoded
+                              assert "WHEEL_PRIVATE_" not in encoded
+                              try:
+                                  await client.read_resource(
+                                      "bundleinspector://jobs/wheel-job-1"
+                                  )
+                              except McpError as error:
+                                  assert "wheel-job-1" not in str(error)
+                              else:
+                                  raise AssertionError("raw job ID resource was accepted")
+                  stderr = stderr_path.read_text(encoding="utf-8")
+                  assert "wheel-job-1" not in stderr
+                  assert "wheel-report-1" not in stderr
+                  assert "WHEEL_PRIVATE_" not in stderr
+                  assert tree_hash(cache_path) == before
+
+          asyncio.run(asyncio.wait_for(smoke(), timeout=30))
+          '@ | & $wheelPython -
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+  quality:
+    name: Static, metrics, coverage, package
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install project and quality dependencies
+        run: |
+          python -m pip install --upgrade "pip==26.1.2"
+          python -m pip install -c benchmarks/packaging-constraints.txt -e ".[dev,mcp]"
+          python -m pip check
+      - name: Lint
+        run: python -m ruff check --no-cache src tests scripts
+      - name: Type check
+        run: python -m mypy --no-incremental src/bundleInspector
+      - name: Detection quality gates
+        run: >-
+          python scripts/run_detection_metrics.py --corpus tests/corpus
+          --fail-on-regression
+      - name: Branch coverage
+        run: >-
+          python -m pytest -q -p no:cacheprovider --tb=short
+          --cov=bundleInspector --cov-branch --cov-report=term-missing
+          --cov-fail-under=80
+      - name: Build wheel and source distribution
+        run: python -m build
+      - name: Verify distribution metadata and exact contents
+        shell: bash
+        run: |
+          python scripts/update_distribution_manifest.py --check
+          wheel="$(printf '%s\n' dist/*.whl)"
+          sdist="$(printf '%s\n' dist/*.tar.gz)"
+          python scripts/verify_distribution_contents.py \
+            --manifest packaging/distribution-manifest.json \
+            --wheel "$wheel" \
+            --sdist "$sdist"
+          python -m twine check dist/*
+          check-wheel-contents dist/*.whl
+      - name: Verify wheel in an isolated environment
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/bundleinspector-wheel"
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -m pip install --upgrade "pip==26.1.2"
+          wheel="$(printf '%s\n' dist/*.whl)"
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -m pip install "$wheel"
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -m pip check
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/bundleInspector" version
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -c 'from importlib.resources import files; assert files("bundleInspector.parser").joinpath("acorn_parse.js").is_file(); assert files("bundleInspector").joinpath("py.typed").is_file()'
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -c 'from bundleInspector.parser.js_parser import parse_js; r=parse_js("const view: JSX.Element = <div />", language_hint="tsx"); assert r.success and not r.partial and r.parser_used == "tree-sitter-tsx"'
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -m pip install "${wheel}[mcp]"
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -m pip check
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" -m playwright install --with-deps chromium
+          "$RUNNER_TEMP/bundleinspector-wheel/bin/python" - <<'PY'
+          import asyncio
+          from playwright.async_api import async_playwright
+
+          async def smoke() -> None:
+              async with async_playwright() as playwright:
+                  browser = await playwright.chromium.launch(headless=True)
+                  page = await browser.new_page()
+                  await page.set_content("<title>bundleInspector wheel smoke</title>")
+                  assert await page.title() == "bundleInspector wheel smoke"
+                  await browser.close()
+
+          asyncio.run(asyncio.wait_for(smoke(), timeout=30))
+          PY
+          MCP_ENTRYPOINT="$RUNNER_TEMP/bundleinspector-wheel/bin/bundleInspector-mcp" \
+            "$RUNNER_TEMP/bundleinspector-wheel/bin/python" - <<'PY'
+          import asyncio
+          import hashlib
+          import json
+          import os
+          import tempfile
+          from pathlib import Path
+
+          from mcp import ClientSession
+          from mcp.client.stdio import StdioServerParameters, stdio_client
+          from mcp.shared.exceptions import McpError
+
+          from bundleInspector.storage.finding_store import FindingStore
+          from bundleInspector.storage.job_repository import JobRepository
+          from bundleInspector.storage.models import (
+              AnalysisCompleteness,
+              CompletenessIssue,
+              CompletenessStatus,
+              Report,
+          )
+
+          def tree_hash(root: Path) -> str:
+              digest = hashlib.sha256()
+              for path in sorted(item for item in root.rglob("*") if item.is_file()):
+                  digest.update(path.relative_to(root).as_posix().encode("utf-8"))
+                  digest.update(b"\0")
+                  digest.update(path.read_bytes())
+                  digest.update(b"\0")
+              return digest.hexdigest()
+
+          async def smoke() -> None:
+              with tempfile.TemporaryDirectory() as work_dir:
+                  work_path = Path(work_dir)
+                  cache_path = work_path / "cache"
+                  cache_path.mkdir()
+                  stderr_path = work_path / "mcp-stderr.log"
+                  repository = JobRepository(cache_path)
+                  repository.register_owner("wheel-job-1", "local")
+                  report = Report(
+                      id="wheel-report-1",
+                      job_id="wheel-job-1",
+                      seed_urls=[
+                          "https://example.invalid/private.js?token=WHEEL_PRIVATE_CANARY"
+                      ],
+                      completeness=AnalysisCompleteness(
+                          status=CompletenessStatus.PARTIAL,
+                          issues=[CompletenessIssue(
+                              code="WHEEL_PRIVATE_CODE_CANARY",
+                              stage="WHEEL_PRIVATE_STAGE_CANARY",
+                              message="WHEEL_PRIVATE_MESSAGE_CANARY",
+                          )],
+                      ),
+                  )
+                  await FindingStore(cache_path / "wheel-job-1").store_report(report)
+                  _ = repository.public_signing_key
+                  before = tree_hash(cache_path)
+                  params = StdioServerParameters(
+                      command=os.environ["MCP_ENTRYPOINT"],
+                      args=["--cache-dir", str(cache_path)],
+                  )
+                  errlog = stderr_path.open("w", encoding="utf-8")
+                  async with stdio_client(params, errlog=errlog) as streams:
+                      async with ClientSession(*streams) as client:
+                          await client.initialize()
+                          tools = await client.list_tools()
+                          names = {tool.name for tool in tools.tools}
+                          assert names == {
+                              "list_jobs",
+                              "get_report_page",
+                              "get_job_status",
+                          }, names
+                          listed = await client.call_tool("list_jobs", {"limit": 10})
+                          assert not listed.isError
+                          listed_payload = json.loads(
+                              "".join(
+                                  item.text
+                                  for item in listed.content
+                                  if hasattr(item, "text")
+                              )
+                          )
+                          public_job_id = listed_payload["jobs"][0]["job_id"]
+                          assert public_job_id != "wheel-job-1"
+                          templates = await client.list_resource_templates()
+                          assert len(templates.resourceTemplates) == 1
+                          template = templates.resourceTemplates[0]
+                          assert template.uriTemplate == "bundleinspector://jobs/{job_id}"
+                          assert template.mimeType == "application/json"
+                          resource = await client.read_resource(
+                              f"bundleinspector://jobs/{public_job_id}"
+                          )
+                          assert len(resource.contents) == 1
+                          content = resource.contents[0]
+                          assert hasattr(content, "text")
+                          assert content.mimeType == "application/json"
+                          payload = json.loads(content.text)
+                          assert payload["job_id"] == public_job_id
+                          encoded = json.dumps(payload, sort_keys=True)
+                          assert "wheel-job-1" not in encoded
+                          assert "wheel-report-1" not in encoded
+                          assert "WHEEL_PRIVATE_" not in encoded
+                          try:
+                              await client.read_resource(
+                                  "bundleinspector://jobs/wheel-job-1"
+                              )
+                          except McpError as error:
+                              assert "wheel-job-1" not in str(error)
+                          else:
+                              raise AssertionError("raw job ID resource was accepted")
+                  errlog.close()
+                  stderr = stderr_path.read_text(encoding="utf-8")
+                  assert "wheel-job-1" not in stderr
+                  assert "wheel-report-1" not in stderr
+                  assert "WHEEL_PRIVATE_" not in stderr
+                  assert tree_hash(cache_path) == before
+
+          async def bounded_smoke() -> None:
+              await asyncio.wait_for(smoke(), timeout=30)
+
+          asyncio.run(bounded_smoke())
+          PY
+
+  heldout-governance:
+    name: Frozen held-out governance release gate
+    if: >-
+      (github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')) ||
+      github.event_name == 'schedule' || github.event_name == 'release' ||
+      (github.event_name == 'workflow_dispatch' && inputs.run_heldout_governance)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install frozen gate runtime
+        run: |
+          python -m pip install --upgrade "pip==26.1.2"
+          python -m pip install -c benchmarks/packaging-constraints.txt -e ".[dev]"
+          python -m pip check
+      - name: Run committed frozen governance artifact
+        run: python scripts/run_heldout_detection_gate.py run
+
+  performance:
+    name: Performance and completeness release gates
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.13"
+          cache: pip
+      - name: Install project
+        env:
+          BUNDLEINSPECTOR_BENCHMARK_ORIGIN: github-hosted
+        run: |
+          python -m pip install --upgrade "pip==26.1.2"
+          python -m pip install \
+            -c benchmarks/packaging-constraints.txt \
+            -c benchmarks/performance-constraints.txt \
+            -e ".[dev]"
+          python -m pip check
+      - name: Run fixed 30-sample release scenarios
+        env:
+          BUNDLEINSPECTOR_BENCHMARK_ORIGIN: github-hosted
+        run: >-
+          python scripts/benchmark_correlator.py
+          --suite --runs 30 --warmups 2 --assert-gates
+          --baseline benchmarks/baselines/correlator.json
+      - name: Run detection resource release gates
+        env:
+          BUNDLEINSPECTOR_BENCHMARK_ORIGIN: github-hosted
+        run: >-
+          python scripts/benchmark_detection.py
+          --runs 30 --warmups 2 --assert-gates
+          --baseline benchmarks/baselines/detection.json

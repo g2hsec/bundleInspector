@@ -4,13 +4,22 @@ Secret-like values in this module are fake samples used to verify masking and
 must not be treated as live credentials.
 """
 
+import hashlib
 import json
+import os
 import re
+from pathlib import Path
 
+import pytest
+
+from bundleInspector.cli import _build_reporter
+from bundleInspector.config import AuthConfig, Config, RuleConfig
 from bundleInspector.reporter.html_reporter import HTMLReporter
 from bundleInspector.reporter.json_reporter import JSONReporter
+from bundleInspector.reporter.redaction import sanitize_report_copy
 from bundleInspector.reporter.sarif_reporter import SARIFReporter
 from bundleInspector.reporter.wordlist_reporter import WordlistReporter
+from bundleInspector.storage.atomic import UnsafePathError
 from bundleInspector.storage.models import (
     Category,
     Confidence,
@@ -20,6 +29,107 @@ from bundleInspector.storage.models import (
     Report,
     Severity,
 )
+
+
+async def test_default_report_path_hashes_nonportable_ids_without_traversal(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    report = Report(id="../../escaped-report")
+    expected_token = hashlib.sha256(report.id.encode("utf-8")).hexdigest()
+    monkeypatch.chdir(tmp_path)
+
+    output_path = await JSONReporter().write(report)
+
+    assert output_path == Path(f"bundleInspector_report_{expected_token}.json")
+    assert output_path.resolve().parent == tmp_path.resolve()
+    assert output_path.is_file()
+    assert not (tmp_path.parent / "escaped-report.json").exists()
+
+
+async def test_default_report_path_hashes_case_aliases_and_windows_device_names(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    for identifier in ("Mixed-Case", "con", "nul.txt"):
+        expected_token = hashlib.sha256(identifier.encode("utf-8")).hexdigest()
+        assert len(expected_token) == 64
+        output_path = await JSONReporter().write(Report(id=identifier))
+        assert output_path.name == f"bundleInspector_report_{expected_token}.json"
+        assert output_path.resolve().parent == tmp_path.resolve()
+
+
+async def test_default_report_path_preserves_full_portable_id(tmp_path: Path, monkeypatch) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    output_path = await JSONReporter().write(Report(id="report-123456"))
+
+    assert output_path == Path("bundleInspector_report_report-123456.json")
+    assert not list(tmp_path.glob(".bundleinspector-lock-*"))
+    assert not list(tmp_path.glob("*.tmp"))
+
+
+async def test_default_report_paths_do_not_collide_on_a_shared_eight_character_prefix(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    first = Report(id="report-123456")
+    second = Report(id="report-198765")
+    assert first.id[:8] == second.id[:8]
+
+    first_path = await JSONReporter().write(first)
+    second_path = await JSONReporter().write(second)
+
+    assert first_path != second_path
+    assert json.loads(first_path.read_text(encoding="utf-8"))["id"] == first.id
+    assert json.loads(second_path.read_text(encoding="utf-8"))["id"] == second.id
+
+
+async def test_explicit_report_path_is_unchanged_for_nonportable_report_id(
+    tmp_path: Path,
+) -> None:
+    explicit_path = tmp_path / "chosen" / "report.json"
+
+    output_path = await JSONReporter().write(
+        Report(id="../../nonportable"),
+        output_path=explicit_path,
+    )
+
+    assert output_path == explicit_path
+    assert explicit_path.is_file()
+
+
+async def test_explicit_report_path_rejects_a_symbolic_link_destination(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside", encoding="utf-8")
+    destination = tmp_path / "report.json"
+    try:
+        destination.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symbolic links are unavailable: {exc}")
+
+    with pytest.raises(UnsafePathError):
+        await JSONReporter().write(Report(id="safe-report"), output_path=destination)
+
+    assert outside.read_text(encoding="utf-8") == "outside"
+
+
+async def test_explicit_report_path_rejects_a_hard_link_destination(tmp_path: Path) -> None:
+    outside = tmp_path / "outside.json"
+    outside.write_text("outside", encoding="utf-8")
+    destination = tmp_path / "report.json"
+    try:
+        os.link(outside, destination)
+    except OSError as exc:
+        pytest.skip(f"hard links are unavailable: {exc}")
+
+    with pytest.raises(UnsafePathError):
+        await JSONReporter().write(Report(id="safe-report"), output_path=destination)
+
+    assert outside.read_text(encoding="utf-8") == "outside"
 
 
 def test_json_reporter_masks_secret_metadata_fields():
@@ -59,6 +169,292 @@ def test_json_reporter_masks_secret_metadata_fields():
     assert finding_data["extracted_value"] == finding.masked_value
     assert finding_data["metadata"]["extracted_fields"]["secret_value"] == "Bearer**************************3456"
     assert secret not in json.dumps(finding_data)
+
+
+def test_zero_visible_chars_masks_entire_secret_in_all_reporters() -> None:
+    secret = "ZERO_VISIBLE_SECRET_0123456789"
+    finding = Finding(
+        rule_id="zero-visible-secret",
+        category=Category.SECRET,
+        severity=Severity.HIGH,
+        confidence=Confidence.HIGH,
+        title="Zero visible secret",
+        evidence=Evidence(
+            file_url="file:///bundle.js",
+            file_hash="hash-zero-visible",
+            line=1,
+            column=0,
+            snippet=f'const token = "{secret}";',
+        ),
+        extracted_value=secret,
+        value_type="secret_value",
+    )
+
+    masked_finding = finding.model_copy(deep=True)
+    assert masked_finding.mask_value(0) == "*" * len(secret)
+
+    reporters = (
+        JSONReporter(secret_visible_chars=0),
+        HTMLReporter(secret_visible_chars=0),
+        SARIFReporter(secret_visible_chars=0),
+    )
+    for reporter in reporters:
+        report = Report(findings=[finding.model_copy(deep=True)])
+        rendered = reporter.generate(report)
+        assert secret not in rendered
+        assert "*" * len(secret) in rendered
+
+
+@pytest.mark.parametrize(
+    "reporter",
+    (
+        JSONReporter(secret_visible_chars=2),
+        HTMLReporter(secret_visible_chars=2),
+        SARIFReporter(secret_visible_chars=2),
+    ),
+    ids=("json", "html", "sarif"),
+)
+def test_reporters_override_precomputed_mask_without_mutating_input(reporter) -> None:
+    secret = "PREMASKED_REPORTER_SECRET_0123456789"
+    finding = Finding(
+        rule_id="pre-masked-secret",
+        category=Category.SECRET,
+        severity=Severity.HIGH,
+        confidence=Confidence.HIGH,
+        title="Pre-masked secret",
+        evidence=Evidence(
+            file_url="file:///bundle.js",
+            file_hash="hash-pre-masked",
+            line=1,
+            snippet=f'const token = "{secret}";',
+        ),
+        extracted_value=secret,
+    )
+    old_mask = finding.mask_value(4)
+    expected = secret[:2] + "*" * (len(secret) - 4) + secret[-2:]
+    report = Report(findings=[finding])
+    before = report.model_dump(mode="python")
+
+    rendered = reporter.generate(report)
+
+    assert secret not in rendered
+    assert expected in rendered
+    assert old_mask not in rendered
+    assert report.model_dump(mode="python") == before
+
+
+@pytest.mark.parametrize(
+    "reporter",
+    (
+        JSONReporter(mask_secrets=False),
+        HTMLReporter(mask_secrets=False),
+        SARIFReporter(mask_secrets=False),
+    ),
+    ids=("json", "html", "sarif"),
+)
+def test_mask_off_reporters_do_not_mutate_input(reporter) -> None:
+    secret = "MASK_OFF_PRIVATE_SECRET_0123456789"
+    finding = Finding(
+        rule_id="mask-off-secret",
+        category=Category.SECRET,
+        severity=Severity.HIGH,
+        confidence=Confidence.HIGH,
+        title="Mask-off secret",
+        evidence=Evidence(
+            file_url="file:///bundle.js",
+            file_hash="h",
+            line=1,
+            snippet=f'const token = "{secret}";',
+        ),
+        extracted_value=secret,
+    )
+    report = Report(findings=[finding])
+    before = report.model_dump(mode="python")
+
+    reporter.generate(report)
+
+    assert report.model_dump(mode="python") == before
+
+
+@pytest.mark.parametrize(
+    "reporter",
+    (
+        JSONReporter(secret_visible_chars=0),
+        HTMLReporter(secret_visible_chars=0),
+        SARIFReporter(secret_visible_chars=0),
+    ),
+    ids=("json", "html", "sarif"),
+)
+def test_zero_visible_chars_fully_masks_custom_rule_metadata(reporter) -> None:
+    secret = "LEAKPX_PRIVATE_SECRET_9X7Q"
+    explicit_mask = "LEAKPX" + "*" * (len(secret) - 10) + "9X7Q"
+    finding = Finding(
+        rule_id="metadata-secret",
+        category=Category.SECRET,
+        severity=Severity.HIGH,
+        confidence=Confidence.HIGH,
+        title="Metadata secret",
+        evidence=Evidence(
+            file_url="file:///bundle.js",
+            file_hash="h",
+            line=1,
+            snippet=f'const token = "{secret}";',
+        ),
+        extracted_value=secret,
+        metadata={
+            "extracted_fields": {"secret_value": secret},
+            "masked_fields": {"secret_value": explicit_mask},
+        },
+    )
+    finding.mask_value(4)
+
+    rendered = reporter.generate(Report(findings=[finding]))
+
+    assert secret not in rendered
+    assert explicit_mask not in rendered
+    assert "LEAKPX" not in rendered
+    assert "9X7Q" not in rendered
+    assert "*" * len(secret) in rendered
+
+
+def test_storage_sanitization_preserves_existing_mask_by_default() -> None:
+    secret = "STORAGE_ZERO_VISIBLE_SECRET_012345"
+    finding = Finding(
+        rule_id="stored-secret",
+        category=Category.SECRET,
+        severity=Severity.HIGH,
+        confidence=Confidence.HIGH,
+        title="Stored secret",
+        evidence=Evidence(file_url="file:///bundle.js", file_hash="h", line=1),
+        extracted_value=secret,
+    )
+    stored_mask = finding.mask_value(0)
+
+    sanitized = sanitize_report_copy(Report(findings=[finding]))
+
+    assert sanitized.findings[0].extracted_value == stored_mask
+    assert sanitized.findings[0].masked_value == stored_mask
+
+
+def test_json_reporter_honors_non_default_visible_chars() -> None:
+    secret = "CONFIGURED_VISIBLE_SECRET_0123456789"
+    finding = Finding(
+        rule_id="configured-visible-secret",
+        category=Category.SECRET,
+        severity=Severity.HIGH,
+        confidence=Confidence.HIGH,
+        title="Configured visible secret",
+        evidence=Evidence(
+            file_url="file:///bundle.js",
+            file_hash="hash-configured-visible",
+            line=1,
+            column=0,
+            snippet=f'const token = "{secret}";',
+        ),
+        extracted_value=secret,
+        value_type="secret_value",
+    )
+
+    rendered = json.loads(
+        JSONReporter(secret_visible_chars=2).generate(Report(findings=[finding]))
+    )
+
+    assert rendered["findings"][0]["extracted_value"] == (
+        secret[:2] + "*" * (len(secret) - 4) + secret[-2:]
+    )
+    assert secret not in json.dumps(rendered)
+
+
+def test_html_reporter_honors_non_default_visible_chars() -> None:
+    secret = "HTML_VISIBLE_SECRET_0123456789"
+    finding = Finding(
+        rule_id="html-visible-secret",
+        category=Category.SECRET,
+        severity=Severity.HIGH,
+        confidence=Confidence.HIGH,
+        title="HTML configured visible secret",
+        evidence=Evidence(
+            file_url="file:///bundle.js",
+            file_hash="hash-html-visible",
+            line=1,
+            column=0,
+            snippet=f'const token = "{secret}";',
+        ),
+        extracted_value=secret,
+        value_type="secret_value",
+    )
+    expected = secret[:2] + "*" * (len(secret) - 4) + secret[-2:]
+
+    rendered = HTMLReporter(secret_visible_chars=2).generate(
+        Report(findings=[finding])
+    )
+
+    assert expected in rendered
+    assert secret not in rendered
+
+
+def test_cli_json_reporter_receives_secret_visible_chars() -> None:
+    reporter = _build_reporter(Config(rules=RuleConfig(secret_visible_chars=0)))
+
+    assert isinstance(reporter, JSONReporter)
+    assert reporter.secret_visible_chars == 0
+
+
+@pytest.mark.parametrize(
+    "cookies",
+    (
+        {"bad\rname": "value"},
+        {"session": "bad\nvalue"},
+        {"session": "bad\x00value"},
+    ),
+)
+def test_auth_config_rejects_cookie_control_characters(cookies: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="Invalid characters in cookie"):
+        AuthConfig(cookies=cookies)
+
+
+@pytest.mark.parametrize("cookies", ({"": "value"}, {"   ": "value"}))
+def test_auth_config_rejects_empty_cookie_names(cookies: dict[str, str]) -> None:
+    with pytest.raises(ValueError, match="Empty cookie name"):
+        AuthConfig(cookies=cookies)
+
+
+def test_auth_config_invalid_assignment_rolls_back_every_auth_field() -> None:
+    auth = AuthConfig(
+        cookies={"session": "valid"},
+        headers={"X-Test": "valid"},
+        bearer_token="valid-token",
+        basic_auth=("valid-user", "valid-password"),
+    )
+    invalid_assignments = (
+        ("cookies", {"bad\nname": "value"}),
+        ("headers", {"X-Test": "bad\rvalue"}),
+        ("bearer_token", "bad\x00token"),
+        ("basic_auth", ("valid-user", "bad\npassword")),
+    )
+
+    for field_name, invalid_value in invalid_assignments:
+        before = auth.model_dump(mode="python")
+        with pytest.raises(ValueError):
+            setattr(auth, field_name, invalid_value)
+        assert auth.model_dump(mode="python") == before
+
+
+def test_auth_config_revalidates_in_place_mapping_mutation_before_transport() -> None:
+    cookie_auth = AuthConfig(cookies={"session": "valid"})
+    cookie_auth.cookies["bad\nname"] = "value"
+    with pytest.raises(ValueError, match="Invalid characters in cookie"):
+        cookie_auth.get_auth_headers()
+
+    header_auth = AuthConfig(headers={"X-Test": "valid"})
+    header_auth.headers["X-Test"] = "bad\rvalue"
+    with pytest.raises(ValueError, match="Invalid characters in header"):
+        header_auth.get_auth_headers()
+
+    valid_auth = AuthConfig()
+    valid_auth.cookies["session"] = "valid"
+    valid_auth.headers["X-Test"] = "valid"
+    assert valid_auth.get_auth_headers() == {"X-Test": "valid"}
 
 
 def test_sarif_reporter_prefers_original_source_location():
@@ -134,6 +530,50 @@ def test_sarif_reporter_ignores_non_positive_original_lines():
 
     assert location["region"]["startLine"] == 40
     assert flow_location["region"]["startLine"] == 40
+
+
+def test_sarif_reporter_defines_every_mapped_rule_id():
+    """Every ruleId that _get_rule_id can emit MUST be defined in tool.driver.rules -- otherwise the
+    SARIF references an undefined rule and GitHub Code Scanning drops the result. Guards the whole
+    category->id map (not just SINK/UPLOAD) so this class of gap cannot be reintroduced."""
+    reporter = SARIFReporter()
+    defined_ids = {r["id"] for r in reporter._generate_rules()}
+    for category in Category:
+        stub = Finding(
+            rule_id="x", category=category, severity=Severity.HIGH,
+            confidence=Confidence.HIGH, title="t",
+            evidence=Evidence(file_url="f", file_hash="h", line=1),
+            extracted_value="x",
+        )
+        rid = reporter._get_rule_id(stub)
+        assert rid in defined_ids, f"category {category} -> ruleId {rid} has no rule definition"
+
+
+def test_sarif_reporter_defines_sink_and_upload_rules():
+    """SINK (DOM-XSS) and UPLOAD findings -- the highest-value results -- must serialize to VALID
+    SARIF: their ruleId resolves to a defined rule with the expected level and CWE tag."""
+    sink = Finding(
+        rule_id="taint", category=Category.SINK, severity=Severity.HIGH,
+        confidence=Confidence.HIGH, title="Confirmed DOM-XSS",
+        evidence=Evidence(file_url="https://x/app.js", file_hash="h", line=10),
+        extracted_value=".html()", value_type="taint_flow",
+    )
+    upload = Finding(
+        rule_id="upload-detector", category=Category.UPLOAD, severity=Severity.MEDIUM,
+        confidence=Confidence.MEDIUM, title="Client-side upload validation",
+        evidence=Evidence(file_url="https://x/app.js", file_hash="h", line=20),
+        extracted_value="allowedExt", value_type="client_side_file_validation",
+    )
+    sarif = json.loads(SARIFReporter().generate(Report(findings=[sink, upload])))
+    rules = {r["id"]: r for r in sarif["runs"][0]["tool"]["driver"]["rules"]}
+    result_ids = {res["ruleId"] for res in sarif["runs"][0]["results"]}
+
+    assert result_ids == {"JSFINDER006", "JSFINDER007"}
+    assert result_ids <= set(rules)  # every referenced rule is defined
+    assert rules["JSFINDER006"]["defaultConfiguration"]["level"] == "error"
+    assert "CWE-79" in rules["JSFINDER006"]["properties"]["tags"]
+    assert rules["JSFINDER007"]["defaultConfiguration"]["level"] == "warning"
+    assert "CWE-434" in rules["JSFINDER007"]["properties"]["tags"]
 
 
 def test_json_reporter_prefers_original_source_location():
@@ -522,3 +962,58 @@ def test_wordlist_reporter_params_only_uses_endpoint_snippets():
     assert "userId" not in params
     assert "accountId" not in params
 
+
+def test_json_reporter_masks_secret_in_colocated_nonsecret_finding():
+    """A secret that appears verbatim in a NON-secret finding's evidence snippet must also be
+    redacted -- masking was category-scoped and leaked the secret via co-located endpoint findings."""
+    secret = "sk_live_0123456789abcdefghij0123"
+    secret_f = Finding(
+        rule_id="secret-detector", category=Category.SECRET, severity=Severity.HIGH,
+        confidence=Confidence.HIGH, title="Secret",
+        evidence=Evidence(file_url="f", file_hash="h", line=1, snippet=f'k = "{secret}"'),
+        extracted_value=secret, value_type="secret_value",
+    )
+    endpoint_f = Finding(
+        rule_id="endpoint-detector", category=Category.ENDPOINT, severity=Severity.MEDIUM,
+        confidence=Confidence.HIGH, title="Endpoint",
+        evidence=Evidence(file_url="f", file_hash="h", line=2,
+                          snippet=f'fetch("/api/data", {{headers: {{Authorization: "Bearer {secret}"}}}})'),
+        extracted_value="/api/data",
+    )
+    out = JSONReporter().generate(Report(findings=[secret_f, endpoint_f]))
+    assert secret not in out
+
+
+def test_mask_secret_findings_redacts_colocated_nonsecret_finding():
+    """base.mask_secret_findings (used by HTML/SARIF) must redact the secret from a co-located
+    non-secret finding's snippet, not only the SECRET finding's own."""
+    from bundleInspector.reporter.base import mask_secret_findings
+    secret = "sk_live_0123456789abcdefghij0123"
+    secret_f = Finding(
+        rule_id="s", category=Category.SECRET, severity=Severity.HIGH, confidence=Confidence.HIGH,
+        title="Secret", evidence=Evidence(file_url="f", file_hash="h", line=1, snippet=f'k="{secret}"'),
+        extracted_value=secret,
+    )
+    endpoint_f = Finding(
+        rule_id="e", category=Category.ENDPOINT, severity=Severity.MEDIUM, confidence=Confidence.HIGH,
+        title="Endpoint", evidence=Evidence(file_url="f", file_hash="h", line=2, snippet=f"Bearer {secret}"),
+        extracted_value="/api/data",
+    )
+    mask_secret_findings(Report(findings=[secret_f, endpoint_f]))
+    assert secret not in (endpoint_f.evidence.snippet or "")
+    assert secret not in (secret_f.evidence.snippet or "")
+
+
+def test_wordlist_reporter_does_not_leak_url_credentials():
+    """A credentialed endpoint URL must not emit its userinfo (user:pass) into the domain wordlist;
+    only the host is used (netloc.split(':')[0] previously emitted the username)."""
+    ep = Finding(
+        rule_id="endpoint-detector", category=Category.ENDPOINT, severity=Severity.MEDIUM,
+        confidence=Confidence.HIGH, title="Endpoint",
+        evidence=Evidence(file_url="f", file_hash="h", line=1),
+        extracted_value="https://admin:s3cr3tTOKEN@api.internal.example.com/v1/users",
+    )
+    lines = WordlistReporter(mode="domains").generate(Report(findings=[ep])).splitlines()
+    assert not any("s3cr3tTOKEN" in ln for ln in lines)
+    assert "admin" not in lines
+    assert "api.internal.example.com" in lines

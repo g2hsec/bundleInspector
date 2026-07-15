@@ -12,11 +12,17 @@ from __future__ import annotations
 
 import pytest
 
-from bundleInspector.storage.models import (
-    Finding, Evidence, Category, Severity, Confidence,
-)
 from bundleInspector.core.download_surface import (
-    classify_download_surface, annotate_download_surfaces, download_surfaces,
+    annotate_download_surfaces,
+    classify_download_surface,
+    download_surfaces,
+)
+from bundleInspector.storage.models import (
+    Category,
+    Confidence,
+    Evidence,
+    Finding,
+    Severity,
 )
 
 
@@ -24,9 +30,9 @@ def _ep(url, *, query=None, body=None, snippet="", value_type="api_path"):
     md: dict = {}
     rc: dict = {}
     if query is not None:
-        rc["query_params"] = {k: "x" for k in query}
+        rc["query_params"] = dict.fromkeys(query, "x")
     if body is not None:
-        rc["body"] = {"kind": "json", "shape": {k: "x" for k in body}}
+        rc["body"] = {"kind": "json", "shape": dict.fromkeys(body, "x")}
     if rc:
         md["request_contract"] = rc
     return Finding(
@@ -267,11 +273,11 @@ class TestOverfitRegressions:
 def test_end_to_end_through_the_real_endpoint_detector():
     """The classifier must read the params the endpoint detector actually produces (ajax `data` ->
     request_contract.body.shape). Proven through the full parse -> IR -> engine -> annotate path."""
-    from bundleInspector.parser.js_parser import parse_js
-    from bundleInspector.parser.ir_builder import build_ir
-    from bundleInspector.rules.engine import RuleEngine
-    from bundleInspector.rules.base import AnalysisContext
     from bundleInspector.config import Config
+    from bundleInspector.parser.ir_builder import build_ir
+    from bundleInspector.parser.js_parser import parse_js
+    from bundleInspector.rules.base import AnalysisContext
+    from bundleInspector.rules.engine import RuleEngine
 
     src = (
         "function d(id, sn){ return $.ajax({ url: '/cmm/fms/FileDown.do', type: 'GET',"
@@ -280,13 +286,15 @@ def test_end_to_end_through_the_real_endpoint_detector():
         " data: { itemCd: cd } }); }\n"
     )
     ir = build_ir(parse_js(src).ast, "f.js", "h")
-    eng = RuleEngine(Config().rules); eng.register_defaults()
+    eng = RuleEngine(Config().rules)
+    eng.register_defaults()
     findings = list(eng.analyze(ir, AnalysisContext(file_url="f.js", file_hash="h",
                                                     source_content=src)))
 
     class R:
         pass
-    r = R(); r.findings = findings
+    r = R()
+    r.findings = findings
     annotate_download_surfaces(r)
 
     tagged = {f.extracted_value.split("?")[0].rsplit("/", 1)[-1]:

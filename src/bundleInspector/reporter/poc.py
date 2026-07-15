@@ -10,7 +10,10 @@ from __future__ import annotations
 
 import json
 import re
-from typing import Any, Iterator
+from collections.abc import Iterator
+from typing import Any
+
+from bundleInspector.storage.models import Finding, Report
 
 _SKELETON = {"string": "<string>", "number": 0, "boolean": False, "null": None,
              "array": [], "object": {}}
@@ -21,7 +24,7 @@ def _shell_q(s: Any) -> str:
 
 
 def _fuzz_url(url: str) -> str:
-    return re.sub(r"\$\{[^}]*\}", "FUZZ", url or "")
+    return re.sub(r"\$\{[^}]{0,1024}\}", "FUZZ", url or "")
 
 
 def _skeleton(shape: dict) -> str:
@@ -75,12 +78,12 @@ def build_fetch(contract: dict) -> str:
     return f'fetch("{url}")'
 
 
-def build_poc(contract: dict) -> dict:
+def build_poc(contract: dict[str, Any]) -> dict[str, str]:
     return {"curl": build_curl(contract), "fetch": build_fetch(contract)}
 
 
-def iter_endpoint_contracts(report) -> Iterator:
-    for finding in getattr(report, "findings", []):
+def iter_endpoint_contracts(report: Report) -> Iterator[tuple[Finding, dict[str, Any]]]:
+    for finding in report.findings:
         contract = (getattr(finding, "metadata", None) or {}).get("request_contract")
-        if contract:
+        if isinstance(contract, dict):
             yield finding, contract

@@ -20,6 +20,7 @@ from bundleInspector.storage.models import (
 @dataclass
 class RiskScore:
     """Risk score result."""
+
     tier: RiskTier
     score: float
     impact: float
@@ -38,7 +39,7 @@ class RiskClassifier:
     - Confidence (how sure are we about the finding)
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._calculator = ScoreCalculator()
 
     def classify(
@@ -62,17 +63,13 @@ class RiskClassifier:
             correlation_count = len(graph.get_related(finding.id))
 
         # Calculate scores
-        score = self._calculator.calculate_risk_score(
-            finding, correlation_count
-        )
+        score = self._calculator.calculate_risk_score(finding, correlation_count)
 
         # Determine tier
         tier = self._score_to_tier(score, finding)
 
         # Build reasoning
-        reasoning = self._build_reasoning(
-            finding, score, tier, correlation_count
-        )
+        reasoning = self._build_reasoning(finding, score, tier, correlation_count)
 
         # Update finding
         finding.risk_score = score
@@ -108,9 +105,9 @@ class RiskClassifier:
         """Determine risk tier from score and finding."""
         # P0: Critical secrets with high confidence
         if (
-            finding.category == Category.SECRET and
-            finding.severity == Severity.CRITICAL and
-            finding.confidence == Confidence.HIGH
+            finding.category == Category.SECRET
+            and finding.severity == Severity.CRITICAL
+            and finding.confidence == Confidence.HIGH
         ):
             return RiskTier.P0
 
@@ -181,4 +178,3 @@ def classify_findings(
     """
     classifier = RiskClassifier()
     return classifier.classify_all(findings, graph)
-

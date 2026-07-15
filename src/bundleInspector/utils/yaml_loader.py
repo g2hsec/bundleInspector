@@ -24,7 +24,18 @@ def load_yaml(content: str) -> Any:
         import yaml  # type: ignore
     except ImportError:
         return _FallbackYamlParser(content).parse()
-    return yaml.safe_load(content) or {}
+    try:
+        return yaml.safe_load(content) or {}
+    except yaml.YAMLError as error:
+        # PyYAML rejects an invalid backslash escape inside a DOUBLE-quoted scalar (e.g. a regex
+        # `\s`/`\d` written in a custom-rule `pattern:`), which the dependency-free fallback parser
+        # deliberately tolerates (it preserves unknown escapes). Retry ONLY that specific scanner
+        # failure with the fallback, so a ruleset loads IDENTICALLY whether or not PyYAML is
+        # installed -- otherwise a natural double-quoted regex silently fails to load under PyYAML
+        # while working without it. Every other YAML error propagates unchanged.
+        if "unknown escape character" in str(error).lower():
+            return _FallbackYamlParser(content).parse()
+        raise
 
 
 class _FallbackYamlParser:
@@ -49,7 +60,9 @@ class _FallbackYamlParser:
             if stripped.startswith("#"):
                 continue
             indent = len(raw_line) - len(stripped)
-            prepared.append(_Line(indent=indent, text=stripped))
+            stripped = _strip_inline_comment(stripped)
+            if stripped:
+                prepared.append(_Line(indent=indent, text=stripped))
         return prepared
 
     def _parse_block(self, indent: int) -> Any:
@@ -98,23 +111,31 @@ class _FallbackYamlParser:
             self.index += 1
 
             if not item_text:
-                item = self._parse_block(self.lines[self.index].indent) if self._has_nested(indent) else None
-                items.append(item)
+                nested_item = (
+                    self._parse_block(self.lines[self.index].indent)
+                    if self._has_nested(indent)
+                    else None
+                )
+                items.append(nested_item)
                 continue
 
             mapping_item = _try_parse_mapping_item(item_text)
             if mapping_item is not None:
                 key, value_text = mapping_item
-                item: Any = {}
+                mapping_value: dict[str, Any] = {}
                 child_indent = line.indent + 2
                 if value_text == "":
-                    item[key] = self._parse_block(self.lines[self.index].indent) if self._has_nested(line.indent) else {}
+                    mapping_value[key] = (
+                        self._parse_block(self.lines[self.index].indent)
+                        if self._has_nested(line.indent)
+                        else {}
+                    )
                 else:
-                    item[key] = _parse_scalar(value_text)
+                    mapping_value[key] = _parse_scalar(value_text)
                     if self._has_nested(line.indent):
                         nested = self._parse_block(self.lines[self.index].indent)
                         if isinstance(nested, dict):
-                            item.update(nested)
+                            mapping_value.update(nested)
                 while self.index < len(self.lines):
                     next_line = self.lines[self.index]
                     if next_line.indent < child_indent:
@@ -126,26 +147,26 @@ class _FallbackYamlParser:
                     sibling_key, sibling_value_text = _split_key_value(next_line.text)
                     self.index += 1
                     if sibling_value_text == "":
-                        item[sibling_key] = (
+                        mapping_value[sibling_key] = (
                             self._parse_block(self.lines[self.index].indent)
                             if self._has_nested(next_line.indent)
                             else {}
                         )
                     else:
-                        item[sibling_key] = _parse_scalar(sibling_value_text)
+                        mapping_value[sibling_key] = _parse_scalar(sibling_value_text)
                         if self._has_nested(next_line.indent):
                             nested = self._parse_block(self.lines[self.index].indent)
                             if isinstance(nested, dict):
-                                item.update(nested)
-                items.append(item)
+                                mapping_value.update(nested)
+                items.append(mapping_value)
                 continue
 
-            item = _parse_scalar(item_text)
-            if isinstance(item, dict) and self._has_nested(indent):
+            scalar_value = _parse_scalar(item_text)
+            if isinstance(scalar_value, dict) and self._has_nested(indent):
                 nested = self._parse_block(self.lines[self.index].indent)
                 if isinstance(nested, dict):
-                    item.update(nested)
-            items.append(item)
+                    scalar_value.update(nested)
+            items.append(scalar_value)
 
         return items
 
@@ -266,16 +287,30 @@ def _split_top_level(text: str, delimiter: str, maxsplit: int = -1) -> list[str]
     quote = ""
     splits = 0
 
-    for char in text:
+    index = 0
+    while index < len(text):
+        char = text[index]
         if quote:
             current.append(char)
+            if quote == '"' and char == "\\" and index + 1 < len(text):
+                index += 1
+                current.append(text[index])
+                index += 1
+                continue
+            if quote == "'" and char == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                index += 1
+                current.append(text[index])
+                index += 1
+                continue
             if char == quote:
                 quote = ""
+            index += 1
             continue
 
         if char in {"'", '"'}:
             quote = char
             current.append(char)
+            index += 1
             continue
 
         if char in "{[":
@@ -287,9 +322,11 @@ def _split_top_level(text: str, delimiter: str, maxsplit: int = -1) -> list[str]
             parts.append("".join(current))
             current = []
             splits += 1
+            index += 1
             continue
 
         current.append(char)
+        index += 1
 
     parts.append("".join(current))
     return parts
@@ -300,31 +337,72 @@ def _find_key_value_separator(text: str) -> int | None:
     depth = 0
     quote = ""
 
-    for index, char in enumerate(text):
+    index = 0
+    while index < len(text):
+        char = text[index]
         if quote:
+            if quote == '"' and char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if quote == "'" and char == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                index += 2
+                continue
             if char == quote:
                 quote = ""
+            index += 1
             continue
 
         if char in {"'", '"'}:
             quote = char
+            index += 1
             continue
 
         if char in "{[":
             depth += 1
+            index += 1
             continue
         if char in "}]":
             depth = max(depth - 1, 0)
+            index += 1
             continue
 
         if char != ":" or depth != 0:
+            index += 1
             continue
 
         next_char = text[index + 1] if index + 1 < len(text) else ""
         if not next_char or next_char.isspace():
             return index
+        index += 1
 
     return None
+
+
+def _strip_inline_comment(text: str) -> str:
+    """Remove a YAML comment marker outside quotes when whitespace introduces it."""
+    quote = ""
+    index = 0
+    while index < len(text):
+        char = text[index]
+        if quote:
+            if quote == '"' and char == "\\" and index + 1 < len(text):
+                index += 2
+                continue
+            if quote == "'" and char == "'" and index + 1 < len(text) and text[index + 1] == "'":
+                index += 2
+                continue
+            if char == quote:
+                quote = ""
+            index += 1
+            continue
+        if char in {"'", '"'}:
+            quote = char
+            index += 1
+            continue
+        if char == "#" and (index == 0 or text[index - 1].isspace()):
+            return text[:index].rstrip()
+        index += 1
+    return text.rstrip()
 
 
 def _looks_like_int(text: str) -> bool:
@@ -340,4 +418,3 @@ def _looks_like_float(text: str) -> bool:
     if whole.startswith("-"):
         whole = whole[1:]
     return (whole == "" or whole.isdigit()) and fraction.isdigit()
-

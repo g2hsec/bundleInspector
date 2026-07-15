@@ -1,0 +1,784 @@
+{
+  "benchmark": "correlator",
+  "measurement_environment": {
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "dependencies": {
+      "bundleInspector": "0.1.0",
+      "pydantic": "2.13.4",
+      "pydantic-core": "2.46.4"
+    },
+    "implementation": "CPython",
+    "machine": "x86_64",
+    "measurement_origin": "local-wsl",
+    "os": "Linux",
+    "os_release": "6.6.87.2-microsoft-standard-WSL2",
+    "python": "3.13.7"
+  },
+  "profile": "linux-x86_64-python3.13-release",
+  "result_sha256": "d5c39bdbb52653dfdf9dfa14b41432f6b80556feb5f9e0d6710437293e41086e",
+  "runs": 30,
+  "scenario_contract_sha256": "6952c77a2c1e61241f42fcecd1b8d28cd0c0acd26da275db30f3ebc7e73c8ea6",
+  "scenarios": [
+    {
+      "actual_load_contexts": 4,
+      "cluster_signature_sha256": "101ab6d34bd5636ec2106efd15f75d3299f29ec43eed5876e1853496df79d6ac",
+      "cluster_signature_variants": 1,
+      "clusters": 1,
+      "edge_signature_sha256": "672f475e4825fa0be7e83d96a972be09700f4d74d85e3c1343a87811c71b505b",
+      "edge_signature_variants": 1,
+      "edges": 1130,
+      "fanout": 3,
+      "findings": 160,
+      "fixture_sha256": "7a6dcd98c5974c77d712e3d4c1104a58d6d15088fa4b0a804acfe44de9a8cd04",
+      "modules": 80,
+      "peak_rss_bytes": 72667136,
+      "python_tracemalloc_peak_bytes": 6694707,
+      "requested_load_contexts": 4,
+      "runs": 30,
+      "telemetry": {
+        "ambiguous_imports": [],
+        "candidate_attempts": 1130,
+        "candidates": 1130,
+        "cap_dropped": 21,
+        "capped_passes": {
+          "_add_call_graph_edges": 1,
+          "_add_dynamic_import_edges": 1,
+          "_add_import_chain_edges": 1,
+          "_add_import_edges": 1,
+          "_add_inter_module_call_edges": 1,
+          "_add_load_context_call_chain_edges": 1,
+          "_add_load_context_downstream_call_chain_edges": 2,
+          "_add_load_context_import_chain_edges": 1,
+          "_add_load_context_runtime_execution_graph_edges": 1,
+          "_add_load_context_scope_call_chain_edges": 1,
+          "_add_runtime_downstream_call_chain_edges": 2,
+          "_add_runtime_edges": 1,
+          "_add_runtime_execution_graph_edges": 1,
+          "_add_runtime_scope_call_chain_edges": 4,
+          "_add_secret_endpoint_edges": 1,
+          "_add_transitive_import_edges": 1
+        },
+        "dropped": 0,
+        "duplicate_dropped": 0,
+        "emitted": 1130,
+        "passes": {
+          "_add_call_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_dynamic_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_import_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_inter_module_call_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_call_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_downstream_call_chain_edges": {
+            "candidate_attempts": 100,
+            "cap_dropped": 2,
+            "duplicate_dropped": 0,
+            "emitted": 100,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 2,
+            "truncated_candidates_unknown": 2
+          },
+          "_add_load_context_import_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_runtime_execution_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_scope_call_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_downstream_call_chain_edges": {
+            "candidate_attempts": 100,
+            "cap_dropped": 2,
+            "duplicate_dropped": 0,
+            "emitted": 100,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 2,
+            "truncated_candidates_unknown": 2
+          },
+          "_add_runtime_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_execution_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_scope_call_chain_edges": {
+            "candidate_attempts": 200,
+            "cap_dropped": 4,
+            "duplicate_dropped": 0,
+            "emitted": 200,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 4,
+            "truncated_candidates_unknown": 4
+          },
+          "_add_same_file_edges": {
+            "candidate_attempts": 80,
+            "cap_dropped": 0,
+            "duplicate_dropped": 0,
+            "emitted": 80,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 0,
+            "truncated_candidates_unknown": 0
+          },
+          "_add_secret_endpoint_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_transitive_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          }
+        },
+        "truncated_candidates": 0,
+        "truncated_candidates_lower_bound": 21,
+        "truncated_candidates_unknown": 21
+      },
+      "telemetry_sha256": "3b26db3e65a37ec80a01468fcf299044d1307950132584d30a479c9ded0ee084",
+      "telemetry_stable": true,
+      "timings_ms": {
+        "coefficient_of_variation": 0.034117,
+        "max": 342.076,
+        "mean": 312.473,
+        "min": 294.033,
+        "p50": 311.577,
+        "p50_bootstrap_95_ci": [
+          307.073,
+          315.62
+        ],
+        "p95": 330.026,
+        "p95_bootstrap_95_ci": [
+          320.358,
+          342.076
+        ],
+        "samples": [
+          294.4,
+          301.721,
+          303.773,
+          306.169,
+          314.845,
+          311.053,
+          294.033,
+          307.852,
+          314.911,
+          309.897,
+          302.546,
+          311.413,
+          307.073,
+          300.865,
+          301.219,
+          304.082,
+          307.239,
+          342.076,
+          317.188,
+          311.741,
+          316.589,
+          314.646,
+          329.18,
+          320.358,
+          324.687,
+          325.061,
+          321.187,
+          330.718,
+          313.824,
+          313.844
+        ]
+      },
+      "warmups": 2
+    },
+    {
+      "actual_load_contexts": 4,
+      "cluster_signature_sha256": "86e9d628a9c80b8e3bf251facbf5c30bc6dd7c4eb5f3d4bb4983265a69502f15",
+      "cluster_signature_variants": 1,
+      "clusters": 1,
+      "edge_signature_sha256": "267a50eacf1cd4076a8ceb924647c57c70de3762b1189ac058d2cb584c44cc52",
+      "edge_signature_variants": 1,
+      "edges": 1250,
+      "fanout": 3,
+      "findings": 400,
+      "fixture_sha256": "35a92df9d614a5f4795d7311db4f0a739840a3c0869bda333b0ccab41568f63d",
+      "modules": 200,
+      "peak_rss_bytes": 86319104,
+      "python_tracemalloc_peak_bytes": 13081622,
+      "requested_load_contexts": 4,
+      "runs": 30,
+      "telemetry": {
+        "ambiguous_imports": [],
+        "candidate_attempts": 1250,
+        "candidates": 1250,
+        "cap_dropped": 21,
+        "capped_passes": {
+          "_add_call_graph_edges": 1,
+          "_add_dynamic_import_edges": 1,
+          "_add_import_chain_edges": 1,
+          "_add_import_edges": 1,
+          "_add_inter_module_call_edges": 1,
+          "_add_load_context_call_chain_edges": 1,
+          "_add_load_context_downstream_call_chain_edges": 2,
+          "_add_load_context_import_chain_edges": 1,
+          "_add_load_context_runtime_execution_graph_edges": 1,
+          "_add_load_context_scope_call_chain_edges": 1,
+          "_add_runtime_downstream_call_chain_edges": 2,
+          "_add_runtime_edges": 1,
+          "_add_runtime_execution_graph_edges": 1,
+          "_add_runtime_scope_call_chain_edges": 4,
+          "_add_secret_endpoint_edges": 1,
+          "_add_transitive_import_edges": 1
+        },
+        "dropped": 0,
+        "duplicate_dropped": 0,
+        "emitted": 1250,
+        "passes": {
+          "_add_call_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_dynamic_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_import_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_inter_module_call_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_call_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_downstream_call_chain_edges": {
+            "candidate_attempts": 100,
+            "cap_dropped": 2,
+            "duplicate_dropped": 0,
+            "emitted": 100,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 2,
+            "truncated_candidates_unknown": 2
+          },
+          "_add_load_context_import_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_runtime_execution_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_scope_call_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_downstream_call_chain_edges": {
+            "candidate_attempts": 100,
+            "cap_dropped": 2,
+            "duplicate_dropped": 0,
+            "emitted": 100,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 2,
+            "truncated_candidates_unknown": 2
+          },
+          "_add_runtime_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_execution_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_scope_call_chain_edges": {
+            "candidate_attempts": 200,
+            "cap_dropped": 4,
+            "duplicate_dropped": 0,
+            "emitted": 200,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 4,
+            "truncated_candidates_unknown": 4
+          },
+          "_add_same_file_edges": {
+            "candidate_attempts": 200,
+            "cap_dropped": 0,
+            "duplicate_dropped": 0,
+            "emitted": 200,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 0,
+            "truncated_candidates_unknown": 0
+          },
+          "_add_secret_endpoint_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_transitive_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          }
+        },
+        "truncated_candidates": 0,
+        "truncated_candidates_lower_bound": 21,
+        "truncated_candidates_unknown": 21
+      },
+      "telemetry_sha256": "a37d18bad2ab343a6a9c0572687d2c31d1ad5bc802ac2f67dbcf57751665c318",
+      "telemetry_stable": true,
+      "timings_ms": {
+        "coefficient_of_variation": 0.022666,
+        "max": 918.252,
+        "mean": 882.238,
+        "min": 840.498,
+        "p50": 880.845,
+        "p50_bootstrap_95_ci": [
+          872.16,
+          896.192
+        ],
+        "p95": 913.658,
+        "p95_bootstrap_95_ci": [
+          901.1,
+          918.252
+        ],
+        "samples": [
+          840.861,
+          880.522,
+          862.391,
+          866.709,
+          857.067,
+          840.498,
+          897.752,
+          867.819,
+          862.008,
+          892.039,
+          906.406,
+          917.825,
+          918.252,
+          898.671,
+          898.364,
+          873.292,
+          871.203,
+          884.46,
+          879.661,
+          903.088,
+          871.527,
+          872.794,
+          908.565,
+          896.192,
+          881.167,
+          895.274,
+          863.414,
+          899.962,
+          884.486,
+          874.882
+        ]
+      },
+      "warmups": 2
+    },
+    {
+      "actual_load_contexts": 4,
+      "cluster_signature_sha256": "d237ce25b2669c3320a6ed676c20b09ebf6c64bddc738782fd2a797a30931d69",
+      "cluster_signature_variants": 1,
+      "clusters": 1,
+      "edge_signature_sha256": "caacdbf8a5b5b7a1826436499fd4fdef2a9e59204c5c1eac852f63e6be53b23c",
+      "edge_signature_variants": 1,
+      "edges": 1550,
+      "fanout": 3,
+      "findings": 1000,
+      "fixture_sha256": "861b18e3dab13ff38e7c4176f15a00ea642d0d0d7576a8e532785081a69e196f",
+      "modules": 500,
+      "peak_rss_bytes": 116260864,
+      "python_tracemalloc_peak_bytes": 24606174,
+      "requested_load_contexts": 4,
+      "runs": 30,
+      "telemetry": {
+        "ambiguous_imports": [],
+        "candidate_attempts": 1550,
+        "candidates": 1550,
+        "cap_dropped": 21,
+        "capped_passes": {
+          "_add_call_graph_edges": 1,
+          "_add_dynamic_import_edges": 1,
+          "_add_import_chain_edges": 1,
+          "_add_import_edges": 1,
+          "_add_inter_module_call_edges": 1,
+          "_add_load_context_call_chain_edges": 1,
+          "_add_load_context_downstream_call_chain_edges": 2,
+          "_add_load_context_import_chain_edges": 1,
+          "_add_load_context_runtime_execution_graph_edges": 1,
+          "_add_load_context_scope_call_chain_edges": 1,
+          "_add_runtime_downstream_call_chain_edges": 2,
+          "_add_runtime_edges": 1,
+          "_add_runtime_execution_graph_edges": 1,
+          "_add_runtime_scope_call_chain_edges": 4,
+          "_add_secret_endpoint_edges": 1,
+          "_add_transitive_import_edges": 1
+        },
+        "dropped": 0,
+        "duplicate_dropped": 0,
+        "emitted": 1550,
+        "passes": {
+          "_add_call_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_dynamic_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_import_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_inter_module_call_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_call_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_downstream_call_chain_edges": {
+            "candidate_attempts": 100,
+            "cap_dropped": 2,
+            "duplicate_dropped": 0,
+            "emitted": 100,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 2,
+            "truncated_candidates_unknown": 2
+          },
+          "_add_load_context_import_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_runtime_execution_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_load_context_scope_call_chain_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_downstream_call_chain_edges": {
+            "candidate_attempts": 100,
+            "cap_dropped": 2,
+            "duplicate_dropped": 0,
+            "emitted": 100,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 2,
+            "truncated_candidates_unknown": 2
+          },
+          "_add_runtime_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_execution_graph_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_runtime_scope_call_chain_edges": {
+            "candidate_attempts": 200,
+            "cap_dropped": 4,
+            "duplicate_dropped": 0,
+            "emitted": 200,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 4,
+            "truncated_candidates_unknown": 4
+          },
+          "_add_same_file_edges": {
+            "candidate_attempts": 500,
+            "cap_dropped": 0,
+            "duplicate_dropped": 0,
+            "emitted": 500,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 0,
+            "truncated_candidates_unknown": 0
+          },
+          "_add_secret_endpoint_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          },
+          "_add_transitive_import_edges": {
+            "candidate_attempts": 50,
+            "cap_dropped": 1,
+            "duplicate_dropped": 0,
+            "emitted": 50,
+            "truncated_candidates": 0,
+            "truncated_candidates_lower_bound": 1,
+            "truncated_candidates_unknown": 1
+          }
+        },
+        "truncated_candidates": 0,
+        "truncated_candidates_lower_bound": 21,
+        "truncated_candidates_unknown": 21
+      },
+      "telemetry_sha256": "7870b81b1cab9c7a5130e40cd4aa2bff8d3a0169061aff7518e6a507eb9b92b7",
+      "telemetry_stable": true,
+      "timings_ms": {
+        "coefficient_of_variation": 0.015093,
+        "max": 4173.599,
+        "mean": 4053.379,
+        "min": 3829.48,
+        "p50": 4062.641,
+        "p50_bootstrap_95_ci": [
+          4030.593,
+          4077.786
+        ],
+        "p95": 4131.418,
+        "p95_bootstrap_95_ci": [
+          4103.741,
+          4173.599
+        ],
+        "samples": [
+          3829.48,
+          4066.511,
+          3986.208,
+          4090.192,
+          4024.707,
+          4005.561,
+          4077.786,
+          4043.635,
+          4013.408,
+          4073.516,
+          4049.524,
+          4043.936,
+          4090.299,
+          4118.615,
+          4173.599,
+          4029.826,
+          4015.112,
+          4089.865,
+          4064.017,
+          4062.472,
+          4141.893,
+          4031.361,
+          4113.449,
+          3999.058,
+          4017.592,
+          4111.157,
+          3997.551,
+          4062.81,
+          4063.4,
+          4114.827
+        ]
+      },
+      "warmups": 2
+    }
+  ],
+  "schema_version": 1,
+  "warmups": 2
+}

@@ -5,25 +5,27 @@ Extract hidden APIs, domains, secrets, feature flags, and debug endpoints
 from JavaScript files through static and dynamic analysis.
 """
 
+from typing import Any
+
 __version__ = "0.1.0"
 __author__ = "BundleInspector Team"
 
-from bundleInspector.config import Config, ScopeConfig, AuthConfig
+from bundleInspector.config import AuthConfig, Config, ScopeConfig
 from bundleInspector.storage.models import (
-    JSAsset,
-    Finding,
-    Evidence,
-    Correlation,
-    Cluster,
-    Report,
-    Severity,
-    Confidence,
     Category,
+    Cluster,
+    Confidence,
+    Correlation,
+    Evidence,
+    Finding,
+    JSAsset,
+    Report,
     RiskTier,
+    Severity,
 )
 
 
-def __getattr__(name):
+def __getattr__(name: str) -> Any:
     # Lazy re-export: importing `BundleInspector` pulls in the orchestrator (and its
     # playwright/httpx stack). Deferring it keeps `import bundleInspector.<submodule>`
     # light -- critical for spawned parallel analysis workers (asset_analysis), which must
@@ -54,4 +56,3 @@ __all__ = [
     "Category",
     "RiskTier",
 ]
-
