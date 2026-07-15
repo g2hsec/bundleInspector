@@ -11,7 +11,7 @@ import asyncio
 import time
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Optional
+from types import TracebackType
 from urllib.parse import urlparse
 
 
@@ -33,7 +33,7 @@ class RateLimiter:
     _last_request_time: dict[str, float] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         # max(1, ...): a negative max_concurrent (settable via config file) would raise
         # ValueError here and abort the whole scan at limiter construction.
         self._semaphore = asyncio.Semaphore(max(1, self.max_concurrent))
@@ -87,12 +87,17 @@ class RateLimiter:
         """Release a concurrent slot (semaphore)."""
         self._semaphore.release()
 
-    async def __aenter__(self):
+    async def __aenter__(self) -> RateLimiter:
         """Context manager entry - acquires a slot."""
         await self.acquire_slot()
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
         """Context manager exit - releases the slot."""
         self.release_slot()
 
@@ -114,7 +119,7 @@ class AdaptiveRateLimiter(RateLimiter):
     _error_counts: dict[str, int] = field(default_factory=dict)
     _current_intervals: dict[str, float] = field(default_factory=dict)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         super().__post_init__()
         self.interval = self.base_interval
 
@@ -187,10 +192,10 @@ class SlidingWindowRateLimiter:
     window_seconds: float = 1.0
     per_domain: bool = True
 
-    _request_times: dict[str, deque] = field(default_factory=dict)
+    _request_times: dict[str, deque[float]] = field(default_factory=dict)
     _lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
-    def __post_init__(self):
+    def __post_init__(self) -> None:
         if self.max_requests < 1:
             raise ValueError("max_requests must be at least 1")
 
@@ -242,8 +247,16 @@ class SlidingWindowRateLimiter:
             if wait_time > 0:
                 await asyncio.sleep(wait_time)
 
-    async def __aenter__(self):
+    # Rate limiting is performed by acquire(); these context-manager hooks exist only for
+    # interface symmetry with RateLimiter and intentionally perform NO acquisition (callers that
+    # want limiting must await acquire()). Do not add acquisition here -- it would change timing.
+    async def __aenter__(self) -> SlidingWindowRateLimiter:
         return self
 
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        pass
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc_val: BaseException | None,
+        exc_tb: TracebackType | None,
+    ) -> None:
+        return None

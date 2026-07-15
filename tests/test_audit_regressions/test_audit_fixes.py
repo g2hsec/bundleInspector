@@ -15,8 +15,8 @@ from pathlib import Path
 import pytest
 
 from bundleInspector.config import Config, CrawlerConfig, RuleConfig
-from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
 from bundleInspector.rules.engine import RuleEngine
 from bundleInspector.storage.models import (
@@ -26,7 +26,6 @@ from bundleInspector.storage.models import (
     PipelineCheckpoint,
     Severity,
 )
-
 
 # --------------------------------------------------------------------------- helpers
 
@@ -112,7 +111,12 @@ def test_generator_raise_preserves_already_yielded_results():
 # --------------------------------------------------------------------------- F6: unknown category surfaced
 
 def test_unknown_enabled_category_warns_but_keeps_valid(monkeypatch):
-    eng = RuleEngine(RuleConfig(enabled_categories=["endpoint", "secretsTYPO"]))
+    with pytest.raises(ValueError, match="unknown enabled_categories"):
+        RuleConfig(enabled_categories=["endpoint", "secretsTYPO"])
+    legacy_config = RuleConfig.model_construct(
+        enabled_categories=["endpoint", "secretsTYPO"],
+    )
+    eng = RuleEngine(legacy_config)
     eng.register_defaults()
     warned = []
     monkeypatch.setattr(
@@ -216,7 +220,7 @@ async def test_concurrent_checkpoints_never_corrupt(tmp_path):
 def test_decode_utf8_no_bom_is_identical():
     from bundleInspector.core.text_decode import decode_js_bytes
 
-    raw = "const s='café résumé 한국어';".encode("utf-8")
+    raw = "const s='café résumé 한국어';".encode()
     assert decode_js_bytes(raw) == raw.decode("utf-8", errors="replace")
 
 
@@ -225,6 +229,21 @@ def test_decode_utf16_bom_not_mangled():
 
     s = "const secret='AKIAIOSFODNN7EXAMPLE';"
     assert decode_js_bytes(s.encode("utf-16")) == s  # BOM detected & stripped
+
+
+def test_decode_bomless_utf16_and_utf32_not_mangled():
+    from bundleInspector.core.text_decode import decode_js_bytes
+
+    source = 'const endpoint = "/api/admin"; fetch(endpoint);'
+    for encoding in ("utf-16-le", "utf-16-be", "utf-32-le", "utf-32-be"):
+        assert decode_js_bytes(source.encode(encoding)) == source
+
+
+def test_decode_does_not_reclassify_binary_without_strong_unicode_lanes():
+    from bundleInspector.core.text_decode import decode_js_bytes
+
+    binary = b"\x89PNG\r\n\x1a\n\x00\x01\x02\x03\xff\x00\xfe\x10"
+    assert decode_js_bytes(binary) == binary.decode("utf-8", errors="replace")
 
 
 def test_decode_utf8_sig_bom_stripped():

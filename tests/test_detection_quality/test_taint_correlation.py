@@ -6,17 +6,20 @@ DOM src/href sink fed a file/image/upload-looking value, within the same asset -
 from __future__ import annotations
 
 from bundleInspector.config import Config
-from bundleInspector.parser.js_parser import parse_js
+from bundleInspector.correlator.graph import Correlator
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.rules.engine import RuleEngine
-from bundleInspector.correlator.graph import Correlator
 
 
 def _correlate(src: str):
     ir = build_ir(parse_js(src).ast, "https://x/a.js", "h")
-    eng = RuleEngine(Config().rules); eng.register_defaults()
-    findings = eng.analyze(ir, AnalysisContext(file_url="https://x/a.js", file_hash="h", source_content=src))
+    eng = RuleEngine(Config().rules)
+    eng.register_defaults()
+    findings = eng.analyze(
+        ir, AnalysisContext(file_url="https://x/a.js", file_hash="h", source_content=src)
+    )
     graph = Correlator().correlate(findings)
     return findings, graph
 
@@ -39,7 +42,10 @@ def test_taint_chain_links_upload_surface_to_img_src_sink():
     e = taint[0]
     src, tgt = fid[e.source_id], fid[e.target_id]
     assert src.category.value == "upload"
-    assert tgt.category.value == "sink" and tgt.value_type in ("dom_attr_injection", "dom_attr_sink")
+    assert tgt.category.value == "sink" and tgt.value_type in (
+        "dom_attr_injection",
+        "dom_attr_sink",
+    )
     assert e.metadata.get("sink_source") == "item.image_url"
     assert "stored/DOM-XSS chain" in e.reasoning
 
@@ -59,7 +65,12 @@ def test_no_taint_when_sink_value_is_not_media_like():
 
 def test_taint_correlation_is_deterministic():
     findings, graph = _correlate(UPLOAD_AND_SINK)
-    sig = lambda g, fs: sorted((e.source_id in {f.id for f in fs}, e.metadata.get("sink_source"))
-                               for e in _taint_edges(g))
+
+    def sig(g, fs):
+        return sorted(
+            (e.source_id in {f.id for f in fs}, e.metadata.get("sink_source"))
+            for e in _taint_edges(g)
+        )
+
     graph2 = Correlator().correlate(findings)
     assert sig(graph, findings) == sig(graph2, findings)

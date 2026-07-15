@@ -13,6 +13,7 @@ class _FakeResponse:
     """Minimal async HTTP response double."""
 
     def __init__(self, text: str, content_type: str = "text/html"):
+        self.status_code = 200
         self.text = text
         self.headers = {"content-type": content_type}
 
@@ -367,4 +368,3 @@ async def test_multipage_static_collector_resumes_with_completed_empty_link_stat
     refs = [ref async for ref in collector.collect("https://example.com", _scope())]
 
     assert refs == []
-

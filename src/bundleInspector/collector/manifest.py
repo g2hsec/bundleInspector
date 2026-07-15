@@ -6,21 +6,33 @@ Parses webpack/vite/next.js manifests to find all JS assets.
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import re
-from typing import Any, AsyncIterator
+from collections.abc import AsyncIterator
+from inspect import isawaitable
+from typing import Any
 from urllib.parse import urljoin
-from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
 import httpx
 
-logger = logging.getLogger(__name__)
-
 from bundleInspector.collector.base import BaseCollector
-from bundleInspector.collector.scope import ScopePolicy, normalize_url, is_js_url
-from bundleInspector.config import CrawlerConfig, AuthConfig
+from bundleInspector.collector.scope import ScopePolicy, is_js_url, normalize_url
+from bundleInspector.config import AuthConfig, CrawlerConfig
+from bundleInspector.core.rate_limiter import RateLimiter
+from bundleInspector.core.safe_http import (
+    ResponseTooLarge,
+    UnsafeRequestTarget,
+    build_pinned_transport,
+    get_with_safe_redirects,
+    normalized_origin,
+    origin_bound_auth_headers,
+)
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 from bundleInspector.storage.models import JSReference, LoadMethod
+
+logger = logging.getLogger(__name__)
 
 
 class ManifestCollector(BaseCollector):
@@ -68,10 +80,16 @@ class ManifestCollector(BaseCollector):
         self,
         crawler_config: CrawlerConfig,
         auth_config: AuthConfig | None = None,
+        *,
+        allow_private_ips: bool = False,
+        rate_limiter: RateLimiter | None = None,
     ):
         self.config = crawler_config
         self.auth = auth_config or AuthConfig()
+        self.allow_private_ips = allow_private_ips
+        self.rate_limiter = rate_limiter
         self._client: httpx.AsyncClient | None = None
+        self._auth_origins: set[tuple[str, str, int]] = set()
 
     async def setup(self) -> None:
         """Initialize HTTP client."""
@@ -79,14 +97,17 @@ class ManifestCollector(BaseCollector):
             "User-Agent": self.config.user_agent,
             "Accept": "*/*",
         }
-        headers.update(self.auth.get_auth_headers())
 
         self._client = httpx.AsyncClient(
             headers=headers,
-            cookies=self.auth.cookies if self.auth.cookies else None,
             timeout=self.config.request_timeout,
-            follow_redirects=self.config.follow_redirects,
+            follow_redirects=False,
             max_redirects=self.config.max_redirects,
+            transport=build_pinned_transport(
+                allow_private_ips=self.allow_private_ips,
+                max_connections=self.config.max_concurrent,
+            ),
+            trust_env=False,
         )
 
     async def teardown(self) -> None:
@@ -94,6 +115,64 @@ class ManifestCollector(BaseCollector):
         if self._client:
             await self._client.aclose()
             self._client = None
+
+    def _bind_auth_origin(self, url: str) -> None:
+        origin = normalized_origin(url)
+        self._auth_origins = {origin} if origin is not None else set()
+
+    def _request_headers(self, url: str) -> dict[str, str]:
+        return origin_bound_auth_headers(
+            url,
+            self._auth_origins,
+            self.auth.get_auth_headers(),
+            self.auth.cookies,
+        )
+
+    async def _request(self, url: str, scope: ScopePolicy) -> httpx.Response:
+        client = self._client
+        if client is None:
+            raise RuntimeError("ManifestCollector must be set up before requesting a URL")
+        attempts = max(0, self.config.max_retries) + 1
+        for attempt in range(attempts):
+            try:
+                response = await get_with_safe_redirects(
+                    client,
+                    url,
+                    allow_private_ips=self.allow_private_ips,
+                    follow_redirects=self.config.follow_redirects,
+                    max_redirects=self.config.max_redirects,
+                    is_allowed=scope.is_allowed,
+                    headers_for_url=self._request_headers,
+                    before_request=self.rate_limiter.acquire if self.rate_limiter else None,
+                    max_response_bytes=self.config.max_file_size,
+                )
+            except (UnsafeRequestTarget, ResponseTooLarge, httpx.TooManyRedirects):
+                raise
+            except httpx.RequestError:
+                await self._record_rate_feedback("record_error", url, 0)
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(max(0.0, self.config.retry_delay))
+                continue
+
+            feedback_url = str(getattr(response, "url", "") or url)
+            if self._is_transient_http_status(response.status_code):
+                await self._record_rate_feedback("record_error", feedback_url, response.status_code)
+                if attempt + 1 < attempts:
+                    await response.aclose()
+                    await asyncio.sleep(max(0.0, self.config.retry_delay))
+                    continue
+            else:
+                await self._record_rate_feedback("record_success", feedback_url)
+            return response
+        raise RuntimeError("manifest request retry loop exhausted without a response")
+
+    async def _record_rate_feedback(self, method: str, *args: Any) -> None:
+        limiter_method = getattr(self.rate_limiter, method, None)
+        if callable(limiter_method):
+            result = limiter_method(*args)
+            if isawaitable(result):
+                await result
 
     async def collect(
         self,
@@ -112,6 +191,7 @@ class ManifestCollector(BaseCollector):
         """
         if not self._client:
             await self.setup()
+        self._bind_auth_origin(url)
 
         base_url = self._get_base_url(url)
         seen_urls: set[str] = set()
@@ -147,29 +227,67 @@ class ManifestCollector(BaseCollector):
         scope: ScopePolicy,
     ) -> AsyncIterator[JSReference]:
         """Parse a manifest file for JS references."""
+        client = self._client
+        if client is None:
+            raise RuntimeError("ManifestCollector must be set up before parsing a manifest")
         try:
-            response = await self._client.get(manifest_url)
+            response = await self._request(manifest_url, scope)
             if response.status_code != 200:
+                if self._is_transient_http_status(response.status_code):  # DQ-C06
+                    self._record_retryable_failure(
+                        manifest_url, f"HTTP {response.status_code}", response.status_code
+                    )
                 return
-        except httpx.HTTPError:
+        except UnsafeRequestTarget as e:
+            logger.warning("Blocked unsafe manifest request %s: %s", e.url, e.reason)
+            return
+        except ResponseTooLarge as e:
+            logger.warning("Manifest response exceeded body limit for %s", e.url)
+            return
+        except httpx.HTTPError as e:
+            self._record_retryable_failure(manifest_url, f"request error: {type(e).__name__}")  # DQ-C06
             return
 
         content = response.text
+        response_url = str(getattr(response, "url", "") or manifest_url)
         content_type = response.headers.get("content-type", "")
 
         # Handle JSON manifests (only by content-type, not by content shape)
         if "json" in content_type:
             async for ref in self._parse_json_manifest(
-                content, manifest_url, base_url, scope
+                content, response_url, base_url, scope
             ):
                 yield ref
 
         # Handle JS manifests (like Next.js buildManifest)
-        elif "javascript" in content_type or manifest_url.endswith(".js"):
+        elif "javascript" in content_type or response_url.endswith(".js"):
             async for ref in self._parse_js_manifest(
-                content, manifest_url, base_url, scope
+                content, response_url, base_url, scope
             ):
                 yield ref
+
+        # Shape-based fallback: a build manifest served with an ambiguous content-type (text/plain,
+        # application/octet-stream, none) at a known .json manifest path is otherwise silently
+        # dropped. Gated by the .json path AND a JSON-container shape; _parse_json_manifest only
+        # yields refs whose paths pass is_js_url + scope, so arbitrary/non-manifest JSON (e.g. a PWA
+        # manifest of .png icons) still produces zero references (DQ-I07).
+        elif response_url.endswith(".json") and self._looks_like_json_manifest(content):
+            async for ref in self._parse_json_manifest(
+                content, response_url, base_url, scope
+            ):
+                yield ref
+
+    @staticmethod
+    def _looks_like_json_manifest(content: str) -> bool:
+        """Best-effort shape check: is `content` a JSON object/array (a possible build manifest)?"""
+        stripped = content.lstrip()
+        if not stripped.startswith(("{", "[")):
+            return False
+        try:
+            data = json.loads(content)
+        except (json.JSONDecodeError, RecursionError):
+            return False
+        return isinstance(data, (dict, list))
 
     async def _parse_json_manifest(
         self,
@@ -188,9 +306,20 @@ class ManifestCollector(BaseCollector):
         # Extract all string values that look like JS paths
         js_paths = self._extract_js_paths_from_json(data)
 
+        # Vite serves its manifest at <base>/.vite/manifest.json, but its `file` values are relative
+        # to the deployment BASE, not the manifest's own directory. Resolving them against
+        # manifest_url yields non-existent /.vite/assets/... URLs (404 -> never analyzed). Strip the
+        # .vite/manifest.json suffix to recover the deployment base (default "/" or a sub-path base).
+        # All other manifests keep resolving against manifest_url unchanged (DQ-I06).
+        resolution_base = manifest_url
+        _vite_marker = "/.vite/manifest.json"
+        if urlparse(manifest_url).path.endswith(_vite_marker):
+            resolution_base = manifest_url[: manifest_url.rfind(_vite_marker)] + "/"
+
         for path in js_paths:
-            # Resolve relative paths against manifest location, not site root
-            full_url = normalize_url(path, manifest_url)
+            # Resolve relative paths against the resolution base (deployment base for Vite,
+            # manifest location otherwise), not site root.
+            full_url = normalize_url(path, resolution_base)
 
             if scope.is_allowed(full_url) and is_js_url(full_url):
                 yield JSReference(
@@ -218,8 +347,12 @@ class ManifestCollector(BaseCollector):
                     paths.append(node)
             elif isinstance(node, dict):
                 for key, value in node.items():
+                    # Vite's `src` is an input path and its import arrays contain manifest entry
+                    # keys, not emitted URLs. Treating either as an output invents phantom assets.
+                    if key in {"src", "imports", "dynamicImports"}:
+                        continue
                     # Common manifest keys
-                    if key in ("src", "file", "url", "path", "js", "main", "module"):
+                    if key in ("file", "url", "path", "js", "main", "module"):
                         if isinstance(value, str):
                             paths.append(value)
                             continue
@@ -277,28 +410,35 @@ class ManifestCollector(BaseCollector):
         scope: ScopePolicy,
     ) -> AsyncIterator[JSReference]:
         """Try to discover JS in common chunk directories."""
+        client = self._client
+        if client is None:
+            raise RuntimeError("ManifestCollector must be set up before discovering chunk directories")
         for chunk_dir in self.CHUNK_DIRS:
             dir_url = urljoin(base_url, chunk_dir)
 
             # Try to list directory (unlikely to work but worth trying)
             try:
-                response = await self._client.get(dir_url)
+                response = await self._request(dir_url, scope)
                 if response.status_code == 200:
+                    response_url = str(getattr(response, "url", "") or dir_url)
                     # Look for JS file references in directory listing
                     for match in re.finditer(
                         r'href=["\']([^"\']+\.js)["\']',
                         response.text
                     ):
                         path = match.group(1)
-                        full_url = normalize_url(path, dir_url)
+                        full_url = normalize_url(path, response_url)
 
                         if scope.is_allowed(full_url):
                             yield JSReference(
                                 url=full_url,
-                                initiator=dir_url,
-                                load_context=dir_url,
+                                initiator=response_url,
+                                load_context=response_url,
                                 method=LoadMethod.MANIFEST,
                             )
+            except UnsafeRequestTarget as e:
+                logger.warning("Blocked unsafe chunk-directory request %s: %s", e.url, e.reason)
+            except ResponseTooLarge as e:
+                logger.warning("Chunk-directory response exceeded body limit for %s", e.url)
             except httpx.HTTPError:
                 pass
-

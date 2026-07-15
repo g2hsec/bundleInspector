@@ -13,14 +13,13 @@ import sys
 import pytest
 
 from bundleInspector.config import Config
-from bundleInspector.core.asset_analyzer import AssetAnalyzer
 from bundleInspector.core import asset_analysis
+from bundleInspector.core.asset_analyzer import AssetAnalyzer
 from bundleInspector.core.dedup import DedupCache
 from bundleInspector.parser.ir_builder import IRBuilder
 from bundleInspector.parser.js_parser import JSParser
 from bundleInspector.rules.engine import RuleEngine
 from bundleInspector.storage.models import JSAsset
-
 
 _HEAVY_CHECK = (
     "import sys;"

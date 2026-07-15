@@ -6,10 +6,14 @@ marked. Rules are added incrementally: A) vendor-file secrets."""
 
 from __future__ import annotations
 
-from bundleInspector.storage.models import (
-    Finding, Evidence, Category, Severity, Confidence,
-)
 from bundleInspector.core.fp_annotate import annotate_false_positives
+from bundleInspector.storage.models import (
+    Category,
+    Confidence,
+    Evidence,
+    Finding,
+    Severity,
+)
 
 
 def _f(cat, vt, *, url="https://x/static/mall/js/shopfront.js", val="", meta=None,

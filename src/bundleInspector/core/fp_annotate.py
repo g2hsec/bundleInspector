@@ -27,12 +27,13 @@ from __future__ import annotations
 
 import re
 
-from bundleInspector.storage.models import Category
+from bundleInspector.storage.models import Category, Finding, Report
 
 try:  # keep import failures from ever breaking report rendering
     from bundleInspector.core.vendor import classify_vendor_file
 except Exception:  # pragma: no cover - defensive
-    def classify_vendor_file(url, content=None):  # type: ignore
+
+    def classify_vendor_file(url: str, content: str | None = None) -> str | None:
         return None
 
 
@@ -43,7 +44,7 @@ _B64_BODY = re.compile(r"[A-Za-z0-9+/=]{40,}")
 _PEM_STRUCTURE = re.compile(r"-----END|Proc-Type\s*:|DEK-Info\s*:", re.IGNORECASE)
 
 
-def annotate_false_positives(report) -> int:
+def annotate_false_positives(report: Report) -> int:
     """Mark likely false positives on ``report.findings`` in place. Returns the count marked.
 
     Idempotent and defensive: any per-finding error is swallowed so a presentation-layer heuristic
@@ -63,22 +64,22 @@ def annotate_false_positives(report) -> int:
     return marked
 
 
-def _vendor_of(f) -> "str | None":
+def _vendor_of(f: Finding) -> str | None:
     """The vendor library name for a finding's file, or None (first-party)."""
     md = f.metadata if isinstance(f.metadata, dict) else {}
     tagged = md.get("third_party_file")
     if tagged:
-        return tagged
+        return str(tagged)
     url = f.evidence.file_url if getattr(f, "evidence", None) else ""
     return classify_vendor_file(url or "")
 
 
-def _snippet(f) -> str:
+def _snippet(f: Finding) -> str:
     ev = getattr(f, "evidence", None)
     return (getattr(ev, "snippet", "") if ev else "") or ""
 
 
-def _fp_reason(f) -> "str | None":
+def _fp_reason(f: Finding) -> str | None:
     """Return a human-readable reason if the finding is a likely false positive, else None."""
     md = f.metadata if isinstance(f.metadata, dict) else {}
     if md.get("confirmed"):
@@ -96,7 +97,9 @@ def _fp_reason(f) -> "str | None":
     if f.value_type in ("private_key", "pgp_private_key"):
         snip = _snippet(f)
         if not _B64_BODY.search(snip) and not _PEM_STRUCTURE.search(snip):
-            return ("PEM 'BEGIN PRIVATE KEY' marker only -- no base64 body or PEM structure present "
-                    "(parsing/label code, not a leaked key)")
+            return (
+                "PEM 'BEGIN PRIVATE KEY' marker only -- no base64 body or PEM structure present "
+                "(parsing/label code, not a leaked key)"
+            )
 
     return None

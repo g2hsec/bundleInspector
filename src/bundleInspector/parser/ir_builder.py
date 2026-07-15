@@ -6,17 +6,17 @@ Transforms AST into analysis-friendly structures.
 
 from __future__ import annotations
 
-from typing import Any, Optional
+from typing import Any
 
 from bundleInspector.storage.models import (
-    GuardCondition,
-    IntermediateRepresentation,
-    StringLiteral,
+    ExportDecl,
     FunctionCall,
     FunctionDef,
-    ImportDecl,
-    ExportDecl,
+    GuardCondition,
     Identifier,
+    ImportDecl,
+    IntermediateRepresentation,
+    StringLiteral,
 )
 
 
@@ -35,9 +35,31 @@ class IRBuilder:
     # asset's findings. Far above any real AST depth, safely below the interpreter limit.
     MAX_VISIT_DEPTH = 300
 
-    def __init__(self):
-        self._current_ir: Optional[IntermediateRepresentation] = None
+    def __init__(
+        self,
+        extract_strings: bool = True,
+        extract_calls: bool = True,
+        extract_imports: bool = True,
+        build_call_graph: bool = True,
+    ) -> None:
+        # DQ-P13: honor the ParserConfig feature flags (were declared but never wired). Defaults True
+        # preserve prior behavior (every extraction on, call graph built).
+        self._extract_strings = extract_strings
+        self._extract_calls = extract_calls
+        self._extract_imports = extract_imports
+        self._build_call_graph = build_call_graph
+        self._current_ir: IntermediateRepresentation | None = None
         self._current_scope: str = "global"
+
+    @classmethod
+    def from_parser_config(cls, parser_config: Any) -> IRBuilder:
+        """DQ-P13: build an IRBuilder honoring a ParserConfig's feature flags (duck-typed)."""
+        return cls(
+            extract_strings=getattr(parser_config, "extract_strings", True),
+            extract_calls=getattr(parser_config, "extract_calls", True),
+            extract_imports=getattr(parser_config, "extract_imports", True),
+            build_call_graph=getattr(parser_config, "build_call_graph", True),
+        )
 
     def build(
         self,
@@ -63,17 +85,47 @@ class IRBuilder:
         )
 
         self._current_scope = "global"
+        # Dedup set so a per-node cap does not append the same note thousands of times.
+        self._truncation_notes: set[str] = set()
 
         # Check if this is a partial/fallback parse
         if ast.get("partial") or ast.get("regex_fallback"):
-            self._current_ir.partial = True
-            self._current_ir.errors.append("Partial parse - some data may be missing")
+            self._ir.partial = True
+            self._ir.errors.append("Partial parse - some data may be missing")
 
         # Visit all nodes
         self._visit(ast)
-        self._finalize_call_graph()
+        if self._build_call_graph:
+            self._finalize_call_graph()
 
         return self._current_ir
+
+    @property
+    def _ir(self) -> IntermediateRepresentation:
+        """Return the IR initialized by ``build`` for visitor helpers."""
+
+        if self._current_ir is None:
+            raise RuntimeError("IRBuilder visitor used before build() initialized the IR")
+        return self._current_ir
+
+    def _note_truncation(self, reason: str) -> None:
+        """Record that a hard analysis cap truncated the IR (DQ-C04).
+
+        Marks the IR `partial` and appends a single deduped note so an INCOMPLETE analysis is no
+        longer indistinguishable from a clean 0-finding result: `ir.partial` is honored by the
+        taint detector (it abstains from `confirmed` on a partial IR) and is propagated to
+        `asset.parse_errors` by the analysis path. Only caps that drop DETECTION-relevant nodes
+        wholesale (AST visit depth, unique-identifier budget) call this -- the per-identifier
+        occurrence sample is a benign memory bound that legitimate minified bundles exceed
+        constantly, so it must NOT flip the whole IR to partial.
+        """
+        ir = self._current_ir
+        if ir is None:
+            return
+        ir.partial = True
+        if reason not in self._truncation_notes:
+            self._truncation_notes.add(reason)
+            ir.errors.append(reason)
 
     def _visit(self, node: Any) -> None:
         """Visit an AST node."""
@@ -85,6 +137,11 @@ class IRBuilder:
         # and dropping the whole asset's findings.
         depth = getattr(self, "_visit_depth", 0) + 1
         if depth > self.MAX_VISIT_DEPTH:
+            # A whole AST subtree (possibly incl. endpoint/secret/sink call nodes) is dropped here;
+            # record it so the loss is not silent (DQ-C04).
+            self._note_truncation(
+                f"IR truncated: AST visit-depth cap ({self.MAX_VISIT_DEPTH}) exceeded"
+            )
             return
         self._visit_depth = depth
         try:
@@ -118,11 +175,11 @@ class IRBuilder:
         """Handle literal values."""
         value = node.get("value")
 
-        if isinstance(value, str):
+        if isinstance(value, str) and self._extract_strings:
             loc = node.get("loc", {})
             start = loc.get("start", {})
 
-            self._current_ir.string_literals.append(StringLiteral(
+            self._ir.string_literals.append(StringLiteral(
                 value=value,
                 raw=node.get("raw"),
                 line=start.get("line", 0),
@@ -132,6 +189,8 @@ class IRBuilder:
 
     def _visit_TemplateLiteral(self, node: dict) -> None:
         """Handle template literals."""
+        if not self._extract_strings:      # DQ-P13
+            return
         # Extract quasis (static parts)
         for quasi in node.get("quasis", []):
             value = quasi.get("value", {})
@@ -141,7 +200,7 @@ class IRBuilder:
                 loc = quasi.get("loc", {})
                 start = loc.get("start", {})
 
-                self._current_ir.string_literals.append(StringLiteral(
+                self._ir.string_literals.append(StringLiteral(
                     value=cooked,
                     raw=value.get("raw"),
                     line=start.get("line", 0),
@@ -152,13 +211,34 @@ class IRBuilder:
     def _visit_CallExpression(self, node: dict) -> None:
         """Handle function calls."""
         callee = node.get("callee", {})
+        # Esprima models a dynamic `import(x)` as CallExpression(callee.type=="Import") rather than
+        # the canonical ImportExpression -> record it as the same dynamic-import so it is not lost
+        # (DQ-P12). Children (arguments) are still visited by the generic walker.
+        if isinstance(callee, dict) and callee.get("type") == "Import":
+            args = node.get("arguments", []) or []
+            src_node = args[0] if args and isinstance(args[0], dict) else {}
+            source = ""
+            if src_node.get("type") == "Literal":
+                v = src_node.get("value", "")
+                source = v if isinstance(v, str) else ""
+            elif src_node.get("type") == "TemplateLiteral":
+                quasis = src_node.get("quasis", [])
+                expressions = src_node.get("expressions", [])
+                if quasis and not expressions:
+                    source = quasis[0].get("value", {}).get("cooked", "") or ""
+            if source and self._extract_imports:      # DQ-P13
+                start = (node.get("loc") or {}).get("start", {})
+                self._ir.imports.append(ImportDecl(
+                    source=source, specifiers=[], is_dynamic=True, line=start.get("line", 0),
+                ))
+            return
         callee_name = self._get_callee_name(callee)
 
-        if callee_name:
+        if callee_name and self._extract_calls:      # DQ-P13
             loc = node.get("loc", {})
             start = loc.get("start", {})
 
-            self._current_ir.function_calls.append(FunctionCall(
+            self._ir.function_calls.append(FunctionCall(
                 name=callee_name.split(".")[-1],  # Last part
                 full_name=callee_name,
                 arguments=node.get("arguments", []),
@@ -169,10 +249,14 @@ class IRBuilder:
 
     def _visit_ImportDeclaration(self, node: dict) -> set:
         """Handle import declarations."""
+        if node.get("importKind") == "type":
+            return {"source", "specifiers"}
         source = node.get("source", {}).get("value", "")
         specifiers = []
 
         for spec in node.get("specifiers", []):
+            if spec.get("importKind") == "type":
+                continue
             spec_type = spec.get("type", "")
             if spec_type == "ImportDefaultSpecifier":
                 local = spec.get("local", {}).get("name", "")
@@ -194,12 +278,13 @@ class IRBuilder:
         loc = node.get("loc", {})
         start = loc.get("start", {})
 
-        self._current_ir.imports.append(ImportDecl(
-            source=source,
-            specifiers=specifiers,
-            is_dynamic=False,
-            line=start.get("line", 0),
-        ))
+        if self._extract_imports:      # DQ-P13
+            self._ir.imports.append(ImportDecl(
+                source=source,
+                specifiers=specifiers,
+                is_dynamic=False,
+                line=start.get("line", 0),
+            ))
 
         return {"source"}
 
@@ -211,16 +296,16 @@ class IRBuilder:
         if source_node.get("type") == "Literal":
             source = source_node.get("value", "")
         elif source_node.get("type") == "TemplateLiteral":
-            # Get static parts
             quasis = source_node.get("quasis", [])
-            if quasis:
+            expressions = source_node.get("expressions", [])
+            if quasis and not expressions:
                 source = quasis[0].get("value", {}).get("cooked", "")
 
-        if source:
+        if source and self._extract_imports:      # DQ-P13
             loc = node.get("loc", {})
             start = loc.get("start", {})
 
-            self._current_ir.imports.append(ImportDecl(
+            self._ir.imports.append(ImportDecl(
                 source=source,
                 specifiers=[],
                 is_dynamic=True,
@@ -229,10 +314,12 @@ class IRBuilder:
 
     def _visit_ExportDefaultDeclaration(self, node: dict) -> None:
         """Handle default exports."""
+        if node.get("exportKind") == "type":
+            return
         loc = node.get("loc", {})
         start = loc.get("start", {})
 
-        self._current_ir.exports.append(ExportDecl(
+        self._ir.exports.append(ExportDecl(
             name="default",
             is_default=True,
             line=start.get("line", 0),
@@ -240,6 +327,8 @@ class IRBuilder:
 
     def _visit_ExportNamedDeclaration(self, node: dict) -> None:
         """Handle named exports."""
+        if node.get("exportKind") == "type":
+            return
         loc = node.get("loc", {})
         start = loc.get("start", {})
 
@@ -250,7 +339,7 @@ class IRBuilder:
             if decl_type == "FunctionDeclaration":
                 name = declaration.get("id", {}).get("name", "")
                 if name:
-                    self._current_ir.exports.append(ExportDecl(
+                    self._ir.exports.append(ExportDecl(
                         name=name,
                         is_default=False,
                         line=start.get("line", 0),
@@ -259,7 +348,7 @@ class IRBuilder:
                 for decl in declaration.get("declarations", []):
                     name = decl.get("id", {}).get("name", "")
                     if name:
-                        self._current_ir.exports.append(ExportDecl(
+                        self._ir.exports.append(ExportDecl(
                             name=name,
                             is_default=False,
                             line=start.get("line", 0),
@@ -267,7 +356,7 @@ class IRBuilder:
             elif decl_type == "ClassDeclaration":
                 name = declaration.get("id", {}).get("name", "")
                 if name:
-                    self._current_ir.exports.append(ExportDecl(
+                    self._ir.exports.append(ExportDecl(
                         name=name,
                         is_default=False,
                         line=start.get("line", 0),
@@ -275,9 +364,11 @@ class IRBuilder:
 
         # Export specifiers
         for spec in node.get("specifiers", []):
+            if spec.get("exportKind") == "type":
+                continue
             exported = spec.get("exported", {}).get("name", "")
             if exported:
-                self._current_ir.exports.append(ExportDecl(
+                self._ir.exports.append(ExportDecl(
                     name=exported,
                     is_default=False,
                     line=start.get("line", 0),
@@ -289,9 +380,14 @@ class IRBuilder:
         if not name:
             return
 
-        # Cap unique identifier names to prevent unbounded memory growth
-        if (name not in self._current_ir.identifiers
-                and len(self._current_ir.identifiers) >= self.MAX_UNIQUE_IDENTIFIERS):
+        # Cap unique identifier names to prevent unbounded memory growth. Reaching this budget
+        # drops NEW identifier names from the IR (losing their def-use visibility), so record it
+        # as a truncation (DQ-C04) rather than silently ignoring the name.
+        if (name not in self._ir.identifiers
+                and len(self._ir.identifiers) >= self.MAX_UNIQUE_IDENTIFIERS):
+            self._note_truncation(
+                f"IR truncated: unique-identifier cap ({self.MAX_UNIQUE_IDENTIFIERS}) reached"
+            )
             return
 
         loc = node.get("loc", {})
@@ -304,10 +400,10 @@ class IRBuilder:
             column=start.get("column", 0),
         )
 
-        if name not in self._current_ir.identifiers:
-            self._current_ir.identifiers[name] = []
-        if len(self._current_ir.identifiers[name]) < self.MAX_OCCURRENCES_PER_IDENTIFIER:
-            self._current_ir.identifiers[name].append(identifier)
+        if name not in self._ir.identifiers:
+            self._ir.identifiers[name] = []
+        if len(self._ir.identifiers[name]) < self.MAX_OCCURRENCES_PER_IDENTIFIER:
+            self._ir.identifiers[name].append(identifier)
 
     def _visit_FunctionDeclaration(self, node: dict) -> set:
         """Handle function declarations. Returns handled keys to prevent double-visit."""
@@ -417,19 +513,27 @@ class IRBuilder:
         callee_type = callee.get("type", "")
 
         if callee_type == "Identifier":
-            return callee.get("name", "")
+            name = callee.get("name", "")
+            return name if isinstance(name, str) else ""
 
         elif callee_type == "MemberExpression":
             if _depth > self.MAX_VISIT_DEPTH:  # deep member chain -> degrade, don't RecursionError
                 return "[deep]"
-            obj = self._get_callee_name(callee.get("object", {}), _depth + 1)
+            object_node = callee.get("object", {})
+            obj = self._get_callee_name(
+                object_node if isinstance(object_node, dict) else {},
+                _depth + 1,
+            )
             prop = callee.get("property", {})
+            if not isinstance(prop, dict):
+                prop = {}
 
             if callee.get("computed"):
                 # obj[prop] - can't determine statically
                 prop_name = "[computed]"
             else:
-                prop_name = prop.get("name", "")
+                value = prop.get("name", "")
+                prop_name = value if isinstance(value, str) else ""
 
             if obj and prop_name:
                 return f"{obj}.{prop_name}"
@@ -440,7 +544,7 @@ class IRBuilder:
     def _derive_function_name(self, node: dict, prefix: str) -> str:
         """Derive a stable function name for graph building."""
         identifier = (node.get("id") or {}).get("name")
-        if identifier:
+        if isinstance(identifier, str) and identifier:
             return identifier
 
         loc = node.get("loc", {})
@@ -471,15 +575,17 @@ class IRBuilder:
         return ""
 
     # ---- enh1: client-side access-control guard extraction ----
-    def _node_line_range(self, node) -> tuple:
+    def _node_line_range(self, node: Any) -> tuple[int, int]:
         if not isinstance(node, dict):
             return (0, 0)
         loc = node.get("loc") or {}
-        start = (loc.get("start") or {}).get("line", 0)
-        end = (loc.get("end") or {}).get("line", start)
+        start_value = (loc.get("start") or {}).get("line", 0)
+        start = start_value if isinstance(start_value, int) else 0
+        end_value = (loc.get("end") or {}).get("line", start)
+        end = end_value if isinstance(end_value, int) else start
         return (start, end)
 
-    def _node_offset_range(self, node) -> tuple:
+    def _node_offset_range(self, node: Any) -> tuple[int, int]:
         """Absolute [start, end) char offsets from the node's `range`; (0, -1) if absent."""
         if not isinstance(node, dict):
             return (0, -1)
@@ -491,9 +597,9 @@ class IRBuilder:
                 return (0, -1)
         return (0, -1)
 
-    def _enclosing_func(self, line: int):
-        best = None
-        for fd in self._current_ir.function_defs:
+    def _enclosing_func(self, line: int) -> FunctionDef | None:
+        best: FunctionDef | None = None
+        for fd in self._ir.function_defs:
             if fd.line <= line <= fd.end_line:
                 if best is None or (fd.end_line - fd.line) < (best.end_line - best.line):
                     best = fd
@@ -512,8 +618,8 @@ class IRBuilder:
         if off < 0:
             return -1
         best_end = -1
-        best_span = None
-        for fd in self._current_ir.function_defs:
+        best_span: int | None = None
+        for fd in self._ir.function_defs:
             if fd.start_offset < 0 or fd.end_offset < 0:
                 continue
             if fd.start_offset <= off < fd.end_offset:
@@ -523,31 +629,35 @@ class IRBuilder:
                     best_end = fd.end_offset
         return best_end
 
-    def _member_path(self, node):
-        parts = []
+    def _member_path(self, node: Any) -> str | None:
+        parts: list[str] = []
         cur = node
         while isinstance(cur, dict) and cur.get("type") == "MemberExpression":
             prop = cur.get("property") or {}
             if not cur.get("computed") and prop.get("type") == "Identifier":
-                parts.append(prop.get("name") or "")
+                name = prop.get("name")
+                parts.append(name if isinstance(name, str) else "")
             elif cur.get("computed") and prop.get("type") == "Literal":
                 parts.append(str(prop.get("value")))
             else:
                 return None
             cur = cur.get("object")
         if isinstance(cur, dict) and cur.get("type") == "Identifier":
-            parts.append(cur.get("name") or "")
+            root_name = cur.get("name")
+            parts.append(root_name if isinstance(root_name, str) else "")
             return ".".join(reversed([p for p in parts if p]))
         return None
 
-    def _collect_test_tokens(self, test) -> list:
-        tokens, seen = [], set()
+    def _collect_test_tokens(self, test: Any) -> list[str]:
+        tokens: list[str] = []
+        seen: set[str] = set()
 
-        def add(tok):
-            if tok and tok not in seen:
-                seen.add(tok); tokens.append(tok)
+        def add(tok: Any) -> None:
+            if isinstance(tok, str) and tok and tok not in seen:
+                seen.add(tok)
+                tokens.append(tok)
 
-        def walk(node, _depth=0):
+        def walk(node: Any, _depth: int = 0) -> None:
             # Depth-guarded like _visit: a deeply nested guard test (e.g. a ~1500-deep
             # member/logical chain) must degrade, not raise RecursionError and drop the asset.
             if not isinstance(node, dict) or _depth > self.MAX_VISIT_DEPTH:
@@ -556,7 +666,8 @@ class IRBuilder:
             if t in ("FunctionExpression", "ArrowFunctionExpression", "FunctionDeclaration"):
                 return
             if t == "Identifier":
-                add(node.get("name")); return
+                add(node.get("name"))
+                return
             if t == "MemberExpression":
                 prop = node.get("property") or {}
                 if not node.get("computed") and prop.get("type") == "Identifier":
@@ -591,7 +702,7 @@ class IRBuilder:
         walk(test)
         return tokens
 
-    def _consequent_is_exit(self, node) -> bool:
+    def _consequent_is_exit(self, node: Any) -> bool:
         if not isinstance(node, dict):
             return False
         t = node.get("type")
@@ -602,7 +713,7 @@ class IRBuilder:
             return bool(body) and self._consequent_is_exit(body[-1])
         return False
 
-    def _is_negative_test(self, test) -> bool:
+    def _is_negative_test(self, test: Any) -> bool:
         if not isinstance(test, dict):
             return False
         t = test.get("type")
@@ -618,9 +729,19 @@ class IRBuilder:
                         return True
         return False
 
-    def _record_guard(self, tokens, guarded_start, guarded_end, test_start, test_end,
-                      node_kind, polarity, guarded_off=(0, -1), test_off=(0, -1)):
-        self._current_ir.guard_conditions.append(GuardCondition(
+    def _record_guard(
+        self,
+        tokens: list[str],
+        guarded_start: int,
+        guarded_end: int,
+        test_start: int,
+        test_end: int,
+        node_kind: str,
+        polarity: str,
+        guarded_off: tuple[int, int] = (0, -1),
+        test_off: tuple[int, int] = (0, -1),
+    ) -> None:
+        self._ir.guard_conditions.append(GuardCondition(
             scope=self._current_scope, node_kind=node_kind, polarity=polarity,
             guarded_start=guarded_start, guarded_end=guarded_end,
             test_start=test_start, test_end=test_end, test_start_line=test_start,
@@ -629,7 +750,7 @@ class IRBuilder:
             tokens=list(tokens),
         ))
 
-    def _visit_IfStatement(self, node: dict):
+    def _visit_IfStatement(self, node: dict) -> None:
         test = node.get("test") or {}
         consequent = node.get("consequent") or {}
         tokens = self._collect_test_tokens(test)
@@ -651,7 +772,7 @@ class IRBuilder:
                                    (if_off_end, func_off_end), t_off)
         return None
 
-    def _visit_ConditionalExpression(self, node: dict):
+    def _visit_ConditionalExpression(self, node: dict) -> None:
         test = node.get("test") or {}
         tokens = self._collect_test_tokens(test)
         if tokens:
@@ -663,7 +784,7 @@ class IRBuilder:
                                    self._node_offset_range(consequent), self._node_offset_range(test))
         return None
 
-    def _visit_LogicalExpression(self, node: dict):
+    def _visit_LogicalExpression(self, node: dict) -> None:
         if node.get("operator") == "&&":
             left = node.get("left") or {}
             right = node.get("right") or {}
@@ -682,7 +803,7 @@ class IRBuilder:
         start = loc.get("start", {})
         end = loc.get("end", {})
         start_offset, end_offset = self._node_offset_range(node)
-        self._current_ir.function_defs.append(FunctionDef(
+        self._ir.function_defs.append(FunctionDef(
             name=func_name,
             scope=f"function:{func_name}",
             line=start.get("line", 0),
@@ -693,10 +814,10 @@ class IRBuilder:
 
     def _finalize_call_graph(self) -> None:
         """Build a simple intra-file call graph between known function scopes."""
-        known_names = {func_def.name for func_def in self._current_ir.function_defs}
+        known_names = {func_def.name for func_def in self._ir.function_defs}
         call_graph: dict[str, set[str]] = {}
 
-        for call in self._current_ir.function_calls:
+        for call in self._ir.function_calls:
             if call.scope == "global":
                 continue
             callee = call.name
@@ -704,7 +825,7 @@ class IRBuilder:
                 continue
             call_graph.setdefault(call.scope, set()).add(f"function:{callee}")
 
-        self._current_ir.call_graph = {
+        self._ir.call_graph = {
             scope: sorted(targets)
             for scope, targets in call_graph.items()
         }
@@ -720,6 +841,10 @@ def build_ir(
     ast: dict[str, Any],
     file_url: str,
     file_hash: str,
+    extract_strings: bool = True,
+    extract_calls: bool = True,
+    extract_imports: bool = True,
+    build_call_graph: bool = True,
 ) -> IntermediateRepresentation:
     """
     Convenience function to build IR.
@@ -728,10 +853,16 @@ def build_ir(
         ast: Parsed AST dictionary
         file_url: URL of the source file
         file_hash: Hash of the source file
+        extract_strings / extract_calls / extract_imports / build_call_graph: DQ-P13 feature flags
+            (default True = full extraction, call graph built)
 
     Returns:
         IntermediateRepresentation
     """
-    builder = IRBuilder()
+    builder = IRBuilder(
+        extract_strings=extract_strings,
+        extract_calls=extract_calls,
+        extract_imports=extract_imports,
+        build_call_graph=build_call_graph,
+    )
     return builder.build(ast, file_url, file_hash)
-

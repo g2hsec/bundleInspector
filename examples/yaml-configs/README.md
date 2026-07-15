@@ -4,7 +4,7 @@ These YAML files are reference examples for a declarative rule configuration for
 
 ## Files
 
-- `default.yml` - Example default configuration with all settings
+- `default.yml` - Example configuration covering the common `scope` / `crawler` / `parser` / `rules` / `output` sections (a curated subset of the full `Config` schema — see [docs/CONFIG_REFERENCE.md](../../docs/CONFIG_REFERENCE.md) for every field; the `auth` section is intentionally omitted)
 - `rulesets/meta.yml` - Ruleset metadata format
 - `rulesets/rules/*.yml` - Rule definition examples per category
 

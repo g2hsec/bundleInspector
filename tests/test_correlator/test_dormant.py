@@ -6,18 +6,16 @@ paths), FP-safe (no-op without an observation baseline; endpoints on uncontacted
 left alone), and idempotent.
 """
 
-import pytest
-
 from bundleInspector.config import Config
-from bundleInspector.parser.js_parser import parse_js
-from bundleInspector.parser.ir_builder import build_ir
-from bundleInspector.rules.base import AnalysisContext
-from bundleInspector.rules.engine import RuleEngine
-from bundleInspector.storage.models import Category, Severity
 from bundleInspector.correlator.dormant import (
     annotate_dormant_endpoints,
     build_observed_index,
 )
+from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
+from bundleInspector.rules.base import AnalysisContext
+from bundleInspector.rules.engine import RuleEngine
+from bundleInspector.storage.models import Category, Severity
 
 
 def _endpoints(source: str):
@@ -40,12 +38,15 @@ def _dormant(f) -> bool:
 
 # --------------------------------------------------------------------------- build_observed_index
 
+
 def test_index_accepts_strings_and_tuples():
-    idx = build_observed_index([
-        ("GET", "https://api.x.com/a/1"),
-        "https://api.x.com/b",
-        ("POST", "/c/2"),
-    ])
+    idx = build_observed_index(
+        [
+            ("GET", "https://api.x.com/a/1"),
+            "https://api.x.com/b",
+            ("POST", "/c/2"),
+        ]
+    )
     assert idx["hosts"] == {"api.x.com"}
     assert "/a/{id}" in idx["rel_paths"]
     assert "/b" in idx["rel_paths"]
@@ -55,11 +56,13 @@ def test_index_accepts_strings_and_tuples():
 
 
 def test_index_normalizes_ids_uuid_hex():
-    idx = build_observed_index([
-        "https://h/u/550e8400-e29b-41d4-a716-446655440000",
-        "https://h/o/deadbeefdeadbeefdeadbeef01",
-        "https://h/n/12345",
-    ])
+    idx = build_observed_index(
+        [
+            "https://h/u/550e8400-e29b-41d4-a716-446655440000",
+            "https://h/o/deadbeefdeadbeefdeadbeef01",
+            "https://h/n/12345",
+        ]
+    )
     assert ("h", "/u/{id}") in idx["host_paths"]
     assert ("h", "/o/{id}") in idx["host_paths"]
     assert ("h", "/n/{id}") in idx["host_paths"]
@@ -67,13 +70,14 @@ def test_index_normalizes_ids_uuid_hex():
 
 # --------------------------------------------------------------------------- core dormancy
 
+
 def test_relative_declared_not_called_is_dormant():
     fs = _endpoints('fetch("/api/v1/users"); fetch("/api/v1/admin/purge");')
     observed = {("GET", "https://app/api/v1/users")}
     n = annotate_dormant_endpoints(fs, observed, Config().rules)
     m = _by_value(fs)
-    assert not _dormant(m["/api/v1/users"])           # was called
-    assert _dormant(m["/api/v1/admin/purge"])         # never called
+    assert not _dormant(m["/api/v1/users"])  # was called
+    assert _dormant(m["/api/v1/admin/purge"])  # never called
     assert n == 1
 
 
@@ -89,8 +93,8 @@ def test_absolute_endpoint_on_observed_host():
     observed = {("GET", "https://api.acme.com/health")}
     annotate_dormant_endpoints(fs, observed, Config().rules)
     m = _by_value(fs)
-    assert _dormant(m["https://api.acme.com/reports"])       # host contacted, path not
-    assert not _dormant(m["https://api.acme.com/health"])    # exercised
+    assert _dormant(m["https://api.acme.com/reports"])  # host contacted, path not
+    assert not _dormant(m["https://api.acme.com/health"])  # exercised
 
 
 def test_absolute_endpoint_on_uncontacted_host_is_not_flagged():
@@ -109,6 +113,7 @@ def test_no_baseline_is_noop():
 
 # --------------------------------------------------------------------------- severity + additivity
 
+
 def test_sensitive_dormant_bumped_to_medium():
     fs = _endpoints('fetch("/internal/admin/console"); fetch("/api/loaded");')
     observed = {("GET", "https://app/api/loaded")}
@@ -126,7 +131,7 @@ def test_non_sensitive_dormant_keeps_severity_but_tagged():
     annotate_dormant_endpoints(fs, observed, Config().rules)
     w = _by_value(fs)["/api/v1/widgets"]
     assert _dormant(w)
-    assert w.severity == before             # not sensitive -> severity unchanged
+    assert w.severity == before  # not sensitive -> severity unchanged
     assert w.metadata.get("dormant_sensitive") is None
 
 
@@ -136,7 +141,7 @@ def test_severity_never_lowered_for_sensitive_dormant():
     f = _by_value(fs)["/internal/admin/purge"]
     f.severity = Severity.HIGH
     annotate_dormant_endpoints(fs, {("GET", "https://app/internal/admin/other")}, Config().rules)
-    assert f.severity == Severity.HIGH      # bump target MEDIUM must not lower HIGH
+    assert f.severity == Severity.HIGH  # bump target MEDIUM must not lower HIGH
 
 
 def test_idempotent_no_double_tag():
@@ -162,3 +167,28 @@ def test_additive_never_drops_findings():
     annotate_dormant_endpoints(fs, {("GET", "https://app/api/a")}, Config().rules)
     after = {f.extracted_value for f in fs}
     assert before == after
+
+
+def test_whole_segment_template_endpoint_not_falsely_dormant():
+    """A declared `/x/${id}` endpoint exercised by a concrete observed `/x/42` must NOT be tagged
+    dormant -- the template collapses to a single `{id}` segment (not slash-split), so declared and
+    observed normalize identically."""
+    from bundleInspector.storage.models import Confidence, Evidence, Finding
+
+    f = Finding(
+        rule_id="endpoint-detector",
+        category=Category.ENDPOINT,
+        severity=Severity.LOW,
+        confidence=Confidence.MEDIUM,
+        title="t",
+        evidence=Evidence(file_url="f.js", file_hash="h", line=1),
+        extracted_value="/users/${id}",
+        value_type="api_path",
+    )
+    annotate_dormant_endpoints(
+        [f],
+        [("GET", "https://app.example.com/users/42")],
+        Config().rules,
+        primary_hosts={"app.example.com"},
+    )
+    assert not _dormant(f)

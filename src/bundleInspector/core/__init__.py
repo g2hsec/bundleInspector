@@ -1,5 +1,7 @@
 """Core orchestration module."""
 
+from typing import Any
+
 # Light re-exports (no browser/network stack). PipelineStage lives in core.progress; import
 # it from there rather than via the orchestrator so this package stays importable without
 # pulling in playwright/httpx.
@@ -18,7 +20,7 @@ __all__ = [
 ]
 
 
-def __getattr__(name):
+def __getattr__(name: str) -> Any:
     # Lazy: the orchestrator (BundleInspector/Orchestrator) drags in playwright/httpx, and
     # JobQueue transitively imports the orchestrator too. Deferring them keeps
     # `import bundleInspector.core.asset_analysis` (the spawned-worker entry) light while
@@ -32,4 +34,3 @@ def __getattr__(name):
 
         return getattr(job_queue, name)
     raise AttributeError(f"module {__name__!r} has no attribute {name!r}")
-

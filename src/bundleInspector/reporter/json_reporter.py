@@ -8,7 +8,7 @@ import json
 from typing import Any
 
 from bundleInspector.reporter.base import BaseReporter
-from bundleInspector.storage.models import Report, Category
+from bundleInspector.storage.models import Report
 
 
 class JSONReporter(BaseReporter):
@@ -19,39 +19,45 @@ class JSONReporter(BaseReporter):
 
     def __init__(
         self,
-        indent: int = 2,
+        indent: int | None = 2,
         include_raw: bool = False,
         mask_secrets: bool = True,
-    ):
+        secret_visible_chars: int = 4,
+    ) -> None:
         self.indent = indent
         self.include_raw = include_raw
         self.mask_secrets = mask_secrets
+        self.secret_visible_chars = secret_visible_chars
 
     def generate(self, report: Report) -> str:
         """Generate JSON report."""
+        if self.mask_secrets:
+            from bundleInspector.reporter.redaction import sanitize_report_copy
+            report = sanitize_report_copy(
+                report,
+                visible_chars=self.secret_visible_chars,
+                include_raw_assets=self.include_raw,
+                honor_existing_mask=False,
+            )
+        else:
+            report = report.model_copy(deep=True)
         # Compute summary
         report.compute_summary()
 
-        # Convert to dict
-        data = report.model_dump(
-            mode="json",
-            exclude_none=True,
-        )
-
-        # Remove raw asset payloads unless explicitly requested
-        if not self.include_raw:
-            for asset in data.get("assets", []):
-                asset.pop("content", None)
-                asset.pop("sourcemap_content", None)
+        # Convert to dict. On the default (raw-off) path, exclude the byte payloads INSIDE
+        # model_dump so json-mode serialization never utf-8-decodes non-UTF8 asset bytes and crashes
+        # before a post-hoc pop could run (DQ-O14).
+        if self.include_raw:
+            data = report.model_dump(mode="json", exclude_none=True)
+        else:
+            data = report.model_dump(
+                mode="json",
+                exclude_none=True,
+                exclude={"assets": {"__all__": {"content", "sourcemap_content"}}},
+            )
 
         for finding in data.get("findings", []):
             self._prefer_original_evidence(finding)
-
-        # Security: Mask or remove secret values from findings
-        if self.mask_secrets:
-            for finding in data.get("findings", []):
-                if finding.get("category") == Category.SECRET.value:
-                    self._mask_secret_finding(finding)
 
         return json.dumps(data, indent=self.indent, ensure_ascii=False)
 
@@ -177,6 +183,5 @@ class CompactJSONReporter(JSONReporter):
 
     name = "json_compact"
 
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__(indent=None, include_raw=False)
-

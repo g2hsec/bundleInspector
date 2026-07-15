@@ -6,10 +6,14 @@ Provides utilities for working with extracted string literals.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
-from typing import Iterator, Optional
+from collections.abc import Iterator
+from dataclasses import dataclass
+from typing import TYPE_CHECKING
 
 from bundleInspector.storage.models import StringLiteral
+
+if TYPE_CHECKING:
+    from bundleInspector.storage.models import IntermediateRepresentation
 
 
 @dataclass
@@ -20,7 +24,7 @@ class StringEntry:
     count: int = 1
 
     @property
-    def first_occurrence(self) -> Optional[StringLiteral]:
+    def first_occurrence(self) -> StringLiteral | None:
         """Get first occurrence of this string."""
         return self.literals[0] if self.literals else None
 
@@ -32,7 +36,7 @@ class StringTable:
     Provides deduplication and lookup functionality.
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self._entries: dict[str, StringEntry] = {}
         self._by_line: dict[int, list[StringLiteral]] = {}
 
@@ -61,7 +65,7 @@ class StringTable:
             self._by_line[line] = []
         self._by_line[line].append(literal)
 
-    def get(self, value: str) -> Optional[StringEntry]:
+    def get(self, value: str) -> StringEntry | None:
         """Get entry for a string value."""
         return self._entries.get(value)
 
@@ -89,7 +93,7 @@ class StringTable:
     def filter_by_length(
         self,
         min_length: int = 0,
-        max_length: Optional[int] = None,
+        max_length: int | None = None,
     ) -> Iterator[StringEntry]:
         """
         Filter strings by length.
@@ -163,7 +167,7 @@ class StringTable:
                     yield entry
 
     @classmethod
-    def from_ir(cls, ir: "IntermediateRepresentation") -> "StringTable":
+    def from_ir(cls, ir: IntermediateRepresentation) -> StringTable:
         """
         Build string table from IR.
 
@@ -177,4 +181,3 @@ class StringTable:
         for literal in ir.string_literals:
             table.add(literal)
         return table
-

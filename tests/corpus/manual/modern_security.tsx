@@ -1,0 +1,1 @@
+const input: string = location.hash; const view=<div dangerouslySetInnerHTML={{__html: input}}/>; fetch("/api/tsx-modern?page=1",{method:"POST",headers:{Authorization:"Bearer synthetic","X-Mode":"tsx"},body:JSON.stringify({name:"value"})});

@@ -5,8 +5,9 @@ Base classes for rule engine.
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import Iterator
 from dataclasses import dataclass, field
-from typing import Any, Iterator
+from typing import Any
 
 from bundleInspector.storage.models import (
     Category,
@@ -21,6 +22,7 @@ from bundleInspector.storage.models import (
 @dataclass
 class AnalysisContext:
     """Context for rule analysis."""
+
     file_url: str
     file_hash: str
     source_content: str
@@ -42,7 +44,14 @@ class AnalysisContext:
         Returns:
             (snippet, (start_line, end_line))
         """
-        lines = self.source_content.split("\n")
+        # Cache the line split on the context: get_snippet runs once per finding with the same
+        # source_content, so splitting per call is O(findings x file-size) -> quadratic on a
+        # single-line minified bundle (thousands of findings each re-splitting the whole file).
+        cache = self.__dict__.get("_snippet_lines_cache")
+        if cache is None or cache[0] is not self.source_content:
+            cache = (self.source_content, self.source_content.split("\n"))
+            self.__dict__["_snippet_lines_cache"] = cache
+        lines = cache[1]
 
         start = max(0, line - context_lines - 1)
         end = min(len(lines), line + context_lines)
@@ -63,6 +72,7 @@ class AnalysisContext:
 @dataclass
 class RuleResult:
     """Result from a single rule match."""
+
     rule_id: str
     category: Category
     severity: Severity
@@ -158,4 +168,3 @@ class BaseRule(ABC):
             tags=result.tags,
             metadata=metadata,
         )
-

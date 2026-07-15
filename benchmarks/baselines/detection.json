@@ -1,0 +1,230 @@
+{
+  "benchmark": "detection",
+  "measurement_environment": {
+    "cpu_model": "AMD Ryzen 9 9950X 16-Core Processor",
+    "dependencies": {
+      "bundleInspector": "0.1.0",
+      "pydantic": "2.13.4",
+      "pydantic-core": "2.46.4",
+      "regex": "2026.7.10",
+      "tree-sitter": "0.26.0",
+      "tree-sitter-javascript": "0.25.0",
+      "tree-sitter-typescript": "0.23.2"
+    },
+    "implementation": "CPython",
+    "machine": "x86_64",
+    "measurement_origin": "local-wsl",
+    "os": "Linux",
+    "os_release": "6.6.87.2-microsoft-standard-WSL2",
+    "python": "3.13.7"
+  },
+  "profile": "linux-x86_64-python3.13-release",
+  "result_sha256": "5618c22070e38787fbe8e7ac608dcf3e3e0f9deeaaef69da7953af7c03615d1c",
+  "runs": 30,
+  "scenario_contract_sha256": "da0ea168f8b32f1486c3ad18db82ff8bfaabb3527a201ead6d2434b8486af270",
+  "scenarios": {
+    "custom_regex": {
+      "configured_timeout_seconds": 0.05,
+      "name": "custom_regex",
+      "peak_rss_bytes": 404127744,
+      "prior_result_preserved_runs": 30,
+      "runs": 30,
+      "signature_variants": 1,
+      "source_bytes": 20029,
+      "source_sha256": "6fcd68e3c4309fde481a00829306b184118a5c1d9b6c98474a3db57fb410b81e",
+      "timeout_disclosures": 30,
+      "timings_ms": {
+        "coefficient_of_variation": 0.000527,
+        "max": 50.253,
+        "mean": 50.187,
+        "min": 50.145,
+        "p50": 50.179,
+        "p50_bootstrap_95_ci": [
+          50.172,
+          50.197
+        ],
+        "p95": 50.234,
+        "p95_bootstrap_95_ci": [
+          50.21,
+          50.253
+        ],
+        "samples": [
+          50.154,
+          50.202,
+          50.171,
+          50.168,
+          50.229,
+          50.253,
+          50.213,
+          50.188,
+          50.173,
+          50.181,
+          50.175,
+          50.195,
+          50.169,
+          50.199,
+          50.223,
+          50.184,
+          50.156,
+          50.215,
+          50.177,
+          50.169,
+          50.154,
+          50.196,
+          50.177,
+          50.203,
+          50.202,
+          50.238,
+          50.177,
+          50.15,
+          50.145,
+          50.17
+        ]
+      },
+      "warmups": 2
+    },
+    "lexical_candidates": {
+      "expected_retained_by_quote": {
+        "double": 10000,
+        "single": 1,
+        "template": 1
+      },
+      "expected_retained_candidates": 10002,
+      "input_double_candidates": 10001,
+      "name": "lexical_candidates",
+      "partial_disclosures": 30,
+      "peak_rss_bytes": 404127744,
+      "retained_by_quote_variants": [
+        {
+          "double": 10000,
+          "single": 1,
+          "template": 1
+        }
+      ],
+      "retained_candidate_counts": [
+        10002
+      ],
+      "runs": 30,
+      "signature_variants": 1,
+      "source_bytes": 150123,
+      "source_sha256": "9b5b91469f32046800c5f57e452df21393188b765f5f19db30b6d4a92ba4e826",
+      "starvation_missing": [],
+      "successful_runs": 30,
+      "timings_ms": {
+        "coefficient_of_variation": 0.022348,
+        "max": 20.729,
+        "mean": 20.078,
+        "min": 18.408,
+        "p50": 20.178,
+        "p50_bootstrap_95_ci": [
+          20.003,
+          20.296
+        ],
+        "p95": 20.593,
+        "p95_bootstrap_95_ci": [
+          20.378,
+          20.729
+        ],
+        "samples": [
+          18.408,
+          19.247,
+          19.353,
+          20.003,
+          20.18,
+          20.488,
+          19.959,
+          20.177,
+          20.374,
+          19.694,
+          20.321,
+          20.22,
+          20.009,
+          20.378,
+          20.626,
+          20.411,
+          20.729,
+          19.78,
+          20.292,
+          19.9,
+          20.067,
+          20.342,
+          20.553,
+          19.981,
+          20.239,
+          20.299,
+          19.959,
+          20.221,
+          20.107,
+          20.034
+        ]
+      },
+      "warmups": 2
+    },
+    "modern_parse": {
+      "endpoint_preserved": true,
+      "error_runs": 0,
+      "language_hint": "typescript",
+      "name": "modern_parse",
+      "parser_variants": [
+        "tree-sitter-typescript"
+      ],
+      "partial_runs": 0,
+      "peak_rss_bytes": 404127744,
+      "runs": 30,
+      "signature_variants": 1,
+      "source_bytes": 1048576,
+      "source_sha256": "680367a475b6c3996dd075cc1a06e6be0e7933c7e147494c2d26882314283a34",
+      "timings_ms": {
+        "coefficient_of_variation": 0.074678,
+        "max": 643.679,
+        "mean": 606.128,
+        "min": 389.104,
+        "p50": 613.226,
+        "p50_bootstrap_95_ci": [
+          608.339,
+          624.294
+        ],
+        "p95": 639.054,
+        "p95_bootstrap_95_ci": [
+          632.591,
+          643.679
+        ],
+        "samples": [
+          389.104,
+          601.321,
+          556.891,
+          563.65,
+          607.797,
+          576.732,
+          596.332,
+          598.929,
+          594.62,
+          637.137,
+          640.623,
+          619.983,
+          607.042,
+          621.123,
+          608.881,
+          622.725,
+          631.188,
+          621.42,
+          632.603,
+          626.831,
+          624.294,
+          610.799,
+          612.746,
+          612.54,
+          612.615,
+          633.927,
+          643.679,
+          636.436,
+          628.175,
+          613.706
+        ]
+      },
+      "warmups": 2
+    }
+  },
+  "schema_version": 1,
+  "warmups": 2
+}

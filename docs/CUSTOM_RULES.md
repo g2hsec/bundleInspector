@@ -1,7 +1,10 @@
 # Custom Rules
 
-BundleInspector now ships a lightweight custom rule loader for project-specific misses.
-JSON and the shipped YAML subset both work without requiring `PyYAML`.
+BundleInspector ships a bounded custom rule loader for project-specific misses.
+JSON, YAML, and YML are accepted as UTF-8/UTF-8-SIG. PyYAML is a direct
+runtime dependency and the normal YAML backend. A dependency-free parser is
+only a compatibility fallback for the shipped YAML subset when PyYAML cannot
+be imported and for PyYAML's specific unknown-escape case.
 
 Supported entry points:
 
@@ -17,10 +20,16 @@ Supported entry points:
 
 `--rules-file` may point at a single JSON/YAML rule file, a directory of rule
 files, or a ruleset-style `meta.yml` file whose sibling `rules/` directory
-contains the actual rule files.
+contains the actual rule files. Directories load `.json`, `.yaml`, and `.yml`
+files in case-insensitive filename order. A `meta.yml` object with `ruleset`
+and no `rules` array is a discovery marker for that sibling directory; its
+metadata values do not configure runtime behavior.
 
-The same job cache also stores stage checkpoints, so `--resume` can continue from
-stored assets/ASTs/findings instead of only reusing a final report.
+The same job cache also stores stage checkpoints, so `--resume` can continue
+from stored assets/ASTs/findings instead of only reusing a final report. The
+resume fingerprint includes custom-rule/config content and engine/parser
+identity; a changed rule pack invalidates stale analysis instead of reusing
+old custom findings.
 
 ## Rule format
 
@@ -32,6 +41,11 @@ either as top-level fields or inside a top-level `defaults:` block. Rule-local
 values win, and top-level tags are merged with rule-local tags.
 For declarative rules, `defaults:` may also provide `matcher`, `extract`,
 `normalize`, and `evidence`, which are deep-merged with rule-local settings.
+
+Only the documented defaults are active. Pack-level `requires`,
+`defaults.masking`, and `defaults.evidence_snippet_context_lines` are reserved
+metadata with no runtime effect. They are not dependency checks, masking
+policy, or snippet controls in the current loader.
 
 ```json
 {
@@ -107,14 +121,15 @@ Shipped declarative support currently covers:
 
 ## Fields
 
-- `id`: unique rule id
+- `id`: rule id; it must be unique within the loaded custom pack (avoid built-in ids as well so findings remain unambiguous)
+- `enabled`: whether the rule runs (default `true`); set `false` to keep a rule in the file but skip it
 - `title`: finding title
 - `description`: optional finding description
-- `category`: one of `endpoint`, `secret`, `domain`, `flag`, `debug`, `sink`, `upload`
+- `category`: canonical values are `endpoint`, `secret`, `domain`, `flag`, `debug`, `sink`, `upload`; the loader also normalizes `endpoints`, `secrets`, `domains`, `flags`, `feature_flag`, `feature_flags`, `feature-flags`, and `featureflags`
 - `severity`: `info`, `low`, `medium`, `high`, `critical`
 - `confidence`: `low`, `medium`, `high`
 - `value_type`: stored on the finding
-- `pattern`: Python regular expression
+- `pattern`: Python-compatible expression compiled by the third-party `regex` engine under the limits below
 - `scope`: `source` or `string_literal`; may be inherited from top-level or `defaults:`
 - `extract_group`: optional capture group index to emit instead of the full match; may be inherited from top-level or `defaults:`
 - `flags`: optional regex flags from `i`, `m`, `s`, `x`; top-level or `defaults:` flags merge with rule-local flags
@@ -123,6 +138,7 @@ Shipped declarative support currently covers:
 Declarative matcher fields:
 
 - `matcher.type`: `regex`, `ast_pattern`, or `semantic`
+- `matcher.language`: reserved compatibility key for AST/semantic matcher payloads; the current runtime does not filter by language, so it is a no-op with no runtime effect (the strict declarative regex matcher does not accept this extra key)
 - `matcher.pattern.kind`: currently `CallExpression`, `NewExpression`, `VariableDeclarator`, `AssignmentExpression`, or `Property`
 - `matcher.pattern.callee_any_of`: allowed call names such as `fetch` or `axios.get`
 - `matcher.pattern.not_callee_any_of`: exact denylist for call names
@@ -166,6 +182,7 @@ Declarative matcher fields:
 - `extract.fields.<name>.mask`: supports patterns such as `keep_prefix_6_suffix_4`
 - `normalize.<field>`: supports `strip_query` and `lowercase` on extracted fields
 - `evidence.include_ast_path`: stores a stable AST path in finding metadata when the matcher can determine it
+- `evidence.snippet_from`: accepted as `raw` or `normalized` and deep-merged through defaults, but currently reserved and a no-op with no runtime effect; evidence source selection still follows the normal analysis/report enrichment pipeline
 
 Call-expression semantic example:
 
@@ -304,6 +321,62 @@ rules:
         secret_value: { from_capture: token, mask: "keep_prefix_6_suffix_4" }
 ```
 
+## Validation, resource bounds, and partial results
+
+Custom rules run on untrusted bundle text, so every user-controlled regex
+uses the following common contract:
+
+- pattern length is at most 256 characters;
+- flags are limited to `i`, `m`, `s`, and `x`;
+- the selected capture group must exist;
+- nested quantified groups and overlapping repeated wildcards such as
+  `.*.*` / `.+.+` are rejected before registration;
+- each `search` or `finditer` operation has a 0.05 second wall-clock timeout
+  in the `regex` engine; and
+- one legacy/declarative `matcher.type: regex` rule may consume at most 50,000
+  enumerated matches during one asset analysis.
+
+The 50,000 bound counts enumerated matches before finding-level deduplication
+and is shared across source/literal iteration in that regex-rule invocation.
+AST and semantic regex conditions use bounded `search` operations, so the
+timeout applies to them but the enumeration cap does not. Results emitted
+before a timeout or cap are preserved. The remainder of that rule is stopped,
+an `analysis_incomplete` event is recorded, and the final report is `partial`
+with a `custom_rule_analysis_incomplete` issue. A complete report therefore
+means no enabled custom-rule work was lost to a load error, duplicate,
+timeout, match cap, or runtime failure; zero custom findings alone does not
+prove that.
+
+The practical semantic resolver is also bounded: constant propagation stops
+after convergence or 50 passes, and nested string/object resolution stops at
+depth 250. Inputs outside the documented semantic subset or beyond those
+bounds remain unresolved rather than becoming a speculative match. These
+resolver bounds do not currently emit the regex timeout/match-cap diagnostic,
+so use focused fixtures for deep alias/helper patterns.
+
+Loader and execution failures are isolated as follows:
+
+- a malformed or unsupported individual rule is skipped while other valid
+  rules in the file/pack continue;
+- a duplicate custom rule id keeps the first loaded rule and skips later
+  duplicates;
+- an invalid top-level document shape is skipped as a document;
+- a syntax/read failure aborts that file/directory load call (for a directory,
+  no accumulated custom documents are registered), but the rule engine catches
+  it and continues with built-in rules; and
+- a runtime matcher/result failure stops only that rule/result, preserving
+  earlier findings and allowing later rules to run.
+
+All of these configured-rule losses are promoted to analysis completeness
+metadata. Inspect `report.completeness.status` and
+`report.completeness.issues`, not only the finding count.
+
+Legacy regex rule objects and declarative top-level rule objects reject
+unknown fields. Some AST/semantic nested matcher models intentionally accept
+or ignore compatibility keys, so an unlisted nested key must not be assumed
+to work merely because a pack loads. In particular, `matcher.language` and
+`evidence.snippet_from` are the reserved no-op fields described above.
+
 ## FP/FN guidance
 
 - Prefer `scope: "string_literal"` when the signal should only come from literal values. This reduces false positives from comments or surrounding syntax.
@@ -311,4 +384,3 @@ rules:
 - Use `extract_group` when the full match contains extra assignment syntax and only the captured value should appear in the finding.
 - Prefer the declarative `ast_pattern` matcher when the signal is tied to a real call site such as `fetch("...")`. That reduces false positives compared with broad source regexes.
 - Add a focused test fixture for each custom rule so project-specific false negatives stay closed over time.
-

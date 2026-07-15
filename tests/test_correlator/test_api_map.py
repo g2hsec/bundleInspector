@@ -46,3 +46,33 @@ def test_api_map_tree_uses_box_drawing_connectors():
     assert "users" in tree
     assert "戌" not in tree
     assert "戍" not in tree
+
+
+def test_template_and_concrete_id_merge_into_one_route():
+    """A template-param route (`/users/${uid}`) and a concrete-id instance (`/users/42`) map to ONE
+    canonical `/users/{id}` node, not two siblings that double-count the endpoint."""
+    from bundleInspector.correlator.api_map import build_api_map
+    from bundleInspector.storage.models import (
+        Category,
+        Confidence,
+        Evidence,
+        Finding,
+        Report,
+        Severity,
+    )
+
+    def _ep(v, m):
+        return Finding(
+            rule_id="r",
+            category=Category.ENDPOINT,
+            severity=Severity.LOW,
+            confidence=Confidence.MEDIUM,
+            title="t",
+            evidence=Evidence(file_url="f", file_hash="h", line=1),
+            extracted_value=v,
+            value_type="api_path",
+            metadata={"method": m},
+        )
+
+    res = build_api_map(Report(findings=[_ep("/users/42", "GET"), _ep("/users/${uid}", "POST")]))
+    assert sum(dom.total_endpoints for dom in res.domains.values()) == 1

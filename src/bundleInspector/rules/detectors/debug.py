@@ -7,14 +7,17 @@ Detects debug endpoints, diagnostic routes, and development artifacts.
 from __future__ import annotations
 
 import re
-from typing import Iterator
+from collections.abc import Iterator
+from typing import Any
 
 from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
 from bundleInspector.storage.models import (
     Category,
     Confidence,
+    FunctionCall,
     IntermediateRepresentation,
     Severity,
+    StringLiteral,
 )
 
 
@@ -41,7 +44,10 @@ class DebugDetector(BaseRule):
         (r"^/debug(?:/|$)", "debug_endpoint", Severity.HIGH),
         (r"^/admin(?:/|$)", "admin_endpoint", Severity.HIGH),
         (r"^/internal(?:/|$)", "internal_endpoint", Severity.HIGH),
-        (r"^/_", "hidden_endpoint", Severity.MEDIUM),
+        # `/_` marks an underscore-prefixed (often internal) path, but framework BUILD ASSETS
+        # (/_next/, /_nuxt/) are public artifacts in every Next.js/Nuxt bundle -- exclude them so a
+        # scan of any such app isn't flooded with MEDIUM "hidden endpoint" false positives.
+        (r"^/_(?!(?:next|nuxt)[/-])", "hidden_endpoint", Severity.MEDIUM),
         (r"^/test(?:/|$)", "test_endpoint", Severity.MEDIUM),
         (r"^/dev(?:/|$)", "dev_endpoint", Severity.MEDIUM),
         (r"^/health(?:/|$)", "health_endpoint", Severity.LOW),
@@ -61,7 +67,9 @@ class DebugDetector(BaseRule):
         (r"(?:^|(?<=/))server-status(?:/|$)", "server_status_endpoint", Severity.MEDIUM),
         (r"(?:^|(?<=/))trace(?:/|$)", "trace_endpoint", Severity.MEDIUM),
         (r"(?:^|(?<=/))dump(?:/|$)", "dump_endpoint", Severity.HIGH),
-        (r"(?:^|(?<=/))profil(?:e|er|ing)(?:/|$)", "profiler_endpoint", Severity.MEDIUM),
+        # `profiler`/`profiling` only -- the bare `e` alternative matched the ordinary user-facing
+        # `/profile` route as a MEDIUM "Profiler Endpoint" false positive.
+        (r"(?:^|(?<=/))profil(?:er|ing)(?:/|$)", "profiler_endpoint", Severity.MEDIUM),
     ]
 
     # Debug function calls
@@ -91,7 +99,7 @@ class DebugDetector(BaseRule):
     # secrets. Anchored to the start of a (beautified) line so it can't match the directive text
     # embedded inside a bundled tooling string literal.
     SOURCE_MAP_DIRECTIVE = re.compile(
-        r'^[ \t]*(?://|/\*)[#@]\s*(sourceMappingURL|sourceURL)\s*=\s*(\S+?)(?:\s*\*/)?[ \t]*\r?$',
+        r"^[ \t]*(?://|/\*)[#@]\s*(sourceMappingURL|sourceURL)\s*=\s*(\S+?)(?:\s*\*/)?[ \t]*\r?$",
         re.IGNORECASE | re.MULTILINE,
     )
 
@@ -111,15 +119,15 @@ class DebugDetector(BaseRule):
 
         # Check source for debugger statements (DebuggerStatement is not a
         # CallExpression, so it won't appear in ir.function_calls)
-        yield from self._check_debugger_statements(context)
+        yield from self._check_debugger_statements(ir)
 
         # Check source for development patterns
-        yield from self._check_dev_patterns(context)
+        yield from self._check_dev_patterns(ir)
 
         # Check source for source-map disclosure directives
         yield from self._check_source_map(context)
 
-    def _check_debug_endpoints(self, literal) -> Iterator[RuleResult]:
+    def _check_debug_endpoints(self, literal: StringLiteral) -> Iterator[RuleResult]:
         """Check for debug endpoints in strings."""
         value = literal.value
 
@@ -143,7 +151,7 @@ class DebugDetector(BaseRule):
 
     def _check_debug_calls(
         self,
-        call,
+        call: FunctionCall,
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Check for debug function calls."""
@@ -161,7 +169,7 @@ class DebugDetector(BaseRule):
                     severity=Severity.MEDIUM,
                     confidence=Confidence.MEDIUM,
                     title=f"Debug Logging: {full_name}",
-                    description=f"Found console logging with potentially sensitive data",
+                    description="Found console logging with potentially sensitive data",
                     extracted_value=full_name,
                     value_type="debug_logging",
                     line=call.line,
@@ -187,42 +195,39 @@ class DebugDetector(BaseRule):
                 tags=["debug", "alert"],
             )
 
-    def _check_debugger_statements(
-        self,
-        context: AnalysisContext,
-    ) -> Iterator[RuleResult]:
-        """Check for debugger statements via source regex (not in IR function_calls)."""
-        for match in re.finditer(r'\bdebugger\b', context.source_content):
-            # Get the line containing the match to filter out strings/comments
-            line_start = context.source_content.rfind("\n", 0, match.start()) + 1
-            line_end = context.source_content.find("\n", match.end())
-            if line_end == -1:
-                line_end = len(context.source_content)
-            line_text = context.source_content[line_start:line_end].strip()
-
-            # Skip matches inside comments
-            if line_text.startswith("//") or line_text.startswith("*") or line_text.startswith("/*"):
+    def _iter_nodes(self, root: Any) -> Iterator[dict[str, Any]]:
+        stack = [root]
+        while stack:
+            node = stack.pop()
+            if not isinstance(node, dict):
                 continue
+            yield node
+            for key, value in node.items():
+                if key in ("loc", "range", "raw"):
+                    continue
+                if isinstance(value, dict):
+                    stack.append(value)
+                elif isinstance(value, list):
+                    stack.extend(item for item in reversed(value) if isinstance(item, dict))
 
-            prefix = context.source_content[line_start:match.start()]
+    @staticmethod
+    def _member_path(node: Any) -> str:
+        parts = []
+        cur = node
+        while isinstance(cur, dict) and cur.get("type") == "MemberExpression":
+            prop = cur.get("property") or {}
+            parts.append(str(prop.get("name") or prop.get("value") or ""))
+            cur = cur.get("object")
+        if isinstance(cur, dict) and cur.get("type") == "Identifier":
+            parts.append(cur.get("name", ""))
+        return ".".join(reversed([part for part in parts if part]))
 
-            # Skip matches inside inline block comments (e.g., var x; /* debugger */)
-            last_comment_open = prefix.rfind('/*')
-            if last_comment_open >= 0 and prefix.rfind('*/', last_comment_open) < 0:
+    def _check_debugger_statements(self, ir: IntermediateRepresentation) -> Iterator[RuleResult]:
+        """DebuggerStatement is syntax, so use the AST instead of quote/comment heuristics."""
+        for node in self._iter_nodes(ir.raw_ast or {}):
+            if node.get("type") != "DebuggerStatement":
                 continue
-
-            # Skip matches inside string literals (count unescaped quotes)
-            unescaped_dq = len(re.findall(r'(?<!\\)"', prefix))
-            unescaped_sq = len(re.findall(r"(?<!\\)'", prefix))
-            if unescaped_dq % 2 == 1 or unescaped_sq % 2 == 1:
-                continue
-
-            # Skip matches inside template literals (backtick strings)
-            if prefix.count('`') % 2 == 1:
-                continue
-
-            line = context.source_content[:match.start()].count("\n") + 1
-
+            start = (node.get("loc") or {}).get("start") or {}
             yield RuleResult(
                 rule_id=self.id,
                 category=self.category,
@@ -232,8 +237,8 @@ class DebugDetector(BaseRule):
                 description="Found debugger statement in code",
                 extracted_value="debugger",
                 value_type="debugger_statement",
-                line=line,
-                column=0,
+                line=int(start.get("line") or 0),
+                column=int(start.get("column") or 0),
                 ast_node_type="DebuggerStatement",
                 tags=["debug", "debugger"],
             )
@@ -241,8 +246,15 @@ class DebugDetector(BaseRule):
     def _check_logged_data(self, arguments: list) -> bool:
         """Check if logged data might be sensitive."""
         sensitive_keywords = [
-            "password", "token", "secret", "key", "auth",
-            "credential", "session", "cookie", "bearer",
+            "password",
+            "token",
+            "secret",
+            "key",
+            "auth",
+            "credential",
+            "session",
+            "cookie",
+            "bearer",
         ]
 
         for arg in arguments:
@@ -260,38 +272,92 @@ class DebugDetector(BaseRule):
 
         return False
 
-    def _check_dev_patterns(
-        self,
-        context: AnalysisContext,
-    ) -> Iterator[RuleResult]:
-        """Check for development-only patterns in source."""
-        for pattern, pattern_type in self.DEV_PATTERNS:
-            for match in re.finditer(pattern, context.source_content):
-                # Get line number
-                line = context.source_content[:match.start()].count("\n") + 1
+    def _check_dev_patterns(self, ir: IntermediateRepresentation) -> Iterator[RuleResult]:
+        """Detect development conditions structurally; comments/strings are not AST expressions."""
+        seen = set()
+        for node in self._iter_nodes(ir.raw_ast or {}):
+            pattern_type = None
+            extracted = ""
+            t = node.get("type")
+            if t == "Identifier" and node.get("name") in ("__DEV__", "__DEBUG__"):
+                extracted = node["name"]
+                pattern_type = "dev_flag" if extracted == "__DEV__" else "debug_flag"
+            elif t in ("BinaryExpression", "LogicalExpression") and node.get("operator") in (
+                "==",
+                "===",
+            ):
+                left, right = node.get("left") or {}, node.get("right") or {}
+                path = self._member_path(left)
+                value = right.get("value") if right.get("type") == "Literal" else None
+                if path == "process.env.NODE_ENV" and value in ("development", "test"):
+                    extracted = f"{path} === {value!r}"
+                    pattern_type = "dev_check" if value == "development" else "test_check"
+            elif t in ("VariableDeclarator", "AssignmentExpression"):
+                target = node.get("id") if t == "VariableDeclarator" else node.get("left")
+                value = node.get("init") if t == "VariableDeclarator" else node.get("right")
+                name = target.get("name") if isinstance(target, dict) else None
+                if (
+                    name in ("DEBUG", "DEVELOPMENT")
+                    and isinstance(value, dict)
+                    and value.get("value") is True
+                ):
+                    extracted = f"{name}=true"
+                    pattern_type = "debug_enabled" if name == "DEBUG" else "dev_enabled"
+            if pattern_type is None:
+                continue
+            start = (node.get("loc") or {}).get("start") or {}
+            sig = (pattern_type, int(start.get("line") or 0), int(start.get("column") or 0))
+            if sig in seen:
+                continue
+            seen.add(sig)
+            yield RuleResult(
+                rule_id=self.id,
+                category=self.category,
+                severity=Severity.LOW,
+                confidence=Confidence.MEDIUM,
+                title=f"Development Check: {pattern_type}",
+                description=f"Found development/debug conditional: {extracted}",
+                extracted_value=extracted,
+                value_type=pattern_type,
+                line=sig[1],
+                column=sig[2],
+                ast_node_type="Expression",
+                tags=["debug", "development"],
+            )
 
-                yield RuleResult(
-                    rule_id=self.id,
-                    category=self.category,
-                    severity=Severity.LOW,
-                    confidence=Confidence.MEDIUM,
-                    title=f"Development Check: {pattern_type}",
-                    description=f"Found development/debug conditional: {match.group(0)}",
-                    extracted_value=match.group(0),
-                    value_type=pattern_type,
-                    line=line,
-                    column=0,
-                    ast_node_type="Expression",
-                    tags=["debug", "development"],
-                )
+    @staticmethod
+    def _mask_strings(source: str) -> str:
+        chars = list(source)
+        quote = None
+        escaped = False
+        for i, ch in enumerate(source):
+            if quote is not None:
+                if ch == "\n" and quote != "`":
+                    quote = None
+                    escaped = False
+                    continue
+                if not escaped and ch == quote:
+                    chars[i] = " "
+                    quote = None
+                    continue
+                escaped = not escaped and ch == "\\"
+                if ch != "\n":
+                    chars[i] = " "
+                continue
+            if ch in ("'", '"', "`"):
+                quote = ch
+                chars[i] = " "
+                escaped = False
+        return "".join(chars)
 
     def _check_source_map(
         self,
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Check for `//# sourceMappingURL=` disclosure directives in source."""
-        for match in self.SOURCE_MAP_DIRECTIVE.finditer(context.source_content or ""):
-            line = context.source_content[:match.start()].count("\n") + 1
+        source = context.source_content or ""
+        for match in self.SOURCE_MAP_DIRECTIVE.finditer(self._mask_strings(source)):
+            line = context.source_content[: match.start()].count("\n") + 1
             directive, target = match.group(1), match.group(2)
             yield RuleResult(
                 rule_id=self.id,
@@ -299,8 +365,10 @@ class DebugDetector(BaseRule):
                 severity=Severity.LOW,
                 confidence=Confidence.HIGH,
                 title="Source Map Disclosure",
-                description=(f"{directive} directive exposes the source map ({target}), which "
-                             f"reconstructs the original pre-minification source."),
+                description=(
+                    f"{directive} directive exposes the source map ({target}), which "
+                    f"reconstructs the original pre-minification source."
+                ),
                 extracted_value=target,
                 value_type="source_map_reference",
                 line=line,
@@ -308,4 +376,3 @@ class DebugDetector(BaseRule):
                 ast_node_type="Line",
                 tags=["debug", "source-map", "disclosure"],
             )
-

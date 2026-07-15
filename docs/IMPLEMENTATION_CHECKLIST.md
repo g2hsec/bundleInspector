@@ -1,73 +1,179 @@
-# BundleInspector Implementation Checklist
+# BundleInspector Current Implementation Checklist
 
-This document is the canonical shipped-status checklist for the current codebase.
-Use it when checking what is implemented today.
+This is a current-state checklist for version `0.1.0`, not a historical changelog. The repository
+has no Git metadata from which to reconstruct a controlled before/after comparison. A checked item
+means that the capability exists in the current implementation and is covered by an executable
+contract; it does not mean that static analysis is complete for every JavaScript program.
 
-## Completed in this pass
+## Runtime and Entry Points
 
-- [x] Main remote scan path now uses depth-aware multi-page collectors instead of single-page collectors only.
-- [x] Seed URLs are validated with the same SSRF guard used for discovered JS downloads.
-- [x] Beautify line mappings are now propagated back into finding evidence as original line/column data.
-- [x] Source map positions are now propagated into finding evidence when a resolvable original position exists.
-- [x] HTML reports now embed machine-readable report JSON so `bundleInspector convert report.html -f json` works for BundleInspector-generated HTML.
-- [x] HTML reports now show original source location/snippet when source map data is available.
-- [x] Endpoint detection now excludes obvious static assets to reduce false positives.
-- [x] Endpoint detection now resolves simple string constants, object/member-config URLs, shallow or practical nested object-destructured endpoint aliases, practical array-destructured endpoint aliases, destructuring aliases that fall back to practical default values, identifier-backed request config objects, array-selected request config objects, spread-based request config objects and helper-returned spread config objects, direct object-return request-config helpers plus one-step identifier aliases of those helper results, practical block-bodied request-config helpers that return local object/array-selected configs, local object-destructured aliases, or alias them through local variables, practical object-literal helper methods that return request configs including local object/array-selected configs from block bodies, `axios.create({ baseURL })` client instances, practical bound or assignment-backed `XMLHttpRequest.open(method, url)` calls, practical `new URL(path, base)` / URL-object `.href` / `.toString()` patterns, practical `Request` object patterns including `new Request(...)` / bound request variables / `Request.url` reads, and practical `WebSocket` constructor/literal patterns to reduce false negatives.
-- [x] Endpoint detection now resolves simple zero-argument helpers, parameterized helper functions including shallow or practical nested object-pattern parameters, spread-backed object-pattern helper arguments, practical array-pattern parameters, and destructuring defaults inside those practical object/array patterns, statically known default parameters, arrow-function string returns, practical object-literal endpoint helper methods, straight-line helper chains, statically decidable conditional branches, practical block-bodied helper flows with local aliases/assignments, practical `switch`-based helper flows, computed route-map lookups including practical logical/nullish/conditional key selection, array-index lookups including static numeric indexes, logical fallback helpers, and practical nullish-coalescing (`??`) fallbacks to reduce cross-function false negatives.
-- [x] `scan` and `analyze` now support `--config` for loading YAML/JSON base configuration files.
-- [x] `scan` and `analyze` now support `--rules-file`, and `rules.custom_rules_file` now loads shipped custom rules from a single rule file, a rules directory, or a ruleset-style `meta.yml` pack.
-- [x] `scan` and `analyze` now support `--resume` and `--job-id`, and can recover the latest stored report for a known job.
-- [x] `scan` and `analyze` now write stage checkpoints and can resume from stored assets/ASTs/findings instead of only reusing a final report.
-- [x] `scan` and `analyze` now persist per-asset parse/analyze progress so unfinished parse/analyze stages can skip already processed assets on `--resume`.
-- [x] Remote `scan` now persists per-seed/per-ref/per-asset progress across crawl/download/normalize, and local `analyze` now persists per-asset normalize progress, so interrupted runs can continue without redoing completed work units.
-- [x] Shipped custom rules now support declarative `regex`, expanded `ast_pattern` call/new/variable/assignment/object-property matchers including exact, contains, or regex callee matching, exact, contains, or regex identifier/member-path or object-property-path matching plus negative exact/contains/regex AST guards, AST-side callee/id/left/property-path capture, AST-pattern arg-index capture, AST-pattern `index`/`index_any_of` selected-argument matching, direct `IdentifierName`/`MemberPath` AST value matching plus constant-key computed member lookup matching, constant-key computed left-path matching, constant-key computed object-property-path matching, exact/negative-exact plus contains/negative-contains and regex/negative-regex value matching for `args`/`init`/`right`/`value`, and practical semantic `AssignmentExpression`/`CallExpression`/`NewExpression`/`VariableDeclarator`/`Property` matchers with captures, field normalization, member-expression resolution, exact, contains, or regex left/callee/id/property-path matching, negative exact/contains/regex AST guards for those left/callee/id/property-path matchers, AST-side callee/id/left/property-path capture, top-level semantic `logic.any` / `logic.all` / `logic.none` clause-object or shorthand composition, direct `logic.any[]` clause shorthand without `and:`, clause-level semantic `or:` / `not:` composition, direct static member-path invocation-argument matching when no resolved string exists, direct static member-path object-property-value matching when no resolved string exists, direct static member-path right/init/value matching when no resolved string exists, plus constant-key computed member lookup matching for AST value, semantic invocation-argument, semantic object-property-value, semantic right/init/value, semantic left-path, semantic property-path, and semantic object-argument property-path conditions, shallow or practical nested object-destructured constant/helper aliases, practical array-destructured constant/helper aliases, destructuring aliases with practical default values, helper-returned string/object argument or property-value resolution including object spreads, helper-returned spread config objects, and spread-backed object-pattern helper arguments, straight-line block-bodied helpers, shallow or practical nested object-pattern helper parameters, practical array-pattern helper parameters, and practical destructuring defaults inside those helper parameters, plus object-literal helper methods, array-selected or locally aliased object-argument resolution, `index_any_of` multi-argument selection for semantic arg/object-property matchers, exact, exact-list, contains, or regex string-valued object-argument property-path matching plus exact/contains/regex denylist path filters, including constant-key computed object-argument property paths, matched-path capture, matched-arg-index capture, exact, contains, or regex resolved-string matching for assignment/init/property/arg/object-property values, negative allowlist/regex guards, top-level rule default inheritance for `category`, `description`, `value_type`, `severity`, `confidence`, `tags`, `enabled`, regex `scope`, regex `extract_group`, and regex `flags`, deep-merged declarative `matcher` / `extract` / `normalize` / `evidence` defaults, and the currently documented example ruleset pack surface under `examples/yaml-configs`.
-- [x] Declarative custom rules now honor field-level masking in extracted metadata and can attach AST paths when requested.
-- [x] YAML config and custom-rule files now load even when `PyYAML` is unavailable, via a dependency-free fallback parser for the shipped subset.
-- [x] Remote `scan` and local `analyze` now persist assets, ASTs, findings, and final reports under the configured cache/job path.
-- [x] Reports now carry a real `job_id`, and the runtime falls back to a workspace-local cache path when the default cache dir is not writable.
-- [x] JSON reports now mask secret metadata fields in addition to the primary extracted value, and JSON/HTML/SARIF now prefer original source-map-backed locations/snippets when available while preserving normalized bundle evidence.
-- [x] Correlation now adds import-driven, runtime-context-driven, intra-file call-graph edges including multiple practical same-file transitive call paths across plain functions plus object/class method scopes, transitive multi-hop import edges, imported-symbol inter-module call-chain edges, transitive imported-scope call-chain edges, practical multi-hop inter-module imported-call-chain edges, practical barrel `export { ... } from "./mod"` and `export * from "./mod"` re-export forwarding including member-access-aware default-object and named-object member forwarding where downstream export metadata proves the object or class-member shape, practical CommonJS `require()` plus `module.exports`/`exports.foo` forwarding, `module.exports = require("./mod")` barrel forwarding, and identifier-backed CommonJS require-alias re-export forwarding, export-scope-aware alias/default-export call-chain edges including default-exported and named exported object or class members, direct local aliases of import bindings, namespace/default/CommonJS object-destructured alias call-chain edges, lexical-parent-scope-visible import binding call-chain edges for nested inner scopes, scope-aware dynamic-import namespace/default call-chain edges from practical `await import()` and simple `.then()` callback bindings, namespace-import member alias call-chain edges, multiple practical source-side and target-side intra-module call paths to the same imported target finding, multiple practical re-export/import call paths to the same target finding, binding-metadata-backed transitive import, dynamic-import, load-context-import, and pure-import same-file scope-call-chain recovery when plain `imports` or `dynamic_imports` lists are absent, pure-import-rooted transitive import-chain runtime linkage, pure-import-rooted imported call-chain runtime linkage, pure-import-rooted same-file scope-call-chain runtime linkage, multi-parent initiator-chain runtime edges, mixed import/initiator execution-chain runtime edges, unified runtime-execution-graph edges over arbitrary practical import/dynamic/initiator paths, unified runtime same-file scope-call-graph edges and downstream inter-module call-graph edges over those execution paths, initiator-rooted downstream imported call-chain runtime linkage, initiator-rooted same-file scope-call-chain runtime linkage inside runtime-reached modules, initiator/mixed/load-context import-or-execution scope-call-chain runtime linkage for same-file transitive calls inside runtime-reached modules, direct load-context root same-file scope-call-chain runtime linkage, load-context-rooted pure-initiator imported call-chain and scope-call-chain runtime linkage, and load-context-rooted transitive runtime-chain edges including imported call-chain runtime linkage, downstream-module imported call-chain runtime linkage reached over transitive import or mixed execution paths, plus multiple practical mixed import/initiator execution chains in addition to same-file/base-url heuristics.
-- [x] Correlation now adds dynamic-import edges, direct initiator-chain runtime edges, and transitive nested initiator-chain runtime edges for more precise runtime/module linkage.
-- [x] Remote `scan` now persists per-seed collector-phase crawl progress, phase-internal discovered refs, practical multipage visited/pending page state, collected-JS URL state, inflight page checkpoints, static-collector HTML snapshots for in-flight pages, headless DOM snapshots plus route-exploration link/click progress, pending route-replay state, pending interactive-click replay state, browser storage state, current page URL, and mid-request discovered network JS refs for in-flight pages, page-internal discovered-ref and discovered-link iteration progress, and mid-page ref/page-state checkpoints, so interrupted seeds can resume without re-running already finished static/headless/manifest collectors and with less repeated multipage crawl work inside unfinished phases, including safe replay of the collector's browser actions at action boundaries.
-- [x] The current runtime config model is now documented in `docs/CONFIG_REFERENCE.md`, and CLI output paths/reporter behavior now honor shipped `output_dir`, `include_raw_content`, and `rules.mask_secrets` settings.
-- [x] Headless collector behavior is now covered by mocked unit tests for auth-context setup, navigation fallback, network-captured JS deduplication, headless multipage link filtering, and headless multipage resume/progress state.
-- [x] Reporter coverage now includes HTML embedded-report JSON safety/no-raw-asset regression checks and HTML original-source evidence rendering checks alongside JSON/SARIF source-aware output tests.
-- [x] Optional hardening now includes additional docs/example adversarial fixtures for secret and endpoint false positives, an end-to-end orchestrator integration fixture that runs headless and manifest discoveries through the real pipeline, and a synthetic correlator benchmark script plus extra pass-wide call-target caching for larger graph workloads.
+- [x] Package metadata supports CPython 3.10 through 3.13 (`>=3.10,<3.14`).
+- [x] `bundleInspector scan` performs scoped remote collection and analysis.
+- [x] `bundleInspector analyze` performs local file/directory/glob analysis without target-network
+  traffic.
+- [x] `bundleInspector convert` converts BundleInspector JSON/HTML reports, and `version` reports the
+  package version.
+- [x] JSON, self-contained HTML, and SARIF reports are supported; wordlist, attack-chain, and API-map
+  views are available from the CLI.
+- [x] Playwright is a runtime dependency, while the Chromium binary and host libraries are separate
+  prerequisites for headless collection.
+- [x] PyYAML and the JavaScript/TypeScript Tree-sitter grammars are direct runtime dependencies.
+  Node.js/Acorn remains an optional parser path.
 
-## Canonical status
+## Analysis Pipeline
 
-- [x] Resume now restores from stage checkpoints and per-work-unit progress across crawl/download/normalize/parse/analyze, including per-seed collector phases, phase-internal discovered refs, practical multipage visited/pending page state, collected-JS URL state, inflight page checkpoints, static-collector HTML snapshots for in-flight pages, headless DOM snapshots plus route-exploration link/click progress, pending route-replay state, pending interactive-click replay state, browser storage state, current page URL, and mid-request discovered network JS refs for in-flight pages, page-internal discovered-ref and discovered-link iteration progress, and mid-page ref/page-state checkpoints during crawl, with action-boundary replay for the collector's browser interactions.
-- [x] Declarative custom rules now cover the documented YAML DSL shipped in `docs/CUSTOM_RULES.md` and `examples/yaml-configs`, including top-level semantic `logic.any` / `logic.all` / `logic.none` clause-object composition, direct clause shorthand, ruleset packs, inherited defaults, and the current AST/semantic matcher surface.
-- [x] Correlation now builds a transitive inter-module call graph over import/re-export/call metadata and a unified runtime execution graph over practical import/dynamic/initiator metadata, and projects same-file plus downstream-module call graphs over those runtime paths.
+| Area | Current implemented contract | Status |
+|---|---|---|
+| Collection | Static HTML, optional headless rendering, build-manifest probing, multipage discovery, bounded fixed-point asset expansion, source maps, and virtual/inline sources | Implemented |
+| Network boundary | Seed, redirect, manifest, asset, and source-map requests are scope/SSRF checked; redirects and response sizes are bounded; credentials are origin-bound | Implemented |
+| Evidence | The raw content-hash artifact is retained; eligible plain JS may use a literal-preserving beautified derivative as the parse/analyze input, while TS/JSX-shaped or literal-losing candidates stay raw-equivalent; findings preserve normalized and available original source locations | Implemented |
+| Parser | Language hints route JS/JSX/TS/TSX to the matching structural backend; incomplete parsing is retried or explicitly reported as partial/degraded | Implemented |
+| Completeness | Collection, parser, rule, cap, graph, and lifecycle loss is represented by `AnalysisCompleteness` issues instead of being silently reported as zero findings | Implemented |
+| Detectors | Endpoints/request contracts, secrets, domains, flags, debug surface, routes/chunks, DOM/code sinks, uploads, GraphQL/WebSocket, and runtime/dormant surface | Implemented |
+| Flow | Reachability-aware, binding/member/alias-aware, context-sensitive taint distinguishes confirmed, probable, and unavailable evidence; unreachable paths do not become confirmed flows | Implemented |
+| Correlation | Canonical import/re-export/dynamic/runtime identities, directional edges, deterministic clustering, partition-fair caps, and cap telemetry | Implemented |
+| Risk and triage | Evidence-sensitive risk tiers, download-surface annotation, third-party labeling, and non-destructive likely-false-positive annotation | Implemented |
+| Resume | Per-stage and per-work-item checkpoints cover remote and local work; a content/config signature invalidates stale incompatible state | Implemented |
+| Custom rules | Strict YAML/JSON regex, AST-pattern, and semantic matchers with bounded regex execution, captures, scopes, inheritance, and shipped pack support | Implemented |
 
-## Hardening status
+## Security, Persistence, and Output
 
-- [x] Additional endpoint/secret adversarial fixtures have been added for docs/example-labeled false positives.
-- [x] Larger integration fixtures now cover HTML<->JSON conversion, reporter output, sourcemap-backed evidence, and full-pipeline headless/manifest discovery.
-- [x] Performance hardening now includes per-pass dependency/runtime caches, pass-wide call-target caches, and a runnable synthetic correlator benchmark script under `scripts/benchmark_correlator.py`.
+- [x] State-changing requests induced by headless exploration are blocked unless an explicit
+  confirmation handler approves them; the guard remains armed for the page lifetime.
+- [x] Authentication inputs reject control-character injection at construction, assignment, and
+  transport preparation after mutable-map changes; persisted configuration, checkpoints, reports,
+  logs, and public projections use credential-aware redaction.
+- [x] Secret masking is applied across JSON, HTML, SARIF, snippets, and metadata. A visible-character
+  count of zero produces no secret suffix.
+- [x] Job/report/finding identities use portable path components. Storage rejects linked, reparse,
+  non-regular, and multi-link payloads where the platform exposes those properties.
+- [x] Persistent writes use atomic publication, bounded 64-shard sibling locks, ownership records,
+  and terminal unsafe-path/commit errors rather than silently continuing.
+- [x] Reporter input models are treated as immutable projections; one-shot user outputs use atomic
+  replacement.
+- [x] Strict configuration rejects unknown fields and propagates parser, rule, output, timeout,
+  scope, and storage settings through the actual pipeline. Remote-scan asset parallelism is a
+  separate opt-in `BUNDLEINSPECTOR_PARALLEL` environment control; local `analyze` remains serial.
 
-No queued hardening items remain in this checklist. Any further work would be new scope rather than unfinished backlog.
+## MCP Public Projection
 
-## FP/FN checklist
+The project exposes the `bundleInspector-mcp` entry point, and the optional `[mcp]` extra supplies
+its runtime dependency. The standalone server is intentionally limited to local stdio and the
+`local` repository principal.
 
-- [x] Block obvious endpoint false positives from static asset URLs.
-- [x] Block standalone endpoint false positives from docs/marketing full URLs and docs/example-labeled API-looking literal URLs while preserving call-site detection.
-- [x] Recover common endpoint false negatives from constant concatenation, object/member propagation, shallow object destructuring, identifier-backed request configs, array-selected request configs, spread-based request configs and helper-returned spread config objects, direct object-return request-config helpers and one-step aliases of those helper results, practical block-bodied request-config helpers that return local object/array-selected configs, local object-destructured aliases, or alias them through locals, practical object-literal request-config helper methods including block-bodied local object/array-selected config returns, `axios.create({ baseURL })`, practical bound or assignment-backed `XMLHttpRequest.open(method, url)` patterns, practical standard `URL` constructor assembly patterns, practical fetch `Request` object patterns, and practical `WebSocket` constructor/literal patterns.
-- [x] Recover common endpoint false negatives from simple zero-argument helpers, parameterized helper functions including shallow or practical nested object-pattern parameters, spread-backed object-pattern helper arguments, practical array-pattern parameters, and destructuring defaults within those practical helper patterns, statically known default parameters, practical object-literal endpoint helper methods, straight-line helper chains, statically decidable conditional branches, practical block-bodied helper flows with local aliases, practical `switch`-based helper flows, computed route-map lookups including practical logical/nullish/conditional key selection, array-index lookups, logical fallbacks, and practical nullish-coalescing fallbacks.
-- [x] Preserve original-source locations where beautification/source maps would otherwise blur evidence.
-- [x] Allow project-specific miss recovery through shipped custom regex rules.
-- [x] Allow project-specific call-site misses to be closed with shipped declarative `ast_pattern`/semantic custom rules, exact, contains, or regex callee/id/member-path or object-property-path matching, negative exact/contains/regex guards for shipped `ast_pattern` path/callee/id matchers, AST-side callee/id/left/property-path capture, AST-pattern arg-index capture, direct `IdentifierName`/`MemberPath` AST value matching plus constant-key computed member lookup matching, constant-key computed left-path matching, constant-key computed object-property-path matching, exact/negative-exact plus contains/negative-contains and regex/negative-regex value matching for `ast_pattern` args/init/right/value, exact, contains, or regex semantic left/callee/id/property-path matching, negative exact/contains/regex AST guards for those semantic path/callee/id matchers, AST-side callee/id/left/property-path capture, top-level semantic `logic.all` and `logic.none` shorthand, direct `logic.any[]` clause shorthand without `and:`, clause-level semantic `or:` / `not:` composition, identifier/member resolution, direct static member-path invocation-argument matching when no resolved string exists, direct static member-path object-property-value matching when no resolved string exists, direct static member-path right/init/value matching when no resolved string exists, plus constant-key computed member lookup matching for AST value, semantic invocation-argument, semantic object-property-value, semantic right/init/value, semantic left-path, semantic property-path, and semantic object-argument property-path conditions, shallow or practical nested object-destructured constant/helper aliases, practical array-destructured constant/helper aliases, destructuring aliases with practical default values, helper-returned string/object resolution including object spreads, helper-returned spread config objects, and spread-backed object-pattern helper arguments, straight-line block-bodied helpers, shallow or practical nested object-pattern helper parameters, practical array-pattern helper parameters, practical destructuring defaults inside those helper parameters, and object-literal helper methods, array-selected or locally aliased object-argument resolution, `index_any_of` multi-argument selection for semantic arg/object-property matchers, exact, exact-list, contains, or regex object-argument property-path matching plus exact/contains/regex denylist path filters, including constant-key computed object-argument property paths, matched-path capture, matched-arg-index capture, exact, contains, or regex semantic init/value/arg/object-property matching for both call and constructor-style invocations, and field normalization.
-- [x] Add adversarial fixtures for secret false positives in comments and structured non-secret values.
-- [x] Add adversarial fixtures for secret false positives in examples/mocks/docs, including block-comment and readme/docs variable-name contexts, beyond the current comment and hash/version coverage.
-- [x] Add adversarial fixtures for endpoint false negatives involving deeper object/member constant propagation and identifier-backed request configs.
-- [x] Add adversarial fixtures for endpoint false negatives involving deeper branchy or multi-path cross-function value flow beyond the current statically decidable helper-chain, practical block-bodied/`switch` helper flow, computed map lookup/logical fallback support, and object/member propagation support, including computed route-map logical/nullish/conditional key selection plus unresolved-branch and asset-map negatives.
-- [x] Endpoint detection now also recognizes server-side dynamic paths (`.do`/`.jsp`/`.jspx`/`.action`/`.php`/`.aspx`/`.ashx`/`.cgi`) as bare/relative literals and `${base}/x.do` template-literal URLs (Java/Spring/Struts, PHP, ASP.NET), closing a large false-negative class for Java/JSP apps.
-- [x] The entropy secret detector no longer flags structured non-secrets: window.open feature specs / query strings / delimited `key=value` config, URL & server-side-endpoint paths, CSS/DOM selectors, host:port, minifier pipe-blobs, and multi-word camelCase / SCREAMING_SNAKE code identifiers (dictionary-coverage filter, validated 0 false-negatives on a real-secret battery).
-- [x] HTML/SARIF reporters now mask secrets (previously only JSON), and secret masking now redacts the raw value from evidence snippet + metadata, not just the primary extracted value; HTML embeds machine-readable JSON with all `<` escaped so no `</script>` variant can break out.
-- [x] Added a DOM-XSS / code-injection **Sink** detector (`Category.SINK`): HTML injection (`innerHTML`/`outerHTML=`, `document.write`, `insertAdjacentHTML`, jQuery `.html()`/`.append()`), attribute injection (`setAttribute`/jQuery `.attr()`/`.prop()` on `src`/`href`/`on*`, and dynamic values interpolated into dangerous HTML attributes such as `<img src="${x}">`), and code execution (`eval`, `new Function`, string `setTimeout`/`setInterval`) — flagged only for DYNAMIC arguments; the finding names the source expression.
-- [x] Added a **File Upload** surface detector (`Category.UPLOAD`): FormData/multipart, `<input type="file">` built in JS, and bypassable client-side-only file-type allow-lists (`allowedExt`, ...).
-- [x] Added a light-taint **correlation** pass (`EdgeType.TAINT`) that auto-links a file-upload surface/endpoint to a same-asset DOM `src`/`href` sink fed a file/image/upload-looking value (the upload→`<img src>` stored-XSS chain).
-- [x] Added a flow-sensitive / context-sensitive / closure-aware intra-file **dataflow taint engine** (`TaintFlowDetector`, `value_type` `taint_flow`) that emits a CONFIRMED source→sink finding (with reconstructed path) only when an enumerated source (FileReader result, `$.ajax`/`fetch` response, DOM `.val()`/`.data()`/`location.*`) reaches a DOM/HTML/code sink via a real def-use chain; hardened via adversarial verification (binding-keyed state, per-branch env fork+join, receiver-aware call resolution, sanitizer/`.text()` kills, params-not-sources); prefers a missed flow over a wrong one.
-- [x] Added `--allow-private-ips` (`scope.allow_private_ips`, default off) opt-in so authorized internal/dev-server targets that resolve to RFC1918/CGNAT/ULA ranges can be scanned; loopback, cloud-metadata (`169.254.169.254`), multicast/reserved and blocked hostnames stay blocked.
-- [x] Correctness/robustness hardening: crash-safe URL parsing (`core/url_utils`) across correlator/reporters/detectors/collectors; iterative/depth-capped AST walkers (no `RecursionError`); ReDoS-bounded secret/domain regexes; per-line snippet cap (minified single-line OOM); deterministic correlation edge selection; `--resume` restores normalized (beautified) content; all text I/O pinned to UTF-8/UTF-8-sig (cp949 Korean Windows).
+| MCP surface | Current contract |
+|---|---|
+| Transport | `stdio` only; no HTTP/SSE listener and no protocol authentication |
+| Tools | `list_jobs`, `get_job_status`, `get_report_page` |
+| Resource template | `bundleinspector://jobs/{job_id}` with `application/json` MIME |
+| Report page kinds | `findings`, `assets`, `correlations`, `clusters` |
+| Pagination | Default 50, maximum 100; signed cursors bind request context, principal, and content revision |
+| Identifiers | Repository-keyed opaque public IDs; raw filesystem IDs are rejected |
+| Data boundary | Explicit immutable DTO allowlist with bounded values, secret/URI redaction, and bounded completeness summaries |
+| Mutation boundary | No scan start/control, cache write tool, raw artifact retrieval, arbitrary local path, or internal exception/queue exposure |
 
+- [x] Current jobs written with an ownership record for `local` are visible through the matching
+  cache directory; ownerless legacy and foreign-principal jobs remain private.
+- [x] Missing, malformed, and unauthorized public IDs collapse to the same public error.
+- [x] Source and installed-wheel tests verify tool/resource enumeration, redaction, raw-ID rejection,
+  revision-bound pagination, and no job/report mutation during reads.
+- [x] First startup may create the cache directory, `.public-view-key`, and a lock shard. The tools
+  are read-only, but provisioning is not a zero-write operation. Deleting or rotating the key
+  changes opaque IDs and invalidates cursors.
+
+The cache and all writable ancestors are an operating-system trust boundary. Do not expose the
+stdio server through a network bridge without a separate authentication, authorization, quota,
+approval, cancellation, and audit design.
+
+## Detection Quality Evidence
+
+| Gate | Current committed fixture | Current result | Scope limit |
+|---|---|---|---|
+| Public metrics | 45 cases, 1,916 labels/predictions, 19 release keys | 19/19 PASS; no FP/FN, parser, completeness, invariance, graph, or regression failure | Repository-visible synthetic/manual corpus |
+| Frozen governance | 11 cases, 2,193 labels/predictions, 19 release keys | 19/19 PASS | Visible; all 11 share one frozen vendor family |
+| Branch coverage | Full source line+branch instrumentation | CI requires at least 80% | Coverage is not proof of detector completeness |
+| Full regression | Ubuntu Python 3.10/3.11/3.12/3.13 and Windows Python 3.13 | Required by CI | Platform-specific skips remain capability checks, not silent passes |
+
+The public metric job runs on every configured workflow trigger. The frozen gate runs only for
+`v*` tags, the weekly schedule, `release: published`, or an explicitly enabled manual dispatch; see
+[Frozen Detection Governance](HELDOUT_GOVERNANCE.md). Corpus precision/recall of 1.0 is evidence for
+these labels only and must not be presented as universal accuracy.
+
+## Exact Synthetic Performance Gates
+
+The first committed reference was measured on WSL2 Linux x86-64, CPython 3.13.7, and an AMD Ryzen 9
+9950X with exact pinned dependencies. Every release scenario uses two warm-ups and 30 measured
+runs, preserves one semantic signature, recomputes sample statistics/bootstrap intervals, and
+requires timing CV no greater than 0.25.
+
+### Correlator Reference
+
+Each fixture uses import fanout 3 and four load contexts.
+
+| Modules / findings | p50 ms | p95 ms | p95 bootstrap 95% CI ms | CV | Observed process peak RSS | Semantic output | Absolute p95 gate |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 80 / 160 | 311.577 | 330.026 | 320.358-342.076 | 0.034117 | 69.3 MiB | 1,130 edges / 1 cluster | 1,000 ms |
+| 200 / 400 | 880.845 | 913.658 | 901.100-918.252 | 0.022666 | 82.3 MiB | 1,250 edges / 1 cluster | 2,500 ms |
+| 500 / 1,000 | 4,062.641 | 4,131.418 | 4,103.741-4,173.599 | 0.015093 | 110.9 MiB | 1,550 edges / 1 cluster | 8,000 ms |
+
+Only the 500-module scenario has a fixed 1 GiB absolute RSS ceiling; all three also participate in
+the relative RSS gate.
+
+### Detection Resource Reference
+
+| Scenario / fixed input | p50 ms | p95 ms | p95 bootstrap 95% CI ms | CV | Observed suite-process peak RSS | Absolute gate |
+|---|---:|---:|---:|---:|---:|---|
+| Structural TypeScript parse / 1,048,576 B | 613.226 | 639.054 | 632.591-643.679 | 0.074678 | 385.4 MiB | p95 <=2,000 ms; RSS <=1 GiB |
+| Bounded custom regex / 20,029 B | 50.179 | 50.234 | 50.210-50.253 | 0.000527 | 385.4 MiB | maximum wall time <=750 ms |
+| Lexical candidate recovery / 150,123 B | 20.178 | 20.593 | 20.378-20.729 | 0.022348 | 385.4 MiB | p95 <=2,000 ms; RSS <=1 GiB |
+
+The structural fixture must remain complete on the TypeScript Tree-sitter backend and preserve its
+known endpoint. All 30 custom-regex runs must disclose the configured 50 ms timeout while preserving
+the result found before timeout. All 30 lexical runs must retain the expected 10,002 candidates,
+preserve single/template quote sentinels, and disclose cap truncation.
+
+Same-CPU comparisons fail when point p95 regresses by more than 20% or process peak RSS by more than
+25%. On a different CPU, the current p95 bootstrap lower bound is compared with the committed upper
+bound times 1.20; RSS +25% still applies and the result is marked
+`applied_cross_hardware_attribution_unavailable`.
+
+These are the first current-reference baselines recorded after remediation. No comparable
+pre-change baseline exists, so they do not establish a speedup percentage. They are synthetic stage
+gates, not end-to-end `scan`/`analyze`, crawler, browser, network, or parallel-throughput SLAs.
+Peak RSS is a process-lifetime high-water observation: later correlator rows and the equal detection
+values are cumulative suite observations, not isolated per-scenario or incremental allocations.
+Correlator timings also run with `tracemalloc` instrumentation active.
+
+## Build and Release Verification
+
+- [x] CI runs the complete test suite on supported Ubuntu Python minors and a Windows filesystem/full
+  regression job.
+- [x] Ruff, production mypy, branch coverage, public metrics, and exact synthetic performance gates
+  fail closed.
+- [x] Wheel and sdist paths are checked against `packaging/distribution-manifest.json`; archive
+  structure, traversal/collision/link/device/bomb constraints, metadata, Twine, and wheel contents
+  are checked before release.
+- [x] Clean installed artifacts are smoke-tested for CLI entry points, packaged resources, TSX
+  structural parsing, MCP stdio projection, and a headless Chromium launch with page rendering
+  (`set_content` + `title` readback).
+- [x] Baselines and frozen governance artifacts change only through explicit reviewed updater
+  commands; CI never rewrites them.
+- [x] A `v*` frozen-governance run is the documented pre-publication gate. The repository has no
+  automated publisher, and `release: published` is necessarily a post-publication recheck.
+
+## Remaining Limits
+
+| Area | Explicit current limit |
+|---|---|
+| Static analysis | Dynamic code generation, opaque runtime state, server-side enforcement, and future syntax cannot be fully inferred. Partial/recovery modes report reduced completeness instead of claiming full coverage. |
+| Statistical evidence | Public and frozen corpora are visible and template-related; the frozen cases share one vendor family. Current corpus scores do not estimate an independent external population. |
+| Performance | Results are hardware- and fixture-specific synthetic stage gates. Cross-hardware failures cannot distinguish code from runner effects, and process high-water RSS is not per-operation allocation. |
+| Headless memory | A response with false/missing `Content-Length` may be materialized by Playwright before the post-read byte cap; declared-size and concurrency caps limit other fan-out. |
+| Browser setup | Clean Linux hosts need Chromium system libraries, normally installed with `playwright install --with-deps chromium`. |
+| Filesystem | Sudden-power-loss durability for Windows namespace deletion is not guaranteed; some NFS implementations reject the required exclusive sidecar lock and therefore fail closed. |
+| Cache trust | An attacker able to replace a writable cache ancestor is outside the supported service-account trust boundary. Legacy per-payload-lock writers require an offline upgrade. |
+| MCP | Local read-only stdio projection only. There is no remote transport, protocol authentication, live standalone queue progress, write operation, or scan-control capability. |
+| Release automation | Local workflow-contract verification does not substitute for an actual remote GitHub Actions run, and no workflow prevents a human from publishing before the tag gate finishes. |
+
+The validation above is bounded by its explicit contracts and is not a claim of mathematical
+perfection, zero future defects, or complete analysis of every JavaScript program.

@@ -6,6 +6,12 @@ regression testing. They are not live credentials.
 
 import pytest
 
+from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
+from bundleInspector.rules.base import AnalysisContext
+from bundleInspector.rules.detectors.secrets import SecretDetector
+from bundleInspector.rules.engine import RuleEngine
+from bundleInspector.storage.models import Confidence, Severity
 from tests.fixtures.fake_secrets import (
     FAKE_AWS_ACCESS_KEY,
     FAKE_GITHUB_PAT,
@@ -13,12 +19,6 @@ from tests.fixtures.fake_secrets import (
     FAKE_MAILGUN_PRIVATE_KEY,
     FAKE_STRIPE_LIVE,
 )
-from bundleInspector.parser.js_parser import parse_js
-from bundleInspector.parser.ir_builder import build_ir
-from bundleInspector.rules.base import AnalysisContext
-from bundleInspector.rules.detectors.secrets import SecretDetector
-from bundleInspector.rules.engine import RuleEngine
-from bundleInspector.storage.models import Severity, Confidence
 
 
 class TestSecretDetector:
@@ -60,54 +60,45 @@ class TestSecretDetector:
 
     def test_detect_aws_key(self, detector, context):
         """Test detection of AWS access key."""
-        source = '''
+        source = """
         const AWS_KEY = "__AWS_ACCESS_KEY__";
-        '''.replace("__AWS_ACCESS_KEY__", FAKE_AWS_ACCESS_KEY)
+        """.replace("__AWS_ACCESS_KEY__", FAKE_AWS_ACCESS_KEY)
         findings = self._analyze(source, detector, context)
 
         assert len(findings) >= 1
-        aws_finding = next(
-            (f for f in findings if "aws" in f.value_type.lower()),
-            None
-        )
+        aws_finding = next((f for f in findings if "aws" in f.value_type.lower()), None)
         assert aws_finding is not None
         assert aws_finding.severity == Severity.CRITICAL
 
     def test_detect_jwt(self, detector, context):
         """Test detection of JWT token."""
-        source = '''
+        source = """
         const token = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         assert len(findings) >= 1
-        jwt_finding = next(
-            (f for f in findings if "jwt" in f.value_type.lower()),
-            None
-        )
+        jwt_finding = next((f for f in findings if "jwt" in f.value_type.lower()), None)
         assert jwt_finding is not None
 
     def test_detect_stripe_key(self, detector, context):
         """Test detection of Stripe secret key."""
-        source = '''
+        source = """
         const stripeKey = "__STRIPE_LIVE__";
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE)
         findings = self._analyze(source, detector, context)
 
         assert len(findings) >= 1
-        stripe_finding = next(
-            (f for f in findings if "stripe" in f.value_type.lower()),
-            None
-        )
+        stripe_finding = next((f for f in findings if "stripe" in f.value_type.lower()), None)
         assert stripe_finding is not None
         assert stripe_finding.severity == Severity.CRITICAL
 
     def test_exclude_placeholder(self, detector, context):
         """Test exclusion of placeholder values."""
-        source = '''
+        source = """
         const key = "your-api-key-here";
         const test = "test_key_placeholder";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         # Should not detect placeholders
@@ -115,24 +106,28 @@ class TestSecretDetector:
 
     def test_detect_database_url(self, detector, context):
         """Test detection of database connection string."""
-        source = '''
+        source = """
         const dbUrl = "mongodb://user:password@localhost:27017/mydb";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         assert len(findings) >= 1
         db_finding = next(
-            (f for f in findings if "mongodb" in f.value_type.lower() or "database" in f.value_type.lower()),
-            None
+            (
+                f
+                for f in findings
+                if "mongodb" in f.value_type.lower() or "database" in f.value_type.lower()
+            ),
+            None,
         )
         assert db_finding is not None
         assert db_finding.severity == Severity.CRITICAL
 
     def test_detect_aws_secret_key_extracts_value_only(self, detector, context):
         """AWS secret extraction should not include assignment context or quotes."""
-        source = '''
+        source = """
         const config = "aws_secret_key = \\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\\"";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         aws_secret = next((f for f in findings if f.value_type == "aws_secret_key"), None)
@@ -147,7 +142,10 @@ class TestSecretDetector:
         '''
         findings = self._analyze(source, detector, context)
 
-        assert any(f.value_type == "mailgun_api_key" and f.extracted_value == FAKE_MAILGUN_API_KEY for f in findings)
+        assert any(
+            f.value_type == "mailgun_api_key" and f.extracted_value == FAKE_MAILGUN_API_KEY
+            for f in findings
+        )
         assert not any("prefixkey-" in f.extracted_value for f in findings)
 
     def test_mailgun_private_key_requires_terminal_boundary(self, detector, context):
@@ -159,8 +157,7 @@ class TestSecretDetector:
         findings = self._analyze(source, detector, context)
 
         assert any(
-            f.value_type == "mailgun_private_key"
-            and f.extracted_value == FAKE_MAILGUN_PRIVATE_KEY
+            f.value_type == "mailgun_private_key" and f.extracted_value == FAKE_MAILGUN_PRIVATE_KEY
             for f in findings
         )
         assert not any(
@@ -170,9 +167,9 @@ class TestSecretDetector:
 
     def test_entropy_detection(self, detector, context):
         """Test high-entropy string detection."""
-        source = '''
+        source = """
         const secret = "aB3$kL9mN2pQ5rT8uW1xY4zA7cD0eF6gH";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         # High entropy string should be flagged
@@ -180,103 +177,148 @@ class TestSecretDetector:
 
     def test_context_filter_excludes_non_secret_version_hash(self, context):
         """Version/hash values should not survive the engine context filter."""
-        source = '''
+        source = """
         const version = "0123456789abcdef0123456789abcdef";
         const assetHash = "fedcba9876543210fedcba9876543210";
-        '''
+        """
         findings = self._engine_analyze(source, context)
 
         assert not any(f.category.value == "secret" for f in findings)
 
     def test_context_filter_keeps_real_secret(self, context):
         """Real secrets should still survive context filtering."""
-        source = '''
+        source = """
         const apiKey = "__STRIPE_LIVE__";
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE)
         findings = self._engine_analyze(source, context)
 
         assert any(f.rule_id == "secret-detector" for f in findings)
 
     def test_context_filter_excludes_comment_only_secret_like_value(self, context):
         """Secret-like strings that appear only in comments should be dropped."""
-        source = '''
+        source = """
         // authorization = "Bearer ABCDEFGHIJKLMNOPQRSTUVWX123456"
-        '''
+        """
         findings = self._engine_analyze(source, context)
 
         assert not any(f.category.value == "secret" for f in findings)
 
-    def test_context_filter_excludes_example_variable_secret_like_value(self, context):
-        """Example/demo variable names should suppress otherwise secret-looking literals."""
-        source = '''
+    def test_context_filter_demotes_example_variable_provider_secret(self, context):
+        """DQ-C01: example/demo variable names must DEMOTE a known-provider credential (LOW +
+        context-suppressed), never hard-drop it -- silently deleting a real, exposed credential is
+        the worse failure (INV-02). Generic/entropy candidates keep their drop-on-FP behavior."""
+        source = """
         const exampleToken = "__STRIPE_LIVE__";
         const demoSecret = "__GITHUB_PAT__";
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
         findings = self._engine_analyze(source, context)
 
-        assert not any(f.category.value == "secret" for f in findings)
+        secrets = [f for f in findings if f.category.value == "secret"]
+        assert secrets, "known-provider secret was hard-dropped (DQ-C01 regression)"
+        assert all(
+            f.confidence == Confidence.LOW and "context-suppressed" in f.tags for f in secrets
+        )
 
-    def test_context_filter_excludes_mock_object_key_secret_like_value(self, context):
-        """Mock/sample object keys should suppress otherwise secret-looking literals."""
-        source = '''
+    def test_context_filter_demotes_mock_object_key_provider_secret(self, context):
+        """DQ-C01: mock/sample object keys must DEMOTE (not hard-drop) a known-provider credential."""
+        source = """
         const fixtures = {
           mockApiKey: "__STRIPE_LIVE__",
           sampleToken: "__GITHUB_PAT__",
         };
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
         findings = self._engine_analyze(source, context)
 
-        assert not any(f.category.value == "secret" for f in findings)
+        secrets = [f for f in findings if f.category.value == "secret"]
+        assert secrets, "known-provider secret was hard-dropped (DQ-C01 regression)"
+        assert all(
+            f.confidence == Confidence.LOW and "context-suppressed" in f.tags for f in secrets
+        )
 
-    def test_context_filter_excludes_example_console_log_secret_like_value(self, context):
-        """Example/test logging strings should not survive context filtering."""
-        source = '''
+    def test_context_filter_demotes_example_console_log_provider_secret(self, context):
+        """DQ-C01: example/test logging context must DEMOTE (not hard-drop) a known-provider secret."""
+        source = """
         console.log("example __STRIPE_LIVE__");
         console.info("test __GITHUB_PAT__");
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
         findings = self._engine_analyze(source, context)
 
-        assert not any(f.category.value == "secret" for f in findings)
+        secrets = [f for f in findings if f.category.value == "secret"]
+        assert secrets, "known-provider secret was hard-dropped (DQ-C01 regression)"
+        assert all(
+            f.confidence == Confidence.LOW and "context-suppressed" in f.tags for f in secrets
+        )
 
     def test_context_filter_excludes_block_comment_secret_like_value(self, context):
         """Secret-like values inside block comments should not survive context filtering."""
-        source = '''
+        source = """
         /*
          * Example token for docs:
          * __STRIPE_LIVE__
          */
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE)
         findings = self._engine_analyze(source, context)
 
         assert not any(f.category.value == "secret" for f in findings)
 
-    def test_context_filter_excludes_readme_docs_variable_secret_like_value(self, context):
-        """Readme/docs/snippet variable names should suppress otherwise secret-looking literals."""
-        source = '''
+    def test_context_filter_demotes_readme_docs_variable_provider_secret(self, context):
+        """DQ-C01: readme/docs/snippet variable names must DEMOTE (not hard-drop) a provider secret."""
+        source = """
         const readmeSnippet = "__STRIPE_LIVE__";
         const docsTokenGuide = "__GITHUB_PAT__";
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
         findings = self._engine_analyze(source, context)
 
-        assert not any(f.category.value == "secret" for f in findings)
+        secrets = [f for f in findings if f.category.value == "secret"]
+        assert secrets, "known-provider secret was hard-dropped (DQ-C01 regression)"
+        assert all(
+            f.confidence == Confidence.LOW and "context-suppressed" in f.tags for f in secrets
+        )
 
-    def test_context_filter_excludes_docs_object_key_secret_like_value(self, context):
-        """Docs/snippet object keys should suppress otherwise secret-looking literals."""
-        source = '''
+    def test_context_filter_demotes_docs_object_key_provider_secret(self, context):
+        """DQ-C01: docs/snippet object keys must DEMOTE (not hard-drop) a known-provider secret."""
+        source = """
         const docsConfig = {
           snippetToken: "__STRIPE_LIVE__",
           tutorialSecret: "__GITHUB_PAT__",
         };
-        '''.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
+        """.replace("__STRIPE_LIVE__", FAKE_STRIPE_LIVE).replace("__GITHUB_PAT__", FAKE_GITHUB_PAT)
         findings = self._engine_analyze(source, context)
 
-        assert not any(f.category.value == "secret" for f in findings)
+        secrets = [f for f in findings if f.category.value == "secret"]
+        assert secrets, "known-provider secret was hard-dropped (DQ-C01 regression)"
+        assert all(
+            f.confidence == Confidence.LOW and "context-suppressed" in f.tags for f in secrets
+        )
+
+    def test_dqc01_provider_secret_kept_under_nonsecret_var_and_example(self, context):
+        """DQ-C01 regression: the exact audit repro -- a KNOWN-provider secret assigned to a
+        NON_SECRET_VAR_NAME (id/path/defaultToken) or on an `// example:` line -- must be KEPT
+        (demoted to LOW + context-suppressed), never hard-dropped. A generic-entropy candidate in the
+        same context is still dropped."""
+        pat = FAKE_GITHUB_PAT
+        for src in (
+            'const id = "AKIAABCDEFGHIJKLMNOP";',
+            f'const defaultToken = "{pat}";',
+            f'const path = "{pat}";',
+            f'const t = "{pat}"; // example: production fallback',
+        ):
+            secrets = [
+                f for f in self._engine_analyze(src, context) if f.category.value == "secret"
+            ]
+            assert secrets, f"provider secret hard-dropped (DQ-C01 regression): {src}"
+            assert all(
+                f.confidence == Confidence.LOW and "context-suppressed" in f.tags for f in secrets
+            )
+        # negative: a generic-entropy candidate in a comment is still dropped (unchanged behavior)
+        generic = '// x = "ABCDEFGHIJKLMNOPQRSTUVWX123456"'
+        assert not any(f.category.value == "secret" for f in self._engine_analyze(generic, context))
 
     def test_detect_session_token_with_moderate_severity_and_confidence(self, detector, context):
         """Session-like assignments should be detected without escalating to high severity."""
-        source = '''
+        source = """
         const session_token = "abcdefghijklmnopqrstuvwxyz123456";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         session_finding = next((f for f in findings if f.value_type == "session_token"), None)
@@ -287,23 +329,26 @@ class TestSecretDetector:
 
     def test_detect_auth_header_preserves_matched_text_metadata(self, detector, context):
         """Captured auth values should retain the original matched text for reporting."""
-        source = '''
+        source = """
         const authorization = "Bearer abcdefghijklmnopqrstuvwxyz123456";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         auth_finding = next((f for f in findings if f.value_type == "auth_header"), None)
         assert auth_finding is not None
         assert auth_finding.severity == Severity.MEDIUM
         assert auth_finding.confidence == Confidence.MEDIUM
-        assert auth_finding.metadata["matched_text"] == 'authorization = "Bearer abcdefghijklmnopqrstuvwxyz123456"'
+        assert (
+            auth_finding.metadata["matched_text"]
+            == 'authorization = "Bearer abcdefghijklmnopqrstuvwxyz123456"'
+        )
         assert auth_finding.metadata["match_uses_capture_group"] is True
 
     def test_detect_session_jwt_downgrades_to_session_context(self, detector, context):
         """JWTs stored in explicit session context should not be escalated as generic high-risk auth tokens."""
-        source = '''
+        source = """
         const sessionToken = "eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.dozjgNryP4J3jVmNHl0w5N_XgL0n3I9PlFUP0THsR8U";
-        '''
+        """
         findings = self._analyze(source, detector, context)
 
         session_finding = next((f for f in findings if f.extracted_value.startswith("eyJ")), None)
@@ -313,4 +358,3 @@ class TestSecretDetector:
         assert session_finding.confidence == Confidence.MEDIUM
         assert session_finding.metadata["matched_pattern_type"] == "jwt_token"
         assert session_finding.metadata["contextual_type_override"] == "session_token"
-

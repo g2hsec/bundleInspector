@@ -3,17 +3,23 @@
 import uuid
 from pathlib import Path
 
-import pytest
-from tests.fixtures.fake_secrets import FAKE_MASK_VALUE_LONG, FAKE_MASK_VALUE_SHORT
 from bundleInspector.core.security import (
-    is_url_safe,
-    is_ip_blocked,
     is_host_blocked,
+    is_ip_blocked,
     is_path_safe,
-    sanitize_url,
-    sanitize_path,
+    is_url_safe,
     mask_sensitive_value,
+    sanitize_path,
+    sanitize_url,
 )
+from bundleInspector.storage.models import (
+    Category,
+    Confidence,
+    Evidence,
+    Finding,
+    Severity,
+)
+from tests.fixtures.fake_secrets import FAKE_MASK_VALUE_LONG, FAKE_MASK_VALUE_SHORT
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
 TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -289,3 +295,61 @@ class TestSensitiveValueMasking:
         assert result.startswith("sk")
         assert result.endswith("90")
 
+    def test_negative_visible_windows_fail_closed(self):
+        """Direct callers cannot expose data by passing negative visible windows."""
+        value = "NEGATIVE_WINDOW_SECRET"
+
+        assert mask_sensitive_value(value, visible_start=-1, visible_end=-1) == "*" * len(value)
+
+
+def test_is_path_safe_blocks_dotdot_traversal_with_symlinks_allowed():
+    """allow_symlinks=True must still reject a '..'-escaping path -- it collapses '..' lexically
+    (without following symlinks), so containment cannot be defeated by upward traversal."""
+    base = Path("/srv/data")
+    escape = base / ".." / ".." / "etc" / "passwd"
+    ok, _ = is_path_safe(escape, [base], allow_symlinks=True)
+    assert ok is False
+    # a genuine child path under the base is still allowed with symlinks on (no over-blocking)
+    ok2, _ = is_path_safe(base / "app.js", [base], allow_symlinks=True)
+    assert ok2 is True
+
+
+def test_is_ip_blocked_catches_numeric_ip_encodings():
+    """Decimal / hex / octal encodings of loopback and cloud-metadata IPs must be blocked -- an
+    inet_aton-based HTTP client dials them even though ipaddress.ip_address rejects the string."""
+    assert is_ip_blocked("2130706433") is True            # decimal 127.0.0.1
+    assert is_ip_blocked("0x7f000001") is True            # hex 127.0.0.1
+    assert is_ip_blocked("0251.0376.0251.0376") is True   # octal 169.254.169.254 (cloud metadata)
+    assert is_ip_blocked("api.example.com") is False      # a real hostname is not an IP literal
+
+
+def test_mask_sensitive_value_does_not_overexpose_short_secrets():
+    """A short secret must not reveal most of its characters (the fixed 4+4 window showed 8 of 9)."""
+    masked = mask_sensitive_value("hunter2!!")            # len 9
+    assert masked.count("*") >= 5                          # majority masked
+    assert "hunter" not in masked                          # the meaningful prefix is not revealed
+    # long secrets keep the informative first/last window
+    long_masked = mask_sensitive_value("sk_live_1234567890abcdef")  # len 24
+    assert long_masked.startswith("sk_l") and long_masked.endswith("cdef")
+
+
+def test_finding_mask_value_matches_canonical_security_helper() -> None:
+    values = ("", "abcd", "secret", "hunter2!!", "LONG_SECRET_0123456789")
+    visible_windows = (-5, 0, 1, 2, 4, 1024)
+
+    for value in values:
+        for visible in visible_windows:
+            finding = Finding(
+                rule_id="mask-parity",
+                category=Category.SECRET,
+                severity=Severity.HIGH,
+                confidence=Confidence.HIGH,
+                title="Mask parity",
+                evidence=Evidence(file_url="f.js", file_hash="h", line=1),
+                extracted_value=value,
+            )
+            assert finding.mask_value(visible) == mask_sensitive_value(
+                value,
+                visible_start=visible,
+                visible_end=visible,
+            )

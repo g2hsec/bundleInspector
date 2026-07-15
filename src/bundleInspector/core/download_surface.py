@@ -45,9 +45,9 @@ romanized-Hangul parameter names. Recognized here (not just surface):
 from __future__ import annotations
 
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any
 
-from bundleInspector.storage.models import Category
+from bundleInspector.storage.models import Category, Finding, Report
 
 
 def _norm(name: str) -> str:
@@ -69,7 +69,9 @@ _FILE_ID_PARAMS = frozenset(_norm(x) for x in (
     # generic
     "fileId", "fileNo", "fileSn", "fileSeq", "fileKey", "fileIdx", "fileNum",
     "attachId", "attachNo", "attachmentId", "attachSeq",
-    "docId", "documentId", "docNo", "docSeq",
+    # DQ-H05: docId/documentId/docNo/docSeq are NOT strong file params -- `/document/update?docId`
+    # is a mutation, not a download. They still resolve to file_id INSIDE a real download context
+    # (via _looks_like_id / _CTX_ID_PARAMS), just not unconditionally.
     "imgId", "imageId", "imgSn", "imageSeq", "photoId", "photoNo",
     "realFileId", "sysFileId", "physicalFileId", "storeFileId",
     "objectKey", "s3Key", "storageKey",            # cloud storage (S3 presigned / object)
@@ -119,6 +121,14 @@ _ID_SUFFIX = frozenset(("id", "no", "seq", "sn", "idx", "key", "num", "cd", "srl
 def _looks_like_id(name: str) -> bool:
     toks = re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", name or "")
     return len(toks) >= 2 and toks[-1].lower() in _ID_SUFFIX
+
+
+def _seg_tokens(seg: str) -> list:
+    """DQ-H05: lowercased camelCase/PascalCase tokens of one path segment (extension stripped). Used
+    so a nonfile/action word is matched as a real sub-token, not a raw character substring ('log' in
+    'catalog') or a noun buried after a download head verb ('register' in 'downloadRegisterForm')."""
+    seg = re.sub(r"\.[a-z0-9]+$", "", seg or "", flags=re.IGNORECASE)
+    return [t.lower() for t in re.findall(r"[A-Z]+(?![a-z])|[A-Z]?[a-z]+|[0-9]+", seg)]
 
 # ---------------------------------------------------------------------------------------------
 # Path keyword lexicons. STRONG = compound, file-specific (trigger on their own). WEAK = ambiguous
@@ -219,11 +229,31 @@ _MECHANISM_RE = re.compile(r"""(?ix)
 
 # Words that mark a DATA/action endpoint (not a file): a "download" here is a count/agree/check, etc.
 _NONFILE_WORDS = frozenset((
-    "count", "cnt", "agree", "yn", "check", "chk", "stat", "statistics", "log", "history", "hist",
+    "count", "cnt", "agree", "yn", "check", "chk", "stat", "statistics",
     "search", "validate", "valid", "exists", "duplicate", "isvalid", "verify",
 ))
+# DQ-H05: target nouns that opt an endpoint OUT of the download tier only when FUSED into a larger
+# path segment (a listing endpoint like /downloadHistory), NOT when they stand alone as the download
+# target (/download/log -- downloading the log file). Keeping them in _NONFILE_WORDS false-negatived
+# the standalone-target case; dropping them outright would false-positive the fused listing case.
+_NONFILE_FUSED_WORDS = frozenset(("log", "history", "hist"))
+# DQ-H05: write/action verbs mark a MUTATION endpoint, not a download. An endpoint carrying only
+# weak/context signals plus an action verb (/document/update?docId, /document/delete?docId) opts out
+# of the lenient POSSIBLE tier (a strong download keyword/param still confirms a combined controller).
+_ACTION_WORDS = frozenset((
+    "update", "delete", "save", "insert", "modify", "edit", "create", "remove", "regist", "register",
+))
+# DQ-H05: download-intent head verbs. When one of these is the segment HEAD, a trailing action word
+# is part of the object noun (downloadRegisterForm), not a governing mutation, so the endpoint is
+# NOT opted out as a mutation.
+_DOWNLOAD_HEAD_WORDS = frozenset((
+    # download-intent VERBS only -- NOT file nouns (file/attach/image), so <noun><verb> mutations
+    # like fileUpdate / attachDelete are still opted out by their tail verb.
+    "download", "export", "get", "view", "read", "stream", "serve", "send", "fetch", "retrieve",
+    "load", "open", "show", "print", "dwnld", "down", "excel", "pdf", "csv", "generate",
+))
 
-def _download_mechanism(finding) -> str:
+def _download_mechanism(finding: Finding) -> str:
     """The file-download response mechanism found near the call (blob/createObjectURL/download
     attr/content-disposition/file MIME), or '' if none. Snippet-based (best-effort)."""
     ev = getattr(finding, "evidence", None)
@@ -262,7 +292,7 @@ def _path_runs(path: str) -> frozenset:
     return frozenset(runs)
 
 
-def _collect_params(finding) -> set:
+def _collect_params(finding: Finding) -> set[str]:
     """Parameter names PRECISELY attributed to this endpoint by the detector: the URL query string,
     request_contract query params + body shape, and named path params.
 
@@ -296,7 +326,7 @@ def _collect_params(finding) -> set:
     return names
 
 
-def _role_of(name: str, *, in_context: bool) -> Optional[str]:
+def _role_of(name: str, *, in_context: bool) -> str | None:
     """Classify a parameter into a role. Strong lexicons resolve unconditionally; ambiguous
     parameters resolve only when a download context is already established."""
     n = _norm(name)
@@ -322,7 +352,7 @@ def _role_of(name: str, *, in_context: bool) -> Optional[str]:
     return None
 
 
-def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
+def classify_download_surface(finding: Finding) -> dict[str, Any] | None:
     """Return a download-surface descriptor for an endpoint finding, or None if it is not a
     file-download surface. Pure and defensive."""
     try:
@@ -364,7 +394,7 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
         mechanism = _download_mechanism(finding)
 
         # Precise param roles (strong lexicons + ambiguous-in-context: name/path/url + selector ids).
-        by_role: Dict[str, List[str]] = {}
+        by_role: dict[str, list[str]] = {}
         for p in params:                              # params already sorted -> deterministic
             r = _role_of(p, in_context=True)
             if r:
@@ -373,26 +403,47 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
         has_url_param = any(r == "url" for r in roles.values())
         weak_signal = bool(weak_kw) or file_collection
 
+        raw_segs = [s for s in path.split("/") if s]
+        seg_toks = [_seg_tokens(s) for s in raw_segs]
+        # DQ-H05: opt out on a target noun (log/history/hist) only when it is a real sub-token of a
+        # MULTI-token segment (a listing endpoint like downloadHistory), NOT a bare substring ('log'
+        # in 'catalog') and NOT a standalone segment (/download/log stays a download target).
+        nonfile = any(w in runs for w in _NONFILE_WORDS) or any(
+            len(toks) > 1 and any(w in toks for w in _NONFILE_FUSED_WORDS) for toks in seg_toks)
+        # DQ-H05: a mutation verb governs when it is the HEAD token (deleteDocument) OR the TAIL token
+        # (documentDelete -- <noun><verb> RPC naming, pervasive in eGov code), but NOT when the head
+        # is a download-intent verb (downloadRegisterForm keeps 'download' as head -> stays a
+        # download). A strong download keyword still confirms regardless.
+        action = any(
+            toks and (toks[0] in _ACTION_WORDS
+                      or (len(toks) > 1 and toks[-1] in _ACTION_WORDS and toks[0] not in _DOWNLOAD_HEAD_WORDS))
+            for toks in seg_toks
+        )
+
         # CONFIRMED (it IS a file download / server fetch): a file-download keyword, a strong file
-        # param, an office/archive extension, a file-RESPONSE mechanism tied to a download-ish
-        # endpoint (a download keyword -- limits cross-endpoint snippet bleed), or a fetch/proxy
-        # keyword + a url param (image-proxy SSRF).
+        # param, an office/archive extension, a file-RESPONSE mechanism, or a fetch/proxy keyword +
+        # url param (image-proxy SSRF). The mechanism is snippet-based and can bleed from a
+        # neighboring call in a minified single-line bundle, so it does NOT count on a mutation-named
+        # (action) endpoint -- a strong keyword/param still confirms a combined controller (DQ-H05).
         confirmed = bool(strong_kw or strong_roles or strong_ext
-                         or (mechanism and weak_signal) or (fetch_kw and has_url_param))
+                         or (mechanism and weak_signal and not action)
+                         or (fetch_kw and has_url_param))
 
         # POSSIBLE (it MIGHT serve a file -- lenient): a download/export keyword or a file-collection
         # segment with no strong signal; or a file-response mechanism / url param on a selector-id
-        # endpoint. Surfaced for VERIFICATION rather than hard-excluded. Data/action endpoints
-        # (count/agree/check/...) opt out via _NONFILE_WORDS.
-        nonfile = any(w in runs for w in _NONFILE_WORDS)
-        possible = (not confirmed) and not nonfile and (
-            weak_signal or (mechanism and bool(by_role)) or (fetch_kw and has_url_param))
+        # endpoint. The NAME-based nonfile/action opt-outs suppress the name/keyword weak_signal
+        # branch, and (per above) the bleed-prone mechanism branch on an action endpoint; a real
+        # fetch/proxy + url param still surfaces.
+        possible = (not confirmed) and (
+            (weak_signal and not nonfile and not action)
+            or (mechanism and bool(by_role) and not action)
+            or (fetch_kw and has_url_param))
 
         if is_asset or not (confirmed or possible):
             return None
         certainty = "confirmed" if confirmed else "possible"
 
-        risks: List[str] = []
+        risks: list[str] = []
         if any(r in ("file_name", "file_path", "directory") for r in roles.values()):
             risks.append("path_traversal")
         if any(r == "url" for r in roles.values()):
@@ -406,7 +457,7 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
 
         confidence = ("high" if (strong_kw and strong_roles) else "medium" if confirmed else "low")
 
-        signals: Dict[str, str] = {}
+        signals: dict[str, str] = {}
         if strong_kw or weak_kw:
             signals["keyword"] = strong_kw or weak_kw
         if any_file_ext:
@@ -429,10 +480,10 @@ def classify_download_surface(finding) -> Optional[Dict[str, Any]]:
         return None
 
 
-def _note(primary: str, by_role: Dict[str, List[str]], ext: str,
+def _note(primary: str, by_role: dict[str, list[str]], ext: str,
           certainty: str = "confirmed", mechanism: str = "") -> str:
-    def _p(*roles):
-        out = []
+    def _p(*roles: str) -> str:
+        out: list[str] = []
         for r in roles:
             out.extend(by_role.get(r, []))
         return ", ".join(f"`{x}`" for x in out)
@@ -464,7 +515,7 @@ def _note(primary: str, by_role: Dict[str, List[str]], ext: str,
             f"rate-limiting.{mech}")
 
 
-def annotate_download_surfaces(report) -> int:
+def annotate_download_surfaces(report: Report) -> int:
     """Tag endpoint findings that are file-download surfaces with metadata['download_surface'].
     In place, additive-only; returns the count tagged. Never raises."""
     n = 0
@@ -492,10 +543,10 @@ def risk_label(risk: str) -> str:
     return _RISK_LABEL.get(risk, risk)
 
 
-def download_surfaces(report) -> List[tuple]:
+def download_surfaces(report: Report) -> list[tuple[Finding, dict[str, Any]]]:
     """(finding, descriptor) for every tagged download surface: CONFIRMED before POSSIBLE, then most
     severe risk first."""
-    out = []
+    out: list[tuple[Finding, dict[str, Any]]] = []
     for f in getattr(report, "findings", []) or []:
         md = f.metadata if isinstance(f.metadata, dict) else {}
         d = md.get("download_surface")

@@ -6,8 +6,8 @@ import time
 import pytest
 
 from bundleInspector.core.rate_limiter import (
-    RateLimiter,
     AdaptiveRateLimiter,
+    RateLimiter,
     SlidingWindowRateLimiter,
 )
 

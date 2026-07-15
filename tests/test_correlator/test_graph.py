@@ -1,7 +1,6 @@
 """Tests for correlation graph enrichment."""
 
-from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE
-from bundleInspector.correlator.graph import Correlator
+from bundleInspector.correlator.graph import CorrelationGraph, Correlator
 from bundleInspector.storage.models import (
     Category,
     Confidence,
@@ -10,6 +9,7 @@ from bundleInspector.storage.models import (
     Finding,
     Severity,
 )
+from tests.fixtures.fake_secrets import FAKE_STRIPE_LIVE
 
 
 def _make_finding(
@@ -62,6 +62,98 @@ def test_correlator_adds_import_edges_from_metadata():
     graph = Correlator().correlate([source_finding, target_finding])
 
     assert any(edge.edge_type == EdgeType.IMPORT for edge in graph.edges)
+
+
+def test_import_matches_rejects_cross_substring_module_names():
+    """A raw endswith wrongly linked modules sharing only a trailing substring; segment-boundary
+    matching must reject them (import './auth' must not match file 'oauth')."""
+    c = Correlator()
+    assert (
+        c._import_matches({"auth", "./auth"}, {"oauth", "oauth.js", "/src/oauth", "/src/oauth.js"})
+        is False
+    )
+    assert c._import_matches({"auth"}, {"oauth"}) is False
+    assert c._import_matches({"config"}, {"appconfig"}) is False
+
+
+def test_import_matches_keeps_exact_and_path_boundary_links():
+    """Real links (exact stem, and '/'-boundary path suffix) must still match."""
+    c = Correlator()
+    assert c._import_matches({"api", "./api"}, {"api", "api.js", "/src/api", "/src/api.js"}) is True
+    assert c._import_matches({"api"}, {"/src/api"}) is True
+    assert c._import_matches({"api.js"}, {"/src/api.js"}) is True
+
+
+def test_correlator_does_not_link_auth_import_to_oauth_file():
+    """import './auth' must NOT create an IMPORT edge to an unrelated 'oauth.js' file."""
+    source = _make_finding(
+        "s", "file:///src/app.js", Category.ENDPOINT, "/api/x", metadata={"imports": ["./auth"]}
+    )
+    target = _make_finding("t", "file:///src/oauth.js", Category.SECRET, FAKE_STRIPE_LIVE)
+    graph = Correlator().correlate([source, target])
+    assert not any(edge.edge_type == EdgeType.IMPORT for edge in graph.edges)
+
+
+def test_correlator_still_links_auth_import_to_auth_file():
+    """Guard against over-tightening: import './auth' still links to the real 'auth.js' file."""
+    source = _make_finding(
+        "s", "file:///src/app.js", Category.ENDPOINT, "/api/x", metadata={"imports": ["./auth"]}
+    )
+    target = _make_finding("t", "file:///src/auth.js", Category.SECRET, FAKE_STRIPE_LIVE)
+    graph = Correlator().correlate([source, target])
+    assert any(edge.edge_type == EdgeType.IMPORT for edge in graph.edges)
+
+
+def test_relative_import_prefers_importer_directory_over_duplicate_basename():
+    """`/admin/main.js -> ./api` resolves only `/admin/api.js`, not `/public/api.js`."""
+    source = _make_finding(
+        "source",
+        "file:///admin/main.js",
+        Category.ENDPOINT,
+        "/api/x",
+        metadata={"imports": ["./api"]},
+    )
+    admin_api = _make_finding(
+        "admin-api", "file:///admin/api.js", Category.SECRET, FAKE_STRIPE_LIVE
+    )
+    public_api = _make_finding(
+        "public-api", "file:///public/api.js", Category.SECRET, FAKE_STRIPE_LIVE
+    )
+
+    graph = Correlator().correlate([source, admin_api, public_api])
+    import_targets = {
+        edge.target_id
+        for edge in graph.edges
+        if edge.edge_type == EdgeType.IMPORT and edge.source_id == "source"
+    }
+
+    assert import_targets == {"admin-api"}
+    assert graph.telemetry["ambiguous_imports"] == []
+
+
+def test_ambiguous_bare_import_emits_no_confirmed_edge_and_records_diagnostic():
+    source = _make_finding(
+        "source",
+        "file:///app/main.js",
+        Category.ENDPOINT,
+        "/api/x",
+        metadata={"imports": ["api"]},
+    )
+    first = _make_finding("first", "file:///admin/api.js", Category.SECRET, FAKE_STRIPE_LIVE)
+    second = _make_finding("second", "file:///public/api.js", Category.SECRET, FAKE_STRIPE_LIVE)
+
+    graph = Correlator().correlate([source, first, second])
+
+    assert not any(
+        edge.edge_type == EdgeType.IMPORT and edge.source_id == "source" for edge in graph.edges
+    )
+    assert graph.telemetry["ambiguous_imports"] == [
+        {
+            "importer": "file:///app/main.js",
+            "source": "api",
+            "candidate_targets": ["file:///admin/api.js", "file:///public/api.js"],
+        }
+    ]
 
 
 def test_correlator_adds_runtime_edges_from_shared_context():
@@ -155,7 +247,8 @@ def test_correlator_preserves_multiple_transitive_intra_file_call_paths():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "caller-transitive-intra-file"
         and edge.target_id == "callee-transitive-intra-file"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:outer",
             "function:midA",
             "function:inner",
@@ -166,7 +259,8 @@ def test_correlator_preserves_multiple_transitive_intra_file_call_paths():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "caller-transitive-intra-file"
         and edge.target_id == "callee-transitive-intra-file"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:outer",
             "function:midB",
             "function:inner",
@@ -455,7 +549,8 @@ def test_correlator_adds_transitive_inter_module_call_edges():
     assert any(
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.target_id == "target-helper"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:loadUsers",
             "./api:fetchUsers",
             "function:buildAuth",
@@ -506,7 +601,8 @@ def test_correlator_preserves_multiple_source_scope_paths_to_same_imported_targe
     assert any(
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.target_id == "target-transitive-call-source-multi"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "function:dispatchA",
             "./api:fetchUsers",
@@ -516,7 +612,8 @@ def test_correlator_preserves_multiple_source_scope_paths_to_same_imported_targe
     assert any(
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.target_id == "target-transitive-call-source-multi"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "function:dispatchB",
             "./api:fetchUsers",
@@ -583,7 +680,8 @@ def test_correlator_preserves_multiple_target_scope_paths_to_same_imported_targe
     assert any(
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.target_id == "target-helper-target-multi"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:loadUsers",
             "./api:fetchUsers",
             "function:buildAuthA",
@@ -594,7 +692,8 @@ def test_correlator_preserves_multiple_target_scope_paths_to_same_imported_targe
     assert any(
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.target_id == "target-helper-target-multi"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:loadUsers",
             "./api:fetchUsers",
             "function:buildAuthB",
@@ -664,7 +763,8 @@ def test_correlator_adds_default_export_scope_call_edges():
     assert any(
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.target_id == "target-default-entry"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./api:default",
         ]
@@ -673,7 +773,8 @@ def test_correlator_adds_default_export_scope_call_edges():
     assert any(
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.target_id == "target-default-helper"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./api:default",
             "function:buildAuth",
@@ -1284,8 +1385,7 @@ def test_correlator_adds_import_chain_edges_from_binding_metadata_through_reexpo
         edge.edge_type == EdgeType.RUNTIME
         and edge.source_id == "root-import-chain-reexport-binding"
         and edge.target_id == "leaf-import-chain-reexport-binding"
-        and edge.metadata.get("context")
-        == "import_chain:file:///src/app.js -> ./index -> ./api"
+        and edge.metadata.get("context") == "import_chain:file:///src/app.js -> ./index -> ./api"
         for edge in graph.edges
     )
 
@@ -1323,8 +1423,7 @@ def test_correlator_adds_import_chain_edges_from_dynamic_binding_metadata():
         edge.edge_type == EdgeType.RUNTIME
         and edge.source_id == "root-import-chain-dynamic-binding"
         and edge.target_id == "leaf-import-chain-dynamic-binding"
-        and edge.metadata.get("context")
-        == "import_chain:file:///src/app.js -> dynamic:./chunk"
+        and edge.metadata.get("context") == "import_chain:file:///src/app.js -> dynamic:./chunk"
         for edge in graph.edges
     )
 
@@ -1864,18 +1963,21 @@ def test_correlator_adds_multiple_load_context_execution_chains_for_same_target(
         metadata={"initiator": "file:///src/vendor.js"},
     )
 
-    graph = Correlator().correlate([
-        root,
-        client,
-        vendor,
-        leaf_from_client,
-        leaf_from_vendor,
-    ])
+    graph = Correlator().correlate(
+        [
+            root,
+            client,
+            vendor,
+            leaf_from_client,
+            leaf_from_vendor,
+        ]
+    )
 
     assert any(
         edge.edge_type == EdgeType.RUNTIME
         and edge.source_id == "root-load-context-multi-execution"
-        and edge.target_id in {
+        and edge.target_id
+        in {
             "leaf-load-context-multi-execution-client",
             "leaf-load-context-multi-execution-vendor",
         }
@@ -1886,7 +1988,8 @@ def test_correlator_adds_multiple_load_context_execution_chains_for_same_target(
     assert any(
         edge.edge_type == EdgeType.RUNTIME
         and edge.source_id == "root-load-context-multi-execution"
-        and edge.target_id in {
+        and edge.target_id
+        in {
             "leaf-load-context-multi-execution-client",
             "leaf-load-context-multi-execution-vendor",
         }
@@ -3023,7 +3126,8 @@ def test_correlator_adds_multi_hop_inter_module_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-multi-hop"
         and edge.target_id == "target-multi-hop"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:start",
             "./client:loadClient",
             "./auth:fetchToken",
@@ -3137,7 +3241,8 @@ def test_correlator_adds_dynamic_import_call_edges_from_namespace_binding():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-dynamic-call"
         and edge.target_id == "target-dynamic-call"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "dynamic:./chunk:loadUsers",
         ]
@@ -3189,7 +3294,8 @@ def test_correlator_adds_dynamic_import_call_edges_from_default_binding():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-dynamic-default-call"
         and edge.target_id == "target-dynamic-default-call"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "dynamic:./chunk:default",
         ]
@@ -3241,7 +3347,8 @@ def test_correlator_allows_outer_scope_import_binding_in_inner_scope_calls():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-outer-scope-binding"
         and edge.target_id == "target-outer-scope-binding"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:inner",
             "dynamic:./chunk:loadUsers",
         ]
@@ -3299,7 +3406,8 @@ def test_correlator_adds_call_edges_from_import_member_alias_binding():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-import-member-alias"
         and edge.target_id == "target-import-member-alias"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./chunk:loadUsers",
         ]
@@ -3367,7 +3475,8 @@ def test_correlator_adds_reexport_forwarded_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-reexport"
         and edge.target_id == "target-reexport"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./index:loadUsers",
             "./api:fetchUsers",
@@ -3463,7 +3572,8 @@ def test_correlator_preserves_multiple_reexport_call_chains_to_same_target():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-reexport-multi"
         and edge.target_id == "target-reexport-multi"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./indexA:loadUsersA",
             "./api:fetchUsers",
@@ -3474,14 +3584,14 @@ def test_correlator_preserves_multiple_reexport_call_chains_to_same_target():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-reexport-multi"
         and edge.target_id == "target-reexport-multi"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./indexB:loadUsersB",
             "./api:fetchUsers",
         ]
         for edge in graph.edges
     )
-
 
 
 def test_correlator_adds_call_edges_from_named_import_alias_binding():
@@ -3534,7 +3644,8 @@ def test_correlator_adds_call_edges_from_named_import_alias_binding():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-import-alias"
         and edge.target_id == "target-import-alias"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./api:loadUsers",
         ]
@@ -3602,7 +3713,8 @@ def test_correlator_adds_call_edges_from_namespace_alias_destructured_binding():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-import-destructure-alias"
         and edge.target_id == "target-import-destructure-alias"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./chunk:loadUsers",
         ]
@@ -3666,7 +3778,8 @@ def test_correlator_adds_commonjs_destructured_alias_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-commonjs-destructure-alias"
         and edge.target_id == "target-commonjs-destructure-alias"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./api:loadUsers",
         ]
@@ -3734,7 +3847,8 @@ def test_correlator_adds_export_all_forwarded_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-reexport-all"
         and edge.target_id == "target-reexport-all"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./index:loadUsers",
             "./api:loadUsers",
@@ -3788,7 +3902,8 @@ def test_correlator_adds_commonjs_default_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-commonjs-default"
         and edge.target_id == "target-commonjs-default"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./api:default",
         ]
@@ -3841,7 +3956,8 @@ def test_correlator_adds_commonjs_named_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-commonjs-named"
         and edge.target_id == "target-commonjs-named"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./api:loadUsers",
         ]
@@ -3894,7 +4010,8 @@ def test_correlator_adds_default_object_member_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-default-object-member"
         and edge.target_id == "target-default-object-member"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./api:loadUsers",
         ]
@@ -3968,7 +4085,8 @@ def test_correlator_adds_commonjs_reexport_forwarded_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-commonjs-reexport"
         and edge.target_id == "target-commonjs-reexport"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./barrel:default",
             "./api:default",
@@ -4043,7 +4161,8 @@ def test_correlator_adds_default_object_member_reexport_forwarded_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-default-object-reexport"
         and edge.target_id == "target-default-object-reexport"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./barrel:loadUsers",
             "./api:loadUsers",
@@ -4189,7 +4308,8 @@ def test_correlator_adds_named_object_reexport_forwarded_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-named-object-reexport"
         and edge.target_id == "target-named-object-reexport"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./barrel:loadUsers",
             "./api:loadUsers",
@@ -4246,7 +4366,8 @@ def test_correlator_adds_named_class_member_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-named-class-member"
         and edge.target_id == "target-named-class-member"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./sdk:loadUsers",
         ]
@@ -4531,7 +4652,8 @@ def test_correlator_adds_commonjs_object_barrel_forwarded_call_edges():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-commonjs-object-reexport"
         and edge.target_id == "target-commonjs-object-reexport"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:boot",
             "./barrel:loadUsers",
             "./api:loadUsers",
@@ -4628,7 +4750,8 @@ def test_correlator_adds_dynamic_import_then_call_edges_from_default_binding():
         edge.edge_type == EdgeType.CALL_CHAIN
         and edge.source_id == "source-dynamic-then-default-call"
         and edge.target_id == "target-dynamic-then-default-call"
-        and edge.metadata.get("chain") == [
+        and edge.metadata.get("chain")
+        == [
             "function:arrow@1",
             "dynamic:./chunk:default",
         ]
@@ -4879,3 +5002,93 @@ def test_correlator_caches_intra_module_target_resolution_within_correlation_pas
     assert first == second
     assert call_count == calls_after_first
 
+
+def test_import_edge_cap_is_per_file_not_global():
+    """The import-edge cap is PER-FILE: a later-scanned file's import correlation survives even when
+    an earlier file has many findings -- a global cap + early return starved later files, making
+    correlation (and risk) depend on scan position."""
+    findings = []
+    for i in range(30):
+        findings.append(
+            _make_finding(
+                f"a{i}",
+                "file:///a.js",
+                Category.ENDPOINT,
+                f"/a/{i}",
+                metadata={"imports": [f"./m{i}"]},
+            )
+        )
+        findings.append(
+            _make_finding(f"m{i}", f"file:///m{i}.js", Category.SECRET, FAKE_STRIPE_LIVE)
+        )
+    findings.append(
+        _make_finding("b", "file:///b.js", Category.ENDPOINT, "/b", metadata={"imports": ["./c"]})
+    )
+    findings.append(_make_finding("c", "file:///c.js", Category.SECRET, FAKE_STRIPE_LIVE))
+    graph = Correlator().correlate(findings)
+    assert any(
+        e.edge_type == EdgeType.IMPORT and {e.source_id, e.target_id} == {"b", "c"}
+        for e in graph.edges
+    )
+
+
+def test_graph_telemetry_accounts_for_cap_drops_before_edge_construction():
+    findings = [
+        _make_finding(f"cap-{index:02d}", "file:///cap.js", Category.FLAG, "same")
+        for index in range(12)
+    ]
+    graph = Correlator().correlate(findings)
+
+    assert len([edge for edge in graph.edges if edge.edge_type == EdgeType.SAME_FILE]) == 50
+    assert graph.telemetry["cap_dropped"] > 0
+    assert graph.telemetry["capped_passes"]["_add_same_file_edges"] > 0
+    assert graph.telemetry["candidate_attempts"] == (
+        graph.telemetry["emitted"] + graph.telemetry["duplicate_dropped"]
+    )
+    assert graph.telemetry["truncated_candidates"] == 16
+    assert graph.telemetry["truncated_candidates_lower_bound"] == 16
+    assert graph.telemetry["truncated_candidates_unknown"] == 0
+
+
+def test_edge_cap_telemetry_n_minus_one_n_n_plus_one_boundaries():
+    below = CorrelationGraph()
+    assert (below.edge_cap(50, possible_candidates=49) <= 49) is False
+    assert below.telemetry["capped_passes"] == {}
+
+    exact = CorrelationGraph()
+    assert (exact.edge_cap(50, possible_candidates=50) <= 50) is True
+    assert exact.telemetry["capped_passes"] == {}
+
+    above = CorrelationGraph()
+    assert (above.edge_cap(50, possible_candidates=51) <= 50) is True
+    assert above.telemetry["truncated_candidates"] == 1
+    assert above.telemetry["truncated_candidates_lower_bound"] == 1
+    assert above.telemetry["truncated_candidates_unknown"] == 0
+
+
+def test_edge_cap_unknown_cardinality_is_a_disclosed_lower_bound():
+    graph = CorrelationGraph()
+
+    assert (graph.edge_cap(50) <= 50) is True
+
+    assert graph.telemetry["truncated_candidates"] == 0
+    assert graph.telemetry["truncated_candidates_lower_bound"] == 1
+    assert graph.telemetry["truncated_candidates_unknown"] == 1
+
+
+def test_semantically_tied_findings_choose_same_capped_edges_under_input_reversal():
+    findings = [
+        _make_finding(f"tie-{index:02d}", "file:///tie.js", Category.FLAG, "same")
+        for index in range(12)
+    ]
+
+    forward = Correlator().correlate(findings)
+    reverse = Correlator().correlate(list(reversed(findings)))
+
+    def signature(graph):
+        return sorted(
+            (edge.source_id, edge.target_id, edge.edge_type.value, edge.reasoning)
+            for edge in graph.edges
+        )
+
+    assert signature(forward) == signature(reverse)

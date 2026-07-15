@@ -8,7 +8,8 @@ from __future__ import annotations
 
 import math
 import re
-from typing import Iterator
+from collections.abc import Iterator
+from typing import TypedDict
 
 from bundleInspector.rules.base import AnalysisContext, BaseRule, RuleResult
 from bundleInspector.storage.models import (
@@ -19,7 +20,7 @@ from bundleInspector.storage.models import (
 )
 
 
-def _extract_required_prefix(pattern: str) -> "str | None":
+def _extract_required_prefix(pattern: str) -> str | None:
     """
     Return a leading literal substring that MUST appear in any match of `pattern`,
     or None if one cannot be soundly determined.
@@ -33,7 +34,10 @@ def _extract_required_prefix(pattern: str) -> "str | None":
     Any parsing difficulty yields None (the pattern then always runs).
     """
     try:
-        parsed = re._parser.parse(pattern)
+        parser = re.__dict__.get("_parser")
+        if parser is None:
+            return None
+        parsed = parser.parse(pattern)
     except Exception:
         return None
     chars: list[str] = []
@@ -51,6 +55,12 @@ def _extract_required_prefix(pattern: str) -> "str | None":
         else:
             break
     return "".join(chars) if chars else None
+
+
+class _SessionOverride(TypedDict):
+    value_type: str
+    severity: Severity
+    confidence: Confidence
 
 
 class SecretDetector(BaseRule):
@@ -74,245 +84,315 @@ class SecretDetector(BaseRule):
         # ===========================================
         # Cloud Providers
         # ===========================================
-
         # AWS
         (r"AKIA[0-9A-Z]{16}", "aws_access_key", Severity.CRITICAL),
         (r"ABIA[0-9A-Z]{16}", "aws_access_key", Severity.CRITICAL),
         (r"ACCA[0-9A-Z]{16}", "aws_access_key", Severity.CRITICAL),
         (r"ASIA[0-9A-Z]{16}", "aws_temp_access_key", Severity.CRITICAL),
-        (r"(?:aws|amazon).{0,20}secret.{0,20}['\"]([0-9a-zA-Z/+]{40})['\"]", "aws_secret_key", Severity.CRITICAL),
-
+        (
+            r"(?:aws|amazon).{0,20}secret.{0,20}['\"]([0-9a-zA-Z/+]{40})['\"]",
+            "aws_secret_key",
+            Severity.CRITICAL,
+        ),
         # Azure
-        (r"(?:AccountKey|account_key|storage_key|storageKey)\s*[=:]\s*['\"]?([a-zA-Z0-9+/]{86}==)", "azure_storage_key", Severity.HIGH),
-        (r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[^;]+", "azure_connection_string", Severity.CRITICAL),
-
+        (
+            r"(?:AccountKey|account_key|storage_key|storageKey)\s*[=:]\s*['\"]?([a-zA-Z0-9+/]{86}==)",
+            "azure_storage_key",
+            Severity.HIGH,
+        ),
+        (
+            r"DefaultEndpointsProtocol=https;AccountName=[^;]+;AccountKey=[^;]+",
+            "azure_connection_string",
+            Severity.CRITICAL,
+        ),
         # Google Cloud
         (r"AIza[0-9A-Za-z_-]{35}", "google_api_key", Severity.HIGH),
-        (r"[0-9]+-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com", "google_oauth_client", Severity.HIGH),
+        (
+            r"[0-9]{1,64}-[0-9A-Za-z_]{32}\.apps\.googleusercontent\.com",
+            "google_oauth_client",
+            Severity.HIGH,
+        ),
         (r"ya29\.[0-9A-Za-z_-]+", "google_oauth_token", Severity.HIGH),
         (r'"type"\s*:\s*"service_account"', "google_service_account", Severity.HIGH),
-
         # DigitalOcean
         (r"dop_v1_[a-f0-9]{64}", "digitalocean_pat", Severity.HIGH),
         (r"doo_v1_[a-f0-9]{64}", "digitalocean_oauth", Severity.HIGH),
         (r"dor_v1_[a-f0-9]{64}", "digitalocean_refresh", Severity.HIGH),
-
         # ===========================================
         # AI/ML Services
         # ===========================================
-
         # OpenAI
         (r"sk-[a-zA-Z0-9]{20}T3BlbkFJ[a-zA-Z0-9]{20}", "openai_api_key", Severity.CRITICAL),
         (r"sk-proj-[a-zA-Z0-9_-]{48,}", "openai_project_key", Severity.CRITICAL),
         (r"sk-[a-zA-Z0-9]{48,}", "openai_api_key", Severity.CRITICAL),
-
         # Anthropic (Claude)
         (r"sk-ant-api[0-9]{2}-[a-zA-Z0-9_-]{93}", "anthropic_api_key", Severity.CRITICAL),
-
         # Hugging Face
         (r"hf_[a-zA-Z0-9]{34}", "huggingface_token", Severity.HIGH),
-
         # Replicate
         (r"r8_[a-zA-Z0-9]{40}", "replicate_api_key", Severity.HIGH),
-
         # ===========================================
         # Version Control & CI/CD
         # ===========================================
-
         # GitHub
         (r"ghp_[0-9a-zA-Z]{36}", "github_pat", Severity.CRITICAL),
         (r"gho_[0-9a-zA-Z]{36}", "github_oauth", Severity.CRITICAL),
         (r"ghu_[0-9a-zA-Z]{36}", "github_user_token", Severity.HIGH),
         (r"ghs_[0-9a-zA-Z]{36}", "github_server_token", Severity.HIGH),
         (r"ghr_[0-9a-zA-Z]{36}", "github_refresh_token", Severity.HIGH),
-        (r"github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}", "github_fine_grained_pat", Severity.CRITICAL),
-
+        (
+            r"github_pat_[a-zA-Z0-9]{22}_[a-zA-Z0-9]{59}",
+            "github_fine_grained_pat",
+            Severity.CRITICAL,
+        ),
         # GitLab
         (r"glpat-[0-9a-zA-Z_-]{20}", "gitlab_pat", Severity.CRITICAL),
         (r"glptt-[0-9a-f]{40}", "gitlab_pipeline_token", Severity.HIGH),
         (r"GR1348941[0-9a-zA-Z_-]{20}", "gitlab_runner_token", Severity.HIGH),
-
         # Bitbucket
         (r"ATBB[a-zA-Z0-9]{32}", "bitbucket_app_password", Severity.HIGH),
-
         # NPM
         (r"npm_[a-zA-Z0-9]{36}", "npm_access_token", Severity.HIGH),
-
         # PyPI
         (r"pypi-AgEIcHlwaS5vcmc[a-zA-Z0-9_-]{50,}", "pypi_api_token", Severity.HIGH),
-
         # Vercel
         (r"vercel_[a-zA-Z0-9]{24,}", "vercel_token", Severity.HIGH),
-
         # CircleCI
         (r"circle-token\s*[:=]\s*['\"]?([a-f0-9]{40})['\"]?", "circleci_token", Severity.HIGH),
-
         # Travis CI
         (r"travis\s*[:=]\s*['\"]?([a-zA-Z0-9]{22})['\"]?", "travis_token", Severity.HIGH),
-
         # ===========================================
         # Payment Providers
         # ===========================================
-
         # Stripe
         (r"sk_live_[0-9a-zA-Z]{24,}", "stripe_secret_key", Severity.CRITICAL),
         (r"sk_test_[0-9a-zA-Z]{24,}", "stripe_test_key", Severity.MEDIUM),
         (r"pk_live_[0-9a-zA-Z]{24,}", "stripe_publishable_key", Severity.MEDIUM),
         (r"rk_live_[0-9a-zA-Z]{24,}", "stripe_restricted_key", Severity.HIGH),
         (r"whsec_[a-zA-Z0-9]{32,}", "stripe_webhook_secret", Severity.HIGH),
-
         # Square
         (r"sq0atp-[0-9A-Za-z_-]{22}", "square_access_token", Severity.CRITICAL),
         (r"sq0csp-[0-9A-Za-z_-]{43}", "square_oauth_secret", Severity.CRITICAL),
         (r"EAAAE[a-zA-Z0-9]{59}", "square_sandbox_token", Severity.MEDIUM),
-
         # PayPal
-        (r"access_token\$production\$[a-z0-9]{13}\$[a-f0-9]{32}", "paypal_access_token", Severity.CRITICAL),
+        (
+            r"access_token\$production\$[a-z0-9]{13}\$[a-f0-9]{32}",
+            "paypal_access_token",
+            Severity.CRITICAL,
+        ),
         (r"A21AA[a-zA-Z0-9_-]{60,}", "paypal_client_secret", Severity.HIGH),
-
         # Shopify
         (r"shpat_[a-fA-F0-9]{32}", "shopify_access_token", Severity.HIGH),
         (r"shpca_[a-fA-F0-9]{32}", "shopify_custom_app_token", Severity.HIGH),
         (r"shppa_[a-fA-F0-9]{32}", "shopify_private_app_token", Severity.HIGH),
         (r"shpss_[a-fA-F0-9]{32}", "shopify_shared_secret", Severity.HIGH),
-
         # ===========================================
         # Communication Services
         # ===========================================
-
         # Twilio
         (r"\bSK[0-9a-fA-F]{32}\b", "twilio_api_key", Severity.HIGH),
         (r"\bAC[a-zA-Z0-9]{32}\b", "twilio_account_sid", Severity.MEDIUM),
-
         # Slack
         (r"xox[baprs]-[0-9]{10,}-[0-9]{10,}-[a-zA-Z0-9]{24}", "slack_token", Severity.HIGH),
         (r"xox[baprs]-[0-9]{10,}-[a-zA-Z0-9]{24,}", "slack_token", Severity.HIGH),
-        (r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+", "slack_webhook", Severity.HIGH),
-
+        (
+            r"https://hooks\.slack\.com/services/T[a-zA-Z0-9_]+/B[a-zA-Z0-9_]+/[a-zA-Z0-9_]+",
+            "slack_webhook",
+            Severity.HIGH,
+        ),
         # Discord
         (r"[MN][A-Za-z\d]{23,40}\.[\w-]{6}\.[\w-]{27}", "discord_bot_token", Severity.CRITICAL),
-        (r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[a-zA-Z0-9_-]+", "discord_webhook", Severity.HIGH),
-
+        (
+            r"https://discord(?:app)?\.com/api/webhooks/[0-9]+/[a-zA-Z0-9_-]+",
+            "discord_webhook",
+            Severity.HIGH,
+        ),
         # Telegram
-        (r"[0-9]+:AA[0-9A-Za-z_-]{33}", "telegram_bot_token", Severity.HIGH),
-
+        (r"[0-9]{1,32}:AA[0-9A-Za-z_-]{33}", "telegram_bot_token", Severity.HIGH),
         # SendGrid
         (r"SG\.[a-zA-Z0-9_-]{22}\.[a-zA-Z0-9_-]{43}", "sendgrid_api_key", Severity.HIGH),
-
         # Mailgun
-        (r"(?<![0-9A-Za-z_-])key-[0-9a-zA-Z]{32}(?![0-9A-Za-z_-])", "mailgun_api_key", Severity.HIGH),
-        (r"(?<![0-9a-f])[a-f0-9]{32}-[a-f0-9]{8}-[a-f0-9]{8}(?![0-9a-f-])", "mailgun_private_key", Severity.HIGH),
-
+        (
+            r"(?<![0-9A-Za-z_-])key-[0-9a-zA-Z]{32}(?![0-9A-Za-z_-])",
+            "mailgun_api_key",
+            Severity.HIGH,
+        ),
+        (
+            r"(?<![0-9a-f])[a-f0-9]{32}-[a-f0-9]{8}-[a-f0-9]{8}(?![0-9a-f-])",
+            "mailgun_private_key",
+            Severity.HIGH,
+        ),
         # Mailchimp
         (r"[a-f0-9]{32}-us[0-9]{1,2}", "mailchimp_api_key", Severity.HIGH),
-
         # ===========================================
         # Database & Backend Services
         # ===========================================
-
         # Firebase
         (r"AAAA[A-Za-z0-9_-]{7}:[A-Za-z0-9_-]{140}", "firebase_cloud_messaging", Severity.HIGH),
-        (r"[a-zA-Z0-9_-]+\.firebaseio\.com", "firebase_database_url", Severity.MEDIUM),
-        (r"[a-zA-Z0-9_-]+\.firebasestorage\.googleapis\.com", "firebase_storage_url", Severity.MEDIUM),
-
+        (r"[a-zA-Z0-9_-]{1,253}\.firebaseio\.com", "firebase_database_url", Severity.MEDIUM),
+        (
+            r"[a-zA-Z0-9_-]{1,253}\.firebasestorage\.googleapis\.com",
+            "firebase_storage_url",
+            Severity.MEDIUM,
+        ),
         # Supabase
         (r"sbp_[a-f0-9]{40}", "supabase_service_key", Severity.CRITICAL),
         # Note: the generic HS256 JWT header (eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9) is not
         # Supabase-specific; generic JWTs are caught by the jwt_token pattern below.
-
         # MongoDB
-        (r"mongodb\+srv://[^:]+:[^@]+@[^/]+", "mongodb_connection_string", Severity.CRITICAL),
-        (r"mongodb://[^:]+:[^@]+@[^/]+", "mongodb_connection_string", Severity.CRITICAL),
-
+        (
+            r"mongodb\+srv://[^:]{1,256}:[^@]{1,256}@[^/]{1,512}",
+            "mongodb_connection_string",
+            Severity.CRITICAL,
+        ),
+        (
+            r"mongodb://[^:]{1,256}:[^@]{1,256}@[^/]{1,512}",
+            "mongodb_connection_string",
+            Severity.CRITICAL,
+        ),
         # PostgreSQL
-        (r"postgres://[^:]+:[^@]+@[^/]+", "postgres_connection_string", Severity.CRITICAL),
-        (r"postgresql://[^:]+:[^@]+@[^/]+", "postgres_connection_string", Severity.CRITICAL),
-
+        (
+            r"postgres://[^:]{1,256}:[^@]{1,256}@[^/]{1,512}",
+            "postgres_connection_string",
+            Severity.CRITICAL,
+        ),
+        (
+            r"postgresql://[^:]{1,256}:[^@]{1,256}@[^/]{1,512}",
+            "postgres_connection_string",
+            Severity.CRITICAL,
+        ),
         # MySQL
-        (r"mysql://[^:]+:[^@]+@[^/]+", "mysql_connection_string", Severity.CRITICAL),
-
+        (
+            r"mysql://[^:]{1,256}:[^@]{1,256}@[^/]{1,512}",
+            "mysql_connection_string",
+            Severity.CRITICAL,
+        ),
         # Redis
-        (r"redis://[^:]+:[^@]+@[^/]+", "redis_connection_string", Severity.CRITICAL),
-        (r"rediss://[^:]+:[^@]+@[^/]+", "redis_connection_string", Severity.CRITICAL),
-
+        (
+            r"redis://[^:]{1,256}:[^@]{1,256}@[^/]{1,512}",
+            "redis_connection_string",
+            Severity.CRITICAL,
+        ),
+        (
+            r"rediss://[^:]{1,256}:[^@]{1,256}@[^/]{1,512}",
+            "redis_connection_string",
+            Severity.CRITICAL,
+        ),
         # PlanetScale
         (r"pscale_tkn_[a-zA-Z0-9_-]{43}", "planetscale_token", Severity.HIGH),
         (r"pscale_pw_[a-zA-Z0-9_-]{43}", "planetscale_password", Severity.CRITICAL),
-
         # ===========================================
         # Monitoring & Analytics
         # ===========================================
-
         # New Relic
         (r"NRAK-[A-Z0-9]{27}", "newrelic_user_key", Severity.HIGH),
         (r"NRJS-[a-f0-9]{19}", "newrelic_browser_key", Severity.MEDIUM),
-
         # Sentry
-        (r"https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+", "sentry_dsn", Severity.MEDIUM),
+        (
+            r"https://[a-f0-9]{32}@[a-z0-9]+\.ingest\.sentry\.io/[0-9]+",
+            "sentry_dsn",
+            Severity.MEDIUM,
+        ),
         (r"sntrys_[a-zA-Z0-9]{64}", "sentry_auth_token", Severity.HIGH),
-
         # ===========================================
         # CDN & Infrastructure
         # ===========================================
-
         # Cloudflare
         (r"v1\.0-[a-f0-9]{24}-[a-f0-9]{146}", "cloudflare_api_token", Severity.HIGH),
-
         # ===========================================
         # Productivity & Collaboration
         # ===========================================
-
         # Linear
         (r"lin_api_[a-zA-Z0-9]{40}", "linear_api_key", Severity.HIGH),
-
         # Notion
         (r"secret_[a-zA-Z0-9]{43}", "notion_integration_token", Severity.HIGH),
         (r"ntn_[a-zA-Z0-9]{50,}", "notion_token", Severity.HIGH),
-
         # Airtable (must be exactly 17 chars and not part of a longer identifier)
         (r"(?<![a-zA-Z0-9_])key[a-zA-Z0-9]{14}(?![a-zA-Z0-9_])", "airtable_api_key", Severity.HIGH),
         (r"pat[a-zA-Z0-9]{14}\.[a-f0-9]{64}", "airtable_pat", Severity.HIGH),
-
         # Asana
         (r"[0-9]/[0-9]{16}:[a-zA-Z0-9]{32}", "asana_pat", Severity.HIGH),
-
         # Figma
         (r"figd_[a-zA-Z0-9_-]{40,}", "figma_pat", Severity.HIGH),
-
         # ===========================================
         # Auth & Security
         # ===========================================
-
         # JWT (generic)
-        (r"eyJ[A-Za-z0-9_-]+\.eyJ[A-Za-z0-9_-]+\.[A-Za-z0-9_-]+", "jwt_token", Severity.MEDIUM),
-
+        (
+            r"eyJ[A-Za-z0-9_-]{1,8192}\.eyJ[A-Za-z0-9_-]{1,8192}\.[A-Za-z0-9_-]{1,8192}",
+            "jwt_token",
+            Severity.MEDIUM,
+        ),
         # Auth0
-        (r"[a-zA-Z0-9_-]{32,}\.auth0\.com", "auth0_domain", Severity.MEDIUM),
-
+        (r"[a-zA-Z0-9_-]{32,253}\.auth0\.com", "auth0_domain", Severity.MEDIUM),
         # Okta
-        (r"(?:okta|SSWS)\s*[:=]\s*['\"]?(00[a-zA-Z0-9]{40})['\"]?", "okta_api_token", Severity.HIGH),
-
+        (
+            r"(?:okta|SSWS)\s*[:=]\s*['\"]?(00[a-zA-Z0-9]{40})['\"]?",
+            "okta_api_token",
+            Severity.HIGH,
+        ),
         # Private keys (PEM format)
-        (r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----", "private_key", Severity.CRITICAL),
+        (
+            r"-----BEGIN (?:RSA |EC |DSA |OPENSSH )?PRIVATE KEY-----",
+            "private_key",
+            Severity.CRITICAL,
+        ),
         (r"-----BEGIN PGP PRIVATE KEY BLOCK-----", "pgp_private_key", Severity.CRITICAL),
-
         # SSH Keys
         (r"ssh-rsa AAAA[0-9A-Za-z+/]+[=]{0,3}", "ssh_public_key", Severity.LOW),
         (r"ssh-ed25519 AAAA[0-9A-Za-z+/]+[=]{0,3}", "ssh_public_key", Severity.LOW),
-
         # Database URLs (additional)
-        (r"(?:mongodb|postgres|mysql|redis|amqp|rabbitmq)://[^'\"\s]{1,256}:[^'\"\s]{1,256}@[^'\"\s]{1,512}", "database_url", Severity.CRITICAL),
+        (
+            r"(?:mongodb|postgres|mysql|redis|amqp|rabbitmq)://[^'\"\s]{1,256}:[^'\"\s]{1,256}@[^'\"\s]{1,512}",
+            "database_url",
+            Severity.CRITICAL,
+        ),
     ]
 
     # Generic assignment-context patterns (scanned against source content, not string literals)
     GENERIC_PATTERNS = [
-        (r"['\"]?(?:api[_-]?key|apikey)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "api_key", Severity.HIGH, Confidence.HIGH),
-        (r"['\"]?(?:secret[_-]?key)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "secret_key", Severity.HIGH, Confidence.HIGH),
-        (r"['\"]?(?:session(?:[_-]?(?:id|token|key))?|sess(?:ion|id)?|jsessionid|phpsessid|connect\.sid|nextauth\.session-token|next-auth\.session-token|session_cookie|cookie_token)['\"]?\s*[:=]\s*['\"]([^'\"]{16,})['\"]", "session_token", Severity.MEDIUM, Confidence.MEDIUM),
-        (r"['\"]?(?:access[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "access_token", Severity.HIGH, Confidence.HIGH),
-        (r"['\"]?(?:auth[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]", "auth_token", Severity.HIGH, Confidence.HIGH),
-        (r"['\"]?(?:secret|token|password|passwd|pwd)['\"]?\s*[:=]\s*['\"]([^'\"]{8,})['\"]", "generic_secret", Severity.MEDIUM, Confidence.HIGH),
-        (r"['\"]?(?:auth|authorization)['\"]?\s*[:=]\s*['\"](?:Bearer |Basic )?([a-zA-Z0-9_.-]{20,})['\"]", "auth_header", Severity.MEDIUM, Confidence.MEDIUM),
+        (
+            r"['\"]?(?:api[_-]?key|apikey)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]",
+            "api_key",
+            Severity.HIGH,
+            Confidence.HIGH,
+        ),
+        (
+            r"['\"]?(?:secret[_-]?key)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]",
+            "secret_key",
+            Severity.HIGH,
+            Confidence.HIGH,
+        ),
+        (
+            r"['\"]?(?:session(?:[_-]?(?:id|token|key))?|sess(?:ion|id)?|jsessionid|phpsessid|connect\.sid|nextauth\.session-token|next-auth\.session-token|session_cookie|cookie_token)['\"]?\s*[:=]\s*['\"]([^'\"]{16,})['\"]",
+            "session_token",
+            Severity.MEDIUM,
+            Confidence.MEDIUM,
+        ),
+        (
+            r"['\"]?(?:access[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]",
+            "access_token",
+            Severity.HIGH,
+            Confidence.HIGH,
+        ),
+        (
+            r"['\"]?(?:auth[_-]?token)['\"]?\s*[:=]\s*['\"]([a-zA-Z0-9_-]{20,})['\"]",
+            "auth_token",
+            Severity.HIGH,
+            Confidence.HIGH,
+        ),
+        (
+            r"['\"]?(?:secret|token|password|passwd|pwd)['\"]?\s*[:=]\s*['\"]([^'\"]{8,})['\"]",
+            "generic_secret",
+            Severity.MEDIUM,
+            Confidence.HIGH,
+        ),
+        (
+            r"['\"]?(?:auth|authorization)['\"]?\s*[:=]\s*['\"](?:Bearer |Basic )?([a-zA-Z0-9_.-]{20,})['\"]",
+            "auth_header",
+            Severity.MEDIUM,
+            Confidence.MEDIUM,
+        ),
     ]
 
     # Precompiled patterns (perf). Each secret entry carries a sound required-literal
@@ -328,8 +408,7 @@ class SecretDetector(BaseRule):
         for _cp in (re.compile(_p),)
     ]
     _COMPILED_GENERIC_PATTERNS = [
-        (re.compile(_p, re.IGNORECASE), _t, _s, _c)
-        for (_p, _t, _s, _c) in GENERIC_PATTERNS
+        (re.compile(_p, re.IGNORECASE), _t, _s, _c) for (_p, _t, _s, _c) in GENERIC_PATTERNS
     ]
 
     # Exclude patterns (placeholder, test values)
@@ -376,8 +455,7 @@ class SecretDetector(BaseRule):
         context: AnalysisContext,
     ) -> Iterator[RuleResult]:
         """Match secrets in IR."""
-        seen_literal_values = set()
-        emitted_values = set()
+        emitted_occurrences: set[tuple[str, int]] = set()
         entropy_candidates = []
 
         for literal in ir.string_literals:
@@ -387,21 +465,17 @@ class SecretDetector(BaseRule):
             if len(value) < 8:
                 continue
 
-            # Skip duplicates
-            if value in seen_literal_values:
-                continue
-            seen_literal_values.add(value)
-
             # Skip excluded patterns
             if self._is_excluded(value):
                 continue
 
             # Check known patterns (precompiled + sound required-literal prefilter)
+            provider_match = False
             for pattern, secret_type, severity, required in self._COMPILED_SECRET_PATTERNS:
                 if required is not None and required not in value:
                     continue
-                match = pattern.search(value)
-                if match:
+                for match in pattern.finditer(value):
+                    provider_match = True
                     matched_value = match.group(0)
                     if len(match.groups()) > 0:
                         matched_value = match.group(1)
@@ -419,8 +493,9 @@ class SecretDetector(BaseRule):
                         effective_severity = context_override["severity"]
                         effective_confidence = context_override["confidence"]
 
-                    # Prevent duplicate from GENERIC_PATTERNS scan
-                    emitted_values.add(matched_value)
+                    # Prevent a generic assignment matcher from duplicating this provider match on
+                    # the same line while preserving independent occurrences on other lines.
+                    emitted_occurrences.add((matched_value, literal.line))
 
                     yield RuleResult(
                         rule_id=self.id,
@@ -432,20 +507,22 @@ class SecretDetector(BaseRule):
                         extracted_value=matched_value,
                         value_type=effective_secret_type,
                         line=literal.line,
-                        column=literal.column,
+                        column=literal.column + match.start(),
                         ast_node_type="Literal",
                         tags=["secret", effective_secret_type],
                         metadata={
                             "matched_text": match.group(0),
-                            "match_uses_capture_group": len(match.groups()) > 0 and matched_value != match.group(0),
+                            "match_uses_capture_group": len(match.groups()) > 0
+                            and matched_value != match.group(0),
                             "matched_pattern_type": secret_type,
                             "contextual_type_override": (
-                                effective_secret_type if effective_secret_type != secret_type else None
+                                effective_secret_type
+                                if effective_secret_type != secret_type
+                                else None
                             ),
                         },
                     )
-                    break
-            else:
+            if not provider_match:
                 entropy_candidates.append((value, literal))
 
         # Scan source content for generic assignment-context patterns
@@ -459,11 +536,10 @@ class SecretDetector(BaseRule):
                     if self._is_excluded(matched_value):
                         continue
 
-                    if matched_value in emitted_values:
+                    line = context.source_content[: match.start()].count("\n") + 1
+                    if (matched_value, line) in emitted_occurrences:
                         continue
-                    emitted_values.add(matched_value)
-
-                    line = context.source_content[:match.start()].count("\n") + 1
+                    emitted_occurrences.add((matched_value, line))
                     line_start = context.source_content.rfind("\n", 0, match.start()) + 1
                     column = match.start() - line_start
 
@@ -482,13 +558,14 @@ class SecretDetector(BaseRule):
                         tags=["secret", secret_type],
                         metadata={
                             "matched_text": match.group(0),
-                            "match_uses_capture_group": len(match.groups()) > 0 and matched_value != match.group(0),
+                            "match_uses_capture_group": len(match.groups()) > 0
+                            and matched_value != match.group(0),
                             "match_column": column,
                         },
                     )
 
         for value, literal in entropy_candidates:
-            if value in emitted_values:
+            if (value, literal.line) in emitted_occurrences:
                 continue
             if not self._looks_like_secret(value) or not self._is_high_quality_random(value):
                 continue
@@ -505,7 +582,7 @@ class SecretDetector(BaseRule):
                 confidence = Confidence.HIGH
 
             tags = ["secret", "entropy"]
-            metadata = {
+            metadata: dict[str, object] = {
                 "entropy": entropy,
                 "normalized_entropy": normalized,
                 "bigram_entropy": bigram,
@@ -535,7 +612,7 @@ class SecretDetector(BaseRule):
                 tags=tags,
                 metadata=metadata,
             )
-            emitted_values.add(value)
+            emitted_occurrences.add((value, literal.line))
 
     def _is_excluded(self, value: str) -> bool:
         """Check if value matches exclusion patterns."""
@@ -546,11 +623,28 @@ class SecretDetector(BaseRule):
         # Exclude scheme URLs without embedded credentials -- re-reported by the Domain/
         # Endpoint detectors, never a secret. Credential-bearing URLs (token=, user:pass@)
         # keep the same guard so they still reach secret detection.
-        credential_params = ("key=", "token=", "secret=", "password=",
-                             "auth=", "api_key=", "apikey=", "access_token=")
+        credential_params = (
+            "key=",
+            "token=",
+            "secret=",
+            "password=",
+            "auth=",
+            "api_key=",
+            "apikey=",
+            "access_token=",
+        )
         if value.startswith(("http://", "https://", "s3://", "gs://", "ws://", "wss://")):
             if "@" not in value and not any(kw in value.lower() for kw in credential_params):
-                return True
+                # Known webhook URLs carry their secret in the PATH (not a query credential), so they
+                # are NOT generic scheme-URLs to drop -- let the webhook patterns run (DQ-S03).
+                _low = value.lower()
+                _webhook_markers = (
+                    "hooks.slack.com/services/",
+                    "discord.com/api/webhooks/",
+                    "discordapp.com/api/webhooks/",
+                )
+                if not any(m in _low for m in _webhook_markers):
+                    return True
 
         # Inline data: URIs (base64 assets/sourcemaps) are provably not credentials.
         if value.startswith("data:"):
@@ -569,7 +663,7 @@ class SecretDetector(BaseRule):
         secret_type: str,
         literal_line: int,
         source_content: str,
-    ) -> dict[str, object] | None:
+    ) -> _SessionOverride | None:
         """Downgrade session-like literals found in explicit session/cookie assignment context."""
         if secret_type not in {"jwt_token", "access_token"}:
             return None
@@ -669,7 +763,8 @@ class SecretDetector(BaseRule):
     # random opaque token (base64/hex/api-key) tokenizes into NON-word segments -> ~0 coverage,
     # so genuine secrets are never suppressed by this filter (empirically 0 FN on a real-secret
     # battery; identifiers score >=0.70, secrets <=0.21).
-    _COMMON_WORDS = frozenset("""
+    _COMMON_WORDS = frozenset(
+        """
 the and for are but not you all can has was one our out get use new now way each which their
 time will about would there could other after first also some what when your from they know want
 been good much more most over such only into than them then these list item view page data name
@@ -684,7 +779,8 @@ total price amount number step ref msg btn img src url api crit restock stock wi
 agent receipt claim refund group ecard preview enlarge zoom toggle class bool boolean string
 array object index window frame form info method function return null default handler http name
 paymentchange previous order cancel confirm claim prefer detail notify request receipt card cash
-""".split())
+""".split()
+    )
 
     def _identifier_word_coverage(self, value: str) -> float:
         """Fraction of a value's letters that belong to common-word segments (camelCase /
@@ -730,10 +826,13 @@ paymentchange previous order cancel confirm claim prefer detail notify request r
             r"^[0-9a-f]{40}$",
             # Short git hashes
             r"^[0-9a-f]{7,8}$",
-            # Common version strings
-            r"^v?\d+\.\d+\.\d+",
-            # Date-like strings
-            r"^\d{4}-\d{2}-\d{2}",
+            # Common version strings (END-anchored so a secret merely STARTING with a version is not
+            # excluded -- DQ-S05). Allow REPEATED dot/dash/plus pre-release+build segments so real
+            # multi-segment SemVer (15.0.0-canary.abc, 1.2.3+sha.5114f85) stays excluded, while a
+            # version-PREFIXED secret with no separator (1.2.3abcdef...) is NOT excluded.
+            r"^v?\d+\.\d+\.\d+(?:[.+-][0-9A-Za-z]+)*$",
+            # Date-like strings (END-anchored, optional ISO time/zone suffix)
+            r"^\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}(?::\d{2})?)?(?:Z|[+-]\d{2}:?\d{2})?$",
             # Common build identifiers
             r"^build[_-]?[0-9a-f]+$",
             # CSS class names
@@ -769,7 +868,7 @@ paymentchange previous order cancel confirm claim prefer detail notify request r
         if not value:
             return 0.0
 
-        freq = {}
+        freq: dict[str, int] = {}
         for c in value:
             freq[c] = freq.get(c, 0) + 1
 
@@ -811,9 +910,9 @@ paymentchange previous order cancel confirm claim prefer detail notify request r
         if len(value) < 3:
             return 0.0
 
-        bigrams = [value[i:i+2] for i in range(len(value) - 1)]
+        bigrams = [value[i : i + 2] for i in range(len(value) - 1)]
 
-        freq = {}
+        freq: dict[str, int] = {}
         for bg in bigrams:
             freq[bg] = freq.get(bg, 0) + 1
 
@@ -867,9 +966,8 @@ paymentchange previous order cancel confirm claim prefer detail notify request r
                 return True
 
         # Check for common repeating patterns
-        for pattern in ['123', 'abc', 'xyz', '000', 'aaa']:
+        for pattern in ["123", "abc", "xyz", "000", "aaa"]:
             if pattern * 3 in value.lower():
                 return True
 
         return False
-

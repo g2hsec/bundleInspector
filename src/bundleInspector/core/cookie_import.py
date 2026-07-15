@@ -12,16 +12,14 @@ from __future__ import annotations
 
 import json
 import logging
-import re
 import sqlite3
 import sys
 from pathlib import Path
-from typing import Optional
 
 logger = logging.getLogger(__name__)
 
 
-def _dpapi_unprotect(data: bytes) -> Optional[bytes]:
+def _dpapi_unprotect(data: bytes) -> bytes | None:
     """Windows DPAPI CryptUnprotectData via ctypes (no pywin32 dependency).
 
     Returns the decrypted bytes, or None on any failure / non-Windows.
@@ -55,7 +53,7 @@ def _dpapi_unprotect(data: bytes) -> Optional[bytes]:
         return None
 
 
-def _chromium_local_state_path(db_path: Path) -> Optional[Path]:
+def _chromium_local_state_path(db_path: Path) -> Path | None:
     """Locate the browser's `Local State` file (holds the encrypted master key) by
     walking up from the cookie DB path (handles both `Default/Cookies` and the newer
     `Default/Network/Cookies` layouts)."""
@@ -66,7 +64,7 @@ def _chromium_local_state_path(db_path: Path) -> Optional[Path]:
     return None
 
 
-def _chromium_master_key(db_path: Path) -> Optional[bytes]:
+def _chromium_master_key(db_path: Path) -> bytes | None:
     """Recover the AES-256 master key used to encrypt Chromium cookie values on Windows:
     base64-decode `os_crypt.encrypted_key` from Local State, strip the `DPAPI` prefix, and
     DPAPI-unprotect the remainder. Returns None if unavailable."""
@@ -89,7 +87,7 @@ def _chromium_master_key(db_path: Path) -> Optional[bytes]:
         return None
 
 
-def _decrypt_chromium_value(encrypted: bytes, key: Optional[bytes]) -> Optional[str]:
+def _decrypt_chromium_value(encrypted: bytes, key: bytes | None) -> str | None:
     """Decrypt a single Chromium `encrypted_value` blob.
 
     - `v10`/`v11`: AES-256-GCM (3-byte tag + 12-byte nonce + ciphertext + 16-byte GCM tag),
@@ -202,9 +200,9 @@ def import_cookies_from_file(
     # Netscape cookie file format
     has_netscape_header = "# Netscape HTTP Cookie File" in content
     has_tab_fields = any(
-        len(line.split("\t")) == 7
+        len(row.split("\t")) == 7
         for line in content.splitlines()
-        if line.strip() and not line.strip().startswith("#")
+        if (row := _strip_httponly_marker(line.strip())) and not row.startswith("#")
     )
     if has_netscape_header or has_tab_fields:
         return parse_netscape_cookies(content, domain)
@@ -258,6 +256,13 @@ def parse_json_cookies(
     return cookies
 
 
+def _strip_httponly_marker(line: str) -> str:
+    """curl/wget serialize HttpOnly cookies with a literal `#HttpOnly_` prefix on the domain field.
+    Strip it so these real 7-field cookie lines are not mistaken for `#` comments and dropped --
+    HttpOnly is exactly the flag on the session/auth cookies an authenticated scan needs."""
+    return line[len("#HttpOnly_"):] if line.startswith("#HttpOnly_") else line
+
+
 def parse_netscape_cookies(
     content: str,
     domain: str = "",
@@ -271,7 +276,7 @@ def parse_netscape_cookies(
     cookies = {}
 
     for line in content.split("\n"):
-        line = line.strip()
+        line = _strip_httponly_marker(line.strip())
 
         # Skip comments and empty lines
         if not line or line.startswith("#"):
@@ -359,7 +364,7 @@ def import_cookies_from_browser(
         return _read_chromium_cookies(db_path, domain)
 
 
-def _find_cookie_db(browser: str) -> Optional[Path]:
+def _find_cookie_db(browser: str) -> Path | None:
     """Find browser cookie database path."""
     import platform
     system = platform.system()

@@ -4,8 +4,8 @@ from __future__ import annotations
 
 import asyncio
 import io
-from pathlib import Path
 import uuid
+from pathlib import Path
 
 from click.testing import CliRunner
 from rich.console import Console
@@ -22,7 +22,6 @@ from bundleInspector.storage.models import (
     RiskTier,
     Severity,
 )
-
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
 TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -82,6 +81,98 @@ def test_analyze_no_banner_suppresses_ascii_banner(monkeypatch):
     assert no_banner_result.exit_code == 0, no_banner_result.output
     assert "JavaScript Security Analyzer" not in no_banner_result.output
     assert "Local analysis" in no_banner_result.output
+
+
+def test_scan_publishes_the_primary_report_with_the_atomic_output_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def fake_run_scan(*args, **kwargs):
+        return _build_report()
+
+    published: list[tuple[Path, str]] = []
+    monkeypatch.setattr(cli_module, "_run_scan", fake_run_scan)
+    monkeypatch.setattr(
+        cli_module,
+        "atomic_publish_text",
+        lambda path, payload: published.append((Path(path), payload)),
+    )
+    output_path = tmp_path / "scan.json"
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        ["scan", "https://example.com", "--quiet", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [path for path, _ in published] == [output_path]
+
+
+def test_analyze_publishes_the_primary_report_with_the_atomic_output_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    async def fake_local_analysis(*args, **kwargs):
+        return _build_report()
+
+    published: list[tuple[Path, str]] = []
+    monkeypatch.setattr(cli_module, "_run_local_analysis", fake_local_analysis)
+    monkeypatch.setattr(
+        cli_module,
+        "atomic_publish_text",
+        lambda path, payload: published.append((Path(path), payload)),
+    )
+    target_dir = tmp_path / "bundle"
+    target_dir.mkdir()
+    output_path = tmp_path / "analyze.json"
+
+    result = CliRunner().invoke(
+        cli_module.main,
+        ["analyze", str(target_dir), "--quiet", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [path for path, _ in published] == [output_path]
+
+
+def test_wordlist_and_api_map_outputs_use_the_atomic_output_contract(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    report = _build_report()
+    report.findings.append(
+        Finding(
+            rule_id="endpoint-detector",
+            category=Category.ENDPOINT,
+            severity=Severity.MEDIUM,
+            confidence=Confidence.HIGH,
+            title="Endpoint",
+            evidence=Evidence(
+                file_url="https://example.com/app.js",
+                file_hash="hash",
+                line=1,
+                snippet='fetch("/api/users")',
+            ),
+            extracted_value="/api/users",
+        )
+    )
+    published: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "atomic_publish_text",
+        lambda path, payload: published.append((Path(path), payload)),
+    )
+    report_path = tmp_path / "report.json"
+
+    cli_module._generate_wordlist(report, "endpoints", report_path, quiet=True)
+    cli_module._generate_wordlist(report, "all", report_path, quiet=True)
+    cli_module._generate_api_map(report, report_path, quiet=True)
+
+    published_names = [path.name for path, _ in published]
+    assert published_names.count("wordlist_endpoints.txt") == 2
+    assert "api_map.json" in published_names
+    assert "api_map.txt" in published_names
+    assert all(path.parent == tmp_path for path, _ in published)
 
 
 def test_scan_debug_enables_debug_logging_and_verbose(monkeypatch):

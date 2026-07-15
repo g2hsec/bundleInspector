@@ -1,13 +1,13 @@
 """enh4: method-preserving dedup + IDOR/enumeration hints + method-flip candidates.
 Additive: preserves every endpoint (hidden verbs surface as extra rows, never dropped)."""
 
+from bundleInspector.classifier.scoring import ScoreCalculator
 from bundleInspector.config import Config
-from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.rules.engine import RuleEngine
-from bundleInspector.classifier.scoring import ScoreCalculator
-from bundleInspector.storage.models import Category, Severity, Confidence, Finding, Evidence
+from bundleInspector.storage.models import Category, Confidence, Evidence, Finding, Severity
 
 
 def _eps(source: str):
@@ -21,9 +21,11 @@ def _eps(source: str):
 
 
 def test_method_split_preserves_all_verbs():
-    eps = _eps("fetch('/api/item/1'); var x=new XMLHttpRequest(); x.open('DELETE','/api/item/1'); axios.post('/api/item/1',{});")
+    eps = _eps(
+        "fetch('/api/item/1'); var x=new XMLHttpRequest(); x.open('DELETE','/api/item/1'); axios.post('/api/item/1',{});"
+    )
     methods = {f.metadata.get("method") for f in eps if f.extracted_value == "/api/item/1"}
-    assert methods == {"GET", "DELETE", "POST"}   # url-only dedup used to collapse to one
+    assert methods == {"GET", "DELETE", "POST"}  # url-only dedup used to collapse to one
 
 
 def test_dedup_same_method_same_url_still_collapses():
@@ -39,19 +41,32 @@ def test_literal_suppressed_by_http_same_path():
 def test_idor_numeric_segment_tagged():
     f = [f for f in _eps("fetch('/api/users/123');") if f.extracted_value == "/api/users/123"][0]
     assert "idor_candidate" in f.tags
-    assert f.metadata["idor_params"][0] == {"position": 3, "segment": "123", "type": "numeric", "value_type": "numeric"}
+    assert f.metadata["idor_params"][0] == {
+        "position": 3,
+        "segment": "123",
+        "type": "numeric",
+        "value_type": "numeric",
+    }
     assert f.severity == Severity.LOW
 
 
 def test_idor_uuid_segment_tagged():
-    f = [f for f in _eps("fetch('/api/orgs/550e8400-e29b-41d4-a716-446655440000/x');") if "orgs" in f.extracted_value][0]
+    f = [
+        f
+        for f in _eps("fetch('/api/orgs/550e8400-e29b-41d4-a716-446655440000/x');")
+        if "orgs" in f.extracted_value
+    ][0]
     assert f.metadata["idor_inferred_type"] == "uuid"
 
 
 def test_idor_template_param():
     # the endpoint resolver renders the expression as a ${...} placeholder, so the param name
     # is not recoverable -> type 'template', value_type inferred 'dynamic'.
-    f = [f for f in _eps("const id=user.id; fetch(`/api/accounts/${id}/balance`);") if "accounts" in f.extracted_value][0]
+    f = [
+        f
+        for f in _eps("const id=user.id; fetch(`/api/accounts/${id}/balance`);")
+        if "accounts" in f.extracted_value
+    ][0]
     p = [p for p in f.metadata["idor_params"] if p["type"] == "template"][0]
     assert p["type"] == "template"
 
@@ -62,7 +77,11 @@ def test_idor_express_param():
 
 
 def test_idor_email_param():
-    f = [f for f in _eps("axios.get('/api/lookup/john.doe@example.com');") if "lookup" in f.extracted_value][0]
+    f = [
+        f
+        for f in _eps("axios.get('/api/lookup/john.doe@example.com');")
+        if "lookup" in f.extracted_value
+    ][0]
     assert f.metadata["idor_inferred_type"] == "email"
 
 
@@ -89,7 +108,9 @@ def test_method_flip_full_set_when_only_get():
 
 
 def test_websocket_gets_idor_no_method_flip():
-    f = [f for f in _eps("new WebSocket('wss://h/socket/7');") if "socket/7" in f.extracted_value][0]
+    f = [f for f in _eps("new WebSocket('wss://h/socket/7');") if "socket/7" in f.extracted_value][
+        0
+    ]
     assert "idor_candidate" in f.tags and "method_flip" not in f.metadata
 
 
@@ -102,8 +123,17 @@ def test_multi_param_positions():
 
 def test_scoring_idor_likelihood_bump():
     ev = Evidence(file_url="f", file_hash="h", line=1, column=0)
-    base = Finding(rule_id="e", category=Category.ENDPOINT, severity=Severity.LOW, confidence=Confidence.MEDIUM,
-                   title="t", description="d", evidence=ev, extracted_value="/api/x/1", value_type="api_endpoint")
+    base = Finding(
+        rule_id="e",
+        category=Category.ENDPOINT,
+        severity=Severity.LOW,
+        confidence=Confidence.MEDIUM,
+        title="t",
+        description="d",
+        evidence=ev,
+        extracted_value="/api/x/1",
+        value_type="api_endpoint",
+    )
     idor = base.model_copy(deep=True)
     idor.tags = ["idor_candidate"]
     sc = ScoreCalculator()

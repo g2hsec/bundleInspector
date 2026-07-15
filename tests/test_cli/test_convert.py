@@ -4,9 +4,11 @@ import json
 import uuid
 from pathlib import Path
 
-from click.testing import CliRunner
 import pytest
+from click import ClickException
+from click.testing import CliRunner
 
+import bundleInspector.cli as cli_module
 from bundleInspector.cli import _parse_report_content_for_convert, main
 from bundleInspector.reporter.html_reporter import HTMLReporter
 from bundleInspector.reporter.json_reporter import JSONReporter
@@ -15,12 +17,11 @@ from bundleInspector.storage.models import (
     Confidence,
     Evidence,
     Finding,
+    JSAsset,
     Report,
     RiskTier,
     Severity,
-    JSAsset,
 )
-
 
 TEST_TMP_ROOT = Path(".tmp_test_artifacts")
 TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
@@ -111,7 +112,7 @@ def test_load_report_from_embedded_html():
 
 def test_load_report_from_html_without_embedded_json_raises():
     """Non-BundleInspector HTML should fail with a clear error."""
-    with pytest.raises(Exception):
+    with pytest.raises(ClickException):
         _parse_report_content_for_convert("<html><body>No embedded report</body></html>")
 
 
@@ -149,3 +150,46 @@ def test_convert_command_round_trips_html_and_preserves_original_evidence():
     assert finding["metadata"]["normalized_evidence"]["file_url"] == "https://example.com/static/app.js"
     assert "content" not in data["assets"][0]
 
+
+def test_convert_publishes_with_the_atomic_output_contract(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    input_path = tmp_path / "input.json"
+    input_path.write_text(JSONReporter().generate(_build_report()), encoding="utf-8")
+    output_path = tmp_path / "output.html"
+    published: list[tuple[Path, str]] = []
+    monkeypatch.setattr(
+        cli_module,
+        "atomic_publish_text",
+        lambda path, payload: published.append((Path(path), payload)),
+    )
+
+    result = CliRunner().invoke(
+        main,
+        ["convert", str(input_path), "--format", "html", "--output", str(output_path)],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert [path for path, _ in published] == [output_path]
+    assert "<html" in published[0][1].lower()
+
+
+def test_convert_rejects_a_symbolic_link_output_destination(tmp_path: Path) -> None:
+    input_path = tmp_path / "input.json"
+    input_path.write_text(JSONReporter().generate(_build_report()), encoding="utf-8")
+    outside = tmp_path / "outside.html"
+    outside.write_text("outside", encoding="utf-8")
+    output_path = tmp_path / "output.html"
+    try:
+        output_path.symlink_to(outside)
+    except OSError as exc:
+        pytest.skip(f"symbolic links are unavailable: {exc}")
+
+    result = CliRunner().invoke(
+        main,
+        ["convert", str(input_path), "--format", "html", "--output", str(output_path)],
+    )
+
+    assert result.exit_code != 0
+    assert outside.read_text(encoding="utf-8") == "outside"

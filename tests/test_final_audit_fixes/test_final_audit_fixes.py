@@ -8,12 +8,11 @@ from __future__ import annotations
 import inspect
 
 from bundleInspector.config import Config
-from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.parser.ir_builder import build_ir
+from bundleInspector.parser.js_parser import parse_js
 from bundleInspector.rules.base import AnalysisContext
 from bundleInspector.rules.engine import RuleEngine
 from bundleInspector.storage.models import JSAsset
-
 
 # ---------------------------------------------------------------- rate limiter
 
@@ -57,7 +56,8 @@ def test_chunk_analyzer_large_minified_bounded_memory():
     # snippet (the OOM). Every finding's snippet is bounded.
     src = "var x=" + ";".join(f'import("./chunk{i}")' for i in range(3000)) + ";"
     ir = build_ir(parse_js(src).ast, "f.js", "h")
-    eng = RuleEngine(Config().rules); eng.register_defaults()
+    eng = RuleEngine(Config().rules)
+    eng.register_defaults()
     findings = eng.analyze(ir, AnalysisContext(file_url="f.js", file_hash="h", source_content=src))
     assert findings
     assert all(len(f.evidence.snippet) <= 520 for f in findings)
@@ -69,7 +69,8 @@ def test_deep_ast_annotation_degrades_not_crashes():
     from bundleInspector.core.asset_analysis import _build_analyzer
     chain = "0" + "".join(f"?a{i}:b{i}" for i in range(1200))  # very deep ternary chain
     src = f'const m=require("./x");const z={chain};fetch("/api/deep-annotate");'
-    asset = JSAsset(url="https://x/a.js", content=src.encode()); asset.compute_hash()
+    asset = JSAsset(url="https://x/a.js", content=src.encode())
+    asset.compute_hash()
     findings = _build_analyzer(Config()).analyze_asset_standalone(asset, None, None)
     vals = {f.extracted_value for f in findings if f.category.value == "endpoint"}
     assert "/api/deep-annotate" in vals  # no RecursionError crash; finding preserved
@@ -78,7 +79,8 @@ def test_deep_ast_annotation_degrades_not_crashes():
 def test_normal_ast_annotation_metadata_intact():
     from bundleInspector.core.asset_analysis import _build_analyzer
     src = 'const m=require("./client");import {x} from "./m";fetch("/api/z");'
-    asset = JSAsset(url="https://x/a.js", content=src.encode()); asset.compute_hash()
+    asset = JSAsset(url="https://x/a.js", content=src.encode())
+    asset.compute_hash()
     findings = _build_analyzer(Config()).analyze_asset_standalone(asset, None, None)
     ep = [f for f in findings if f.category.value == "endpoint"][0]
     assert ep.metadata.get("imports")           # the try/except wrap didn't regress normal metadata

@@ -17,6 +17,9 @@ Design guarantees:
 
 from __future__ import annotations
 
+from collections.abc import Iterable
+from typing import Any
+
 from bundleInspector.correlator.dormant import _SENSITIVE_RE, _split
 from bundleInspector.storage.models import (
     Category,
@@ -28,11 +31,11 @@ from bundleInspector.storage.models import (
 
 
 def surface_runtime_endpoints(
-    findings,
-    observed,
-    observed_websockets=None,
-    config=None,
-    primary_hosts=None,
+    findings: list[Finding],
+    observed: Iterable[Any] | None,
+    observed_websockets: Iterable[Any] | None = None,
+    config: Any | None = None,
+    primary_hosts: Iterable[str] | None = None,
 ) -> int:
     """Append endpoint findings for first-party HTTP/WS URLs observed at runtime that are
     not already present as static endpoint findings.
@@ -41,8 +44,7 @@ def surface_runtime_endpoints(
     no runtime observation baseline.
     """
     enabled = (
-        getattr(config, "runtime_endpoint_surfacing_enabled", True)
-        if config is not None else True
+        getattr(config, "runtime_endpoint_surfacing_enabled", True) if config is not None else True
     )
     if not enabled:
         return 0
@@ -51,14 +53,24 @@ def surface_runtime_endpoints(
 
     primary = {h.lower() for h in primary_hosts} if primary_hosts else None
 
-    # Normalized paths already covered by static endpoint findings, so we never duplicate.
-    known_paths: set[str] = set()
+    # Endpoints already covered by static findings, so we never duplicate. DQ-H02: keyed by verb (and
+    # host for absolute findings), NOT path only -- else a static GET would suppress a runtime DELETE
+    # on the same path, and a static third-party URL would suppress a first-party call. A relative
+    # static finding is host-agnostic (resolves against the app origin), so it still suppresses a
+    # first-party absolute runtime call of the same verb.
+    known_rel: set[tuple[str, str]] = set()  # (METHOD, path) -- relative/host-less findings
+    known_host: set[tuple[str, str, str]] = set()  # (host, METHOD, path) -- absolute findings
     for f in findings:
         if f.category == Category.ENDPOINT and f.extracted_value:
             try:
-                known_paths.add(_split(f.extracted_value)[1])
+                fhost, fpath = _split(f.extracted_value)
             except Exception:
                 continue
+            fmethod = str((f.metadata or {}).get("method") or "GET").upper()
+            if fhost:
+                known_host.add((fhost, fmethod, fpath))
+            else:
+                known_rel.add((fmethod, fpath))
 
     def _in_scope(host: str) -> bool:
         # Relative (host-less) or first-party only; when no primary set is known, keep the
@@ -70,7 +82,7 @@ def surface_runtime_endpoints(
         return host in primary
 
     added = 0
-    seen_new: set[str] = set()
+    seen_new: set[tuple[str, str, str]] = set()
 
     def _emit(url: str, method: str, transport: str) -> None:
         nonlocal added
@@ -80,36 +92,39 @@ def surface_runtime_endpoints(
             return
         if path in ("", "/") or not _in_scope(host):
             return
-        if path in known_paths or path in seen_new:
+        m = str(method or "GET").upper()
+        if (m, path) in known_rel or (host, m, path) in known_host or (host, m, path) in seen_new:
             return
-        seen_new.add(path)
+        seen_new.add((host, m, path))
 
         sensitive = bool(_SENSITIVE_RE.search(path))
         severity = Severity.MEDIUM if sensitive else Severity.LOW
         label = "WebSocket" if transport == "websocket" else method
-        findings.append(Finding(
-            rule_id="runtime_observed_endpoint",
-            category=Category.ENDPOINT,
-            severity=severity,
-            confidence=Confidence.HIGH,  # we literally observed the call happen
-            title=f"Runtime-observed endpoint: {label} {path}",
-            description=(
-                "Endpoint the running application called at runtime but which static "
-                "analysis did not surface (likely a dynamically-assembled URL). Reachable "
-                "and replayable by hand."
-            ),
-            evidence=Evidence(file_url=url, file_hash="", line=0),
-            extracted_value=url,
-            value_type="websocket_url" if transport == "websocket" else "api_endpoint",
-            tags=["runtime-observed", "dynamically-discovered"],
-            metadata={
-                "observed_at_runtime": True,
-                "method": method,
-                "transport": transport,
-                "runtime_sensitive": sensitive,
-                "is_first_party": True,
-            },
-        ))
+        findings.append(
+            Finding(
+                rule_id="runtime_observed_endpoint",
+                category=Category.ENDPOINT,
+                severity=severity,
+                confidence=Confidence.HIGH,  # we literally observed the call happen
+                title=f"Runtime-observed endpoint: {label} {path}",
+                description=(
+                    "Endpoint the running application called at runtime but which static "
+                    "analysis did not surface (likely a dynamically-assembled URL). Reachable "
+                    "and replayable by hand."
+                ),
+                evidence=Evidence(file_url=url, file_hash="", line=0),
+                extracted_value=url,
+                value_type="websocket_url" if transport == "websocket" else "api_endpoint",
+                tags=["runtime-observed", "dynamically-discovered"],
+                metadata={
+                    "observed_at_runtime": True,
+                    "method": method,
+                    "transport": transport,
+                    "runtime_sensitive": sensitive,
+                    "is_first_party": True,
+                },
+            )
+        )
         added += 1
 
     for item in observed or []:

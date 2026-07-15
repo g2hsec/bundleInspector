@@ -1,5 +1,5 @@
 [build-system]
-requires = ["hatchling"]
+requires = ["hatchling==1.31.0"]
 build-backend = "hatchling.build"
 
 [project]
@@ -8,7 +8,7 @@ version = "0.1.0"
 description = "JavaScript Security Analysis Tool - Extract hidden APIs, domains, secrets from JS files"
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.14"
 authors = [
     { name = "BundleInspector Team" }
 ]
@@ -30,11 +30,13 @@ classifiers = [
     "Programming Language :: Python :: 3.10",
     "Programming Language :: Python :: 3.11",
     "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
     "Topic :: Security",
     "Topic :: Software Development :: Testing",
 ]
 dependencies = [
-    "httpx>=0.24.0",
+    "httpx>=0.27.1,<0.29",
+    "httpcore>=1.0.5,<1.1",
     "playwright>=1.40.0",
     "beautifulsoup4>=4.12.0",
     "lxml>=4.9.0",
@@ -47,10 +49,18 @@ dependencies = [
     "jinja2>=3.1.0",
     "aiofiles>=23.0.0",
     "regex>=2023.0.0",
+    "cryptography>=42,<47",
+    "tree-sitter>=0.26,<0.27",
+    "tree-sitter-javascript>=0.25,<0.26",
+    "tree-sitter-typescript>=0.23.2,<0.24",
+    "PyYAML>=6.0,<7",
 ]
 
 [project.optional-dependencies]
 dev = [
+    "build==1.5.0",
+    "twine==6.2.0",
+    "check-wheel-contents==0.6.3",
     "pytest>=7.0.0",
     "pytest-asyncio>=0.21.0",
     "pytest-cov>=4.0.0",
@@ -58,9 +68,15 @@ dev = [
     "mypy>=1.0.0",
     "pre-commit>=3.0.0",
 ]
+mcp = [
+    "mcp>=1.28.1,<2",
+    "sse-starlette>=1.6.1,<3",
+    "starlette>=0.40,<0.42",
+]
 
 [project.scripts]
 bundleInspector = "bundleInspector.cli:main"
+bundleInspector-mcp = "bundleInspector.mcp_server.server:main"
 
 [project.urls]
 Homepage = "https://github.com/g2hsec/bundleInspector"
@@ -71,9 +87,28 @@ Issues = "https://github.com/g2hsec/bundleInspector/issues"
 [tool.hatch.build.targets.wheel]
 packages = ["src/bundleInspector"]
 
+[tool.hatch.build.targets.sdist]
+include = [
+    "/.github/workflows/quality.yml",
+    "/LICENSE",
+    "/README.md",
+    "/README.en.md",
+    "/README.ko.md",
+    "/benchmarks",
+    "/docs",
+    "/examples",
+    "/packaging",
+    "/pyproject.toml",
+    "/scripts",
+    "/src",
+    "/tests",
+]
+
 [tool.ruff]
 target-version = "py310"
 line-length = 100
+
+[tool.ruff.lint]
 select = [
     "E",    # pycodestyle errors
     "W",    # pycodestyle warnings
@@ -88,7 +123,7 @@ ignore = [
     "B008",  # function calls in argument defaults
 ]
 
-[tool.ruff.isort]
+[tool.ruff.lint.isort]
 known-first-party = ["bundleInspector"]
 
 [tool.mypy]
@@ -101,6 +136,7 @@ ignore_missing_imports = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 addopts = "-v --tb=short"
 
 [tool.coverage.run]
@@ -114,4 +150,3 @@ exclude_lines = [
     "raise NotImplementedError",
     "if TYPE_CHECKING:",
 ]
-

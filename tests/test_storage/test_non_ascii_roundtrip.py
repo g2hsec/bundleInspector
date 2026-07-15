@@ -5,6 +5,8 @@ characters such as 'é' (\\xe9) that appear in JS bundle content/snippets. The
 stores pin encoding="utf-8" so writes/reads never depend on the ambient locale.
 """
 
+import hashlib
+
 import pytest
 
 from bundleInspector.config import Config
@@ -28,8 +30,9 @@ async def test_checkpoint_roundtrips_non_ascii(tmp_path):
 
     path = await store.store_checkpoint(checkpoint)
 
-    # File is genuine UTF-8 (é -> 0xC3 0xA9), not the ambient locale codec.
-    assert "café".encode("utf-8") in path.read_bytes()
+    # Checkpoints are encrypted at rest; the decoded model still round-trips Unicode.
+    assert path.read_bytes().startswith(b"BICP1")
+    assert "café".encode() not in path.read_bytes()
 
     restored = await store.get_checkpoint()
     assert restored is not None
@@ -53,9 +56,10 @@ async def test_asset_meta_roundtrips_non_ascii(tmp_path):
 async def test_ast_roundtrips_non_ascii(tmp_path):
     store = ArtifactStore(tmp_path)
     ast = {"type": "Literal", "value": NON_ASCII}
+    content_hash = hashlib.sha256(b"source").hexdigest()
 
-    ast_hash = await store.store_ast(ast, "deadbeef")
-    restored = await store.get_ast("deadbeef", ast_hash)
+    ast_hash = await store.store_ast(ast, content_hash)
+    restored = await store.get_ast(content_hash, ast_hash)
 
     assert restored == ast
 

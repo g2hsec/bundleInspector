@@ -100,7 +100,7 @@ Notes:
 - `ultra-safe` is the lowest-impact profile and the safest choice when you are not sure what a program allows.
 - `conservative` is the safest profile here. `standard` is clearly visible in logs. `deep` can be operationally unsafe on small services, brittle legacy apps, or heavy SPA targets.
 - The default `bundleInspector scan ...` behavior is more aggressive than `conservative`, so do not rely on defaults for production systems or bug bounty targets.
-- `ultra-safe` and `conservative` keep beautify enabled. They are low-traffic profiles, not low-precision profiles.
-- `fast` is the only shipped profile that intentionally disables beautify and sourcemap resolution for speed. Use it only when that tradeoff is acceptable.
+- `ultra-safe` and `conservative` keep **beautify** enabled — they are low-traffic profiles, not low-parse-precision profiles — though they leave source-map resolution off.
+- `fast` is the only shipped profile that disables **beautify** (`beautify: false`). **Source-map resolution** (`resolve_sourcemaps: false`) is off in three profiles — `ultra-safe`, `conservative`, and `fast` — so original (pre-minified) positions are not reconstructed there; `standard` and `deep` enable both. Use `fast` only when the beautify tradeoff is acceptable.
 - Always follow program-specific traffic limits, automation policy, and safe-harbor rules. If you do not have explicit permission for heavier testing, start with `ultra-safe` or `conservative`.
 

@@ -9,18 +9,18 @@ from __future__ import annotations
 
 import json
 import re
-from collections import defaultdict
 from dataclasses import dataclass, field
-from typing import Any, Optional
+from typing import Any
 from urllib.parse import parse_qs
-from bundleInspector.core.url_utils import safe_urlparse as urlparse
 
+from bundleInspector.core.url_utils import safe_urlparse as urlparse
 from bundleInspector.storage.models import Category, Finding, Report
 
 
 @dataclass
 class APIParameter:
     """An API parameter."""
+
     name: str
     location: str  # path, query, header, body
     example: str = ""
@@ -29,11 +29,12 @@ class APIParameter:
 @dataclass
 class APIRoute:
     """A single API route."""
+
     path: str
     methods: set[str] = field(default_factory=set)
     parameters: list[APIParameter] = field(default_factory=list)
     sources: list[str] = field(default_factory=list)  # file URLs
-    children: dict[str, "APIRoute"] = field(default_factory=dict)
+    children: dict[str, APIRoute] = field(default_factory=dict)
     finding_count: int = 0
 
     def add_method(self, method: str) -> None:
@@ -51,15 +52,14 @@ class APIRoute:
         if self.sources:
             result["sources"] = sorted(set(self.sources))[:5]
         if self.children:
-            result["children"] = {
-                k: v.to_dict() for k, v in sorted(self.children.items())
-            }
+            result["children"] = {k: v.to_dict() for k, v in sorted(self.children.items())}
         return result
 
 
 @dataclass
 class APIDomain:
     """API endpoints grouped by domain."""
+
     domain: str
     base_url: str = ""
     routes: dict[str, APIRoute] = field(default_factory=dict)
@@ -70,9 +70,7 @@ class APIDomain:
             "domain": self.domain,
             "base_url": self.base_url,
             "total_endpoints": self.total_endpoints,
-            "routes": {
-                k: v.to_dict() for k, v in sorted(self.routes.items())
-            },
+            "routes": {k: v.to_dict() for k, v in sorted(self.routes.items())},
         }
 
 
@@ -84,16 +82,13 @@ class APIMapBuilder:
     domain → path segments → methods/parameters
     """
 
-    def __init__(self):
+    def __init__(self) -> None:
         self.domains: dict[str, APIDomain] = {}
 
     def build(self, report: Report) -> dict[str, APIDomain]:
         """Build API map from report findings."""
         self.domains.clear()
-        endpoint_findings = [
-            f for f in report.findings
-            if f.category == Category.ENDPOINT
-        ]
+        endpoint_findings = [f for f in report.findings if f.category == Category.ENDPOINT]
 
         for finding in endpoint_findings:
             self._process_finding(finding)
@@ -158,7 +153,7 @@ class APIMapBuilder:
     def _parse_endpoint(self, value: str) -> tuple[str, str, str]:
         """Parse endpoint into (domain, path, query)."""
         # Template literals
-        value = re.sub(r'\$\{[^}]*\}', '{param}', value)
+        value = re.sub(r"\$\{[^}]{0,1024}\}", "{param}", value)
 
         if value.startswith(("http://", "https://", "//")):
             parsed = urlparse(value)
@@ -192,9 +187,12 @@ class APIMapBuilder:
                 normalized.append("{id}")
                 continue
 
-            # Already a curly-brace parameter placeholder → preserve it
-            if segment.startswith("{"):
-                normalized.append(segment)
+            # Any placeholder segment (`{param}` from a template, `{id}`, `{uuid}`, ...) collapses to
+            # ONE canonical key so a template-param instance and a concrete-id instance of the same
+            # route map to the SAME tree node instead of fragmenting into two siblings (which
+            # double-counted the endpoint and inflated total_endpoints).
+            if segment.startswith("{") and segment.endswith("}"):
+                normalized.append("{id}")
                 continue
 
             # Pure numeric → likely an ID
@@ -204,14 +202,15 @@ class APIMapBuilder:
 
             # UUID pattern
             if re.match(
-                r'^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$',
-                segment, re.IGNORECASE
+                r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$",
+                segment,
+                re.IGNORECASE,
             ):
                 normalized.append("{uuid}")
                 continue
 
             # Hex string that looks like an ID (24+ chars)
-            if re.match(r'^[0-9a-f]{24,}$', segment, re.IGNORECASE):
+            if re.match(r"^[0-9a-f]{24,}$", segment, re.IGNORECASE):
                 normalized.append("{id}")
                 continue
 
@@ -235,12 +234,10 @@ class APIMapBuilder:
         existing_names = {p.name for p in route.parameters}
 
         # Path parameters
-        for match in re.finditer(r'\{(\w+)\}', path):
+        for match in re.finditer(r"\{(\w+)\}", path):
             name = match.group(1)
             if name not in existing_names:
-                route.parameters.append(APIParameter(
-                    name=name, location="path"
-                ))
+                route.parameters.append(APIParameter(name=name, location="path"))
                 existing_names.add(name)
 
         # Query parameters
@@ -249,11 +246,13 @@ class APIMapBuilder:
                 params = parse_qs(query)
                 for name in params:
                     if name not in existing_names:
-                        route.parameters.append(APIParameter(
-                            name=name,
-                            location="query",
-                            example=params[name][0] if params[name] else "",
-                        ))
+                        route.parameters.append(
+                            APIParameter(
+                                name=name,
+                                location="query",
+                                example=params[name][0] if params[name] else "",
+                            )
+                        )
                         existing_names.add(name)
             except Exception:
                 pass
@@ -302,21 +301,14 @@ class APIMapBuilder:
                 param_names = [p.name for p in route.parameters]
                 params_str = f" ?{', '.join(param_names)}"
 
-            lines.append(
-                f"{prefix}{connector}/{name}{methods_str}{params_str}"
-            )
+            lines.append(f"{prefix}{connector}/{name}{methods_str}{params_str}")
 
             if route.children:
-                self._tree_routes(
-                    route.children, lines, prefix + extension
-                )
+                self._tree_routes(route.children, lines, prefix + extension)
 
     def to_json(self) -> str:
         """Generate JSON representation."""
-        data = {
-            name: domain.to_dict()
-            for name, domain in sorted(self.domains.items())
-        }
+        data = {name: domain.to_dict() for name, domain in sorted(self.domains.items())}
         return json.dumps(data, indent=2, ensure_ascii=False)
 
 
@@ -325,4 +317,3 @@ def build_api_map(report: Report) -> APIMapBuilder:
     builder = APIMapBuilder()
     builder.build(report)
     return builder
-

@@ -14,7 +14,8 @@ import pytest
 
 import bundleInspector.collector.headless as headless_mod
 from bundleInspector.collector.headless import HeadlessCollector
-from bundleInspector.config import CrawlerConfig
+from bundleInspector.collector.scope import ScopePolicy
+from bundleInspector.config import CrawlerConfig, ScopeConfig
 
 
 @pytest.mark.asyncio
@@ -45,6 +46,105 @@ async def test_setup_stops_driver_when_launch_fails(monkeypatch):
         await collector.setup()
     assert stopped["v"] is True            # driver stopped on the failure path
     assert collector._playwright is None    # and reference cleared
+
+
+@pytest.mark.asyncio
+async def test_context_creation_failure_closes_lazy_security_proxy(monkeypatch):
+    closed = {"value": False}
+
+    class _Proxy:
+        url = "socks5://127.0.0.1:43210"
+
+        def __init__(self, **kwargs):
+            self.started = False
+
+        async def start(self):
+            self.started = True
+
+        async def close(self):
+            closed["value"] = True
+
+    class _Browser:
+        async def new_context(self, **kwargs):
+            raise RuntimeError("context failed")
+
+    monkeypatch.setattr(headless_mod, "PLAYWRIGHT_AVAILABLE", True)
+    monkeypatch.setattr(headless_mod, "ValidatingSocksProxy", _Proxy)
+    collector = HeadlessCollector(CrawlerConfig())
+    collector._browser = _Browser()
+
+    with pytest.raises(RuntimeError, match="context failed"):
+        await collector._create_context(
+            "https://example.com/app",
+            ScopePolicy(ScopeConfig()),
+        )
+
+    assert closed["value"] is True
+    assert collector._socks_proxy is None
+
+
+@pytest.mark.asyncio
+async def test_teardown_closes_proxy_and_driver_when_browser_close_raises(monkeypatch):
+    events: list[str] = []
+
+    class _Browser:
+        async def close(self):
+            events.append("browser")
+            raise RuntimeError("browser crashed")
+
+    class _Proxy:
+        async def close(self):
+            events.append("proxy")
+
+    class _Playwright:
+        async def stop(self):
+            events.append("playwright")
+
+    monkeypatch.setattr(headless_mod, "PLAYWRIGHT_AVAILABLE", True)
+    collector = HeadlessCollector(CrawlerConfig())
+    collector._browser = _Browser()
+    collector._socks_proxy = _Proxy()
+    collector._playwright = _Playwright()
+
+    with pytest.raises(RuntimeError, match="browser crashed"):
+        await collector.teardown()
+
+    assert events == ["browser", "proxy", "playwright"]
+    assert collector._browser is None
+    assert collector._playwright is None
+    assert collector._socks_proxy is None
+
+
+@pytest.mark.asyncio
+async def test_teardown_clears_references_when_driver_stop_raises(monkeypatch):
+    events: list[str] = []
+
+    class _Browser:
+        async def close(self):
+            events.append("browser")
+
+    class _Proxy:
+        async def close(self):
+            events.append("proxy")
+
+    class _Playwright:
+        async def stop(self):
+            events.append("playwright")
+            raise RuntimeError("driver shutdown failed")
+
+    monkeypatch.setattr(headless_mod, "PLAYWRIGHT_AVAILABLE", True)
+    collector = HeadlessCollector(CrawlerConfig())
+    collector._browser = _Browser()
+    collector._socks_proxy = _Proxy()
+    collector._playwright = _Playwright()
+
+    with pytest.raises(RuntimeError, match="driver shutdown failed"):
+        await collector.teardown()
+
+    assert events == ["browser", "proxy", "playwright"]
+    assert collector._browser is None
+    assert collector._playwright is None
+    assert collector._socks_proxy is None
 
 
 @pytest.mark.skipif(sys.platform != "win32", reason="Proactor transports are Windows-only")
