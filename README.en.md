@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="images/main_banner.png" alt="BundleInspector" width="100%">
+
 # 🔎 BundleInspector
 
 ### Surface the attack surface hiding in JavaScript.

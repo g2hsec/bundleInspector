@@ -1,5 +1,7 @@
 <div align="center">
 
+<img src="images/main_banner.png" alt="BundleInspector" width="100%">
+
 # 🔎 BundleInspector
 
 ### 자바스크립트 속에 숨은 공격 표면을 드러냅니다.
